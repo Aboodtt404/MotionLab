@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Build output
+dist/
+build/
+*.egg-info/
+.vite/
+**/node_modules/.vite/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Generated 3D assets / large binaries
+outputs/
+generated/
+*.step
+*.stp
+*.stl
+*.glb
+
+# Model weights / caches
+*.safetensors
+*.ckpt
+*.gguf
+.cache/
+
+# Logs / tmp
+*.log
+logs/
+tmp/
+.DS_Store
+Thumbs.db
+
+# Editor / local tooling
+.vscode/
+.idea/
+*.swp
+.claude/settings.local.json
+
+# Local-only study / research (not part of the project)
+docs/research/
