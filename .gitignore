@@ -6,6 +6,8 @@ __pycache__/
 .venv/
 venv/
 env/
+serve_venv/
+*_venv/
 
 # Build output
 dist/
@@ -34,6 +36,7 @@ generated/
 *.ckpt
 *.gguf
 .cache/
+unsloth_compiled_cache/
 
 # Logs / tmp
 *.log
