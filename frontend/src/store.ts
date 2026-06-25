@@ -223,7 +223,7 @@ export const useStudio = create<StudioState>((set, get) => {
     genStatus: "idle", genStep: 0, progress: 0, attempt: 0, attempts: 0, retry: null, retryDiff: null,
     inspection: null, organicReport: null, fidelity: 0, bestOfN: 0, approved: false,
     addMenuOpen: false, libOpen: false, hollow: false, minWall: 1.5, activeVar: 0, assets: seedAssets,
-    meshStl: null, code: null, backendError: null, useModel: false, // real-backend wiring
+    meshStl: null, code: null, backendError: null, useModel: true, // real-backend wiring (live Phase-2 model)
     assemblyMode: false, assembly: null, assemblyObject: null,      // planner / edit-loop
 
     // planner (multi-part): first prompt PLANS, subsequent prompts EDIT the current design

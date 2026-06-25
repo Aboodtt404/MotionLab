@@ -228,6 +228,10 @@ class VLLMGenerator:
             "model": self.model,
             "messages": [{"role": "system", "content": self.SYSTEM}, {"role": "user", "content": user}],
             "temperature": 0, "max_tokens": 8192,
+            # no-think: this is a transcription task (spec→code), not a reasoning one. Thinking just
+            # burns latency (free-form ramble at single-stream ~28 tok/s) and is how Phase-3 GRPO was
+            # trained. vLLM honours chat_template_kwargs on the chat endpoint.
+            "chat_template_kwargs": {"enable_thinking": False},
         }).encode()
         req = urllib.request.Request(self.base_url + "/chat/completions", data=payload, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=180) as r:

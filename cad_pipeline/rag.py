@@ -69,6 +69,14 @@ _EXAMPLES = {
                   '(absolute, origin = part center). Do NOT chain .center() per hole: .center() is '
                   'RELATIVE and accumulates, so the 2nd+ holes drift off-target.',
                   'result = result.faces(">Z").workplane().pushPoints([(x1, y1), (x2, y2), (x3, y3)]).hole(diameter)'),
+    "hole_nonbox":('through-holes on a LOFT / REVOLVE / SWEEP: do NOT use .faces(">Z").workplane().hole() '
+                   'here — the top face is tilted/curved and its local frame does NOT map to global X/Y, so '
+                   'the holes miss. Cut an EXPLICIT cylinder at ABSOLUTE coords, one per hole. For a Z-axis '
+                   'hole at (x, y): h = the part Z-extent (loft ⇒ max(height, height_top)); the cutter starts '
+                   'just below the part and spans through. (For an x/y-axis hole, swap the direction vector '
+                   'and the start offset to that axis.)',
+                   'h = max(H, Ht)   # part Z-extent (loft); for revolve/sweep use the body height\n'
+                   'result = result.cut(cq.Solid.makeCylinder(diameter / 2, h + 2, cq.Vector(x, y, -h / 2 - 1), cq.Vector(0, 0, 1)))'),
     "fillet":  ('fillet the VERTICAL edges', 'result = result.edges("|Z").fillet(radius)'),
     "chamfer": ('chamfer the VERTICAL edges', 'result = result.edges("|Z").chamfer(distance)'),
     "pocket":  ('rectangular pocket / panel inset cut into the top face. With a position use a FRESH '
@@ -219,13 +227,23 @@ def grep(pattern: str, k: int = 8) -> List[Doc]:
 def _examples_for_spec(spec: Spec) -> List[Doc]:
     """Deterministically pull the canonical recipe(s) the spec needs — guaranteed present."""
     keys = [spec.shape]
+    # On a loft/revolve/sweep the box face-workplane hole idiom MISSES (tilted/curved top face) — the
+    # holes must be cut as explicit absolute cylinders. Route those shapes to `hole_nonbox` and suppress
+    # the box hole idioms, which would otherwise mislead the model. (cylinder's flat top is fine as box.)
+    cut_idiom = spec.shape in ("loft", "revolve", "sweep")
     n_placed_holes = 0
+    has_hole = False
     for f in spec.features:
+        if cut_idiom and f.type in ("through_hole", "hole_pattern"):
+            has_hole = True
+            continue   # skip the box hole examples for these shapes
         keys.append(f.type)
         if f.type == "through_hole" and getattr(f, "from_edge", None) is not None and spec.shape == "box":
             keys.append("from_edge")
         if f.type == "through_hole" and getattr(f, "at", None) is not None:
             n_placed_holes += 1
+    if cut_idiom and has_hole:
+        keys.append("hole_nonbox")
     # ≥2 explicitly-positioned holes ⇒ the .center()-accumulation trap (the #1 L2/L3 failure):
     # surface the absolute pushPoints idiom + the relative-center warning.
     always = ["selector: vertical edges", "selector: top face", "workplane offset is numeric"]

@@ -59,7 +59,7 @@ def _run_golden(spec: Spec) -> dict:
 def _run_model(spec: Spec, max_attempts: int) -> dict:
     """Thin generate→verify→retry that ALSO keeps the winning code+solid (loop.run discards
     them). Re-execs the model's code in-process to export its geometry — dev-only, trusted."""
-    gen = VLLMGenerator()
+    gen = VLLMGenerator(model=os.environ.get("CAD_MODEL", "qwen3.6-27b"))
     feedback = None
     history, best = [], None
     for attempt in range(1, max_attempts + 1):
