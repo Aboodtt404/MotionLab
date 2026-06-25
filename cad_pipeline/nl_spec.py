@@ -109,6 +109,17 @@ def _extract_json(txt: str) -> str:
     return txt[a:b + 1] if a != -1 and b > a else txt.strip()
 
 
+# The schema hint the dedicated parser (training/build_nl_spec.py) was fine-tuned with — MUST stay
+# byte-identical to the training prompt. The fine-tune internalized the mapping, so no few-shot block
+# or thinking is needed: ~5s/parse + 8/8 held-out vs the few-shot base's ~55s + 5/8 (Stage-2 eval).
+PARSER_HINT = (
+    "Convert the part description to a CadQuery spec JSON. shape is one of box|cylinder|loft|"
+    "revolve|sweep. box:{length,width,height} cylinder:{diameter,height} loft:{length,width,"
+    "height,width_top,height_top} revolve:profile=[[r,z],..] sweep:{diameter}+path=[[x,y,z],..]. "
+    "features: through_hole/hole_pattern/fillet/chamfer/var_fillet/pocket/counterbore/countersink/"
+    "draft/shell/thread/mirror. Holes default to the z axis. Output ONLY the JSON.\nDescription: ")
+
+
 def _chat(base_url, model, messages, timeout, think, max_tokens=2500):
     body = {"model": model, "messages": messages, "temperature": 0.0 if think else 0.4,
             "max_tokens": max_tokens}
@@ -120,27 +131,48 @@ def _chat(base_url, model, messages, timeout, think, max_tokens=2500):
         return json.loads(r.read())["choices"][0]["message"]["content"]
 
 
+def _inset_holes(spec: Spec) -> Spec:
+    """Nudge any box/loft z-hole that lands on/outside the footprint back fully inside (|x|≤L/2−d/2).
+    A hole on the boundary is degenerate (half-hole, fails the hole↔edge check), so clamping is always
+    the right correction. Fixes the parser's bare "hole at each end" → ±L/2; harmless when already inside."""
+    e = spec.envelope
+    if spec.shape == "box":
+        L, W = e.get("length", 0.0), e.get("width", 0.0)
+    elif spec.shape == "loft":
+        L, W = e.get("length", 0.0), max(e.get("width", 0.0), e.get("width_top", e.get("width", 0.0)))
+    else:
+        return spec
+    for f in spec.features:
+        if f.type == "through_hole" and f.at is not None and getattr(f, "axis", "z") == "z":
+            x, y = f.at; r = f.diameter / 2.0
+            xm, ym = L / 2 - r - 0.5, W / 2 - r - 0.5
+            nx = (xm if x > xm else -xm if x < -xm else x) if xm > 0 else x
+            ny = (ym if y > ym else -ym if y < -ym else y) if ym > 0 else y
+            if (nx, ny) != (x, y):
+                f.at = (round(nx, 2), round(ny, 2))
+    return spec
+
+
 def prompt_to_spec(prompt: str, base_url: str = "http://localhost:8002/v1",
-                   model: str = "qwen3.6-27b", timeout: float = 120.0, max_tries: int = 3) -> Spec:
-    """NL → typed Spec with a validator-in-the-loop repair loop (docs/research/nl-to-spec-research.md):
-    attempt 1 reasons (thinking ON) for semantic fidelity; if the result is unparseable JSON or fails
-    pydantic validation, the malformed output + the exact error are fed back and a fast (thinking-OFF)
-    SYNTAX-repair retry is issued. Hard prompts (tapered loft, multi-constraint brackets) intermittently
-    emit malformed JSON one-shot — the loop recovers them. Conventions live in the system prompt."""
-    # Thinking is ON for attempt 1 deliberately: NL→spec is a reasoning task (pick shape class, place
-    # features). With thinking OFF the model shortcuts hard cases and emits malformed/empty JSON.
-    messages = [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": "input: " + prompt}]
+                   model: str = "parser2", timeout: float = 60.0, max_tries: int = 3) -> Spec:
+    """NL → typed Spec via the fine-tuned parser adapter (research Stage 2.1). Direct mapping, no
+    few-shot, no thinking: ~4s vs the few-shot base's ~50s, and higher semantic accuracy (27/28 vs 25/28
+    held-out, incl. correct positioned holes after the positioned-hole corpus augment). PARSER_HINT carries
+    the schema vocab; a validator-retry repairs the rare malformed JSON; `_inset_holes` clamps any
+    boundary-placed hole inside. `model` must be a served adapter ('parser2') — the vLLM launch loads it
+    from training/nl_spec_parser_v2. (Set model='qwen3.6-27b' + _SYSTEM + think=True for the few-shot fallback.)"""
+    user = PARSER_HINT + prompt
+    messages = [{"role": "user", "content": user}]
     last_err: Exception = RuntimeError("no attempt made")
     for attempt in range(max_tries):
-        txt = _chat(base_url, model, messages, timeout, think=(attempt == 0))
+        txt = _chat(base_url, model, messages, timeout, think=False)
         raw = _extract_json(txt)
         try:
-            return Spec(**json.loads(raw))   # pydantic validates; raises on a malformed spec
+            return _inset_holes(Spec(**json.loads(raw)))   # pydantic validates; clamp boundary holes inside
         except Exception as e:   # noqa: BLE001 — JSONDecodeError or pydantic ValidationError → repair
             last_err = e
-            # feed the bad output + the exact error back for a focused syntax/schema repair
-            messages = messages[:2] + [
-                {"role": "assistant", "content": raw[:1500]},
-                {"role": "user", "content": f"That is not valid ({type(e).__name__}: {e}). Output ONLY a "
-                 "single corrected ```json block that parses and matches the schema — no prose, no thinking."}]
+            messages = [{"role": "user", "content": user},
+                        {"role": "assistant", "content": raw[:1500]},
+                        {"role": "user", "content": f"That is not valid ({type(e).__name__}: {e}). Output "
+                         "ONLY a single corrected JSON object that parses and matches the schema."}]
     raise last_err
