@@ -80,10 +80,26 @@ def _run_model(spec: Spec, max_attempts: int) -> dict:
             if res["report"]["passed"]:
                 break
         feedback = _feedback(res, spec)
-    if best is None:  # never produced valid geometry
+    if best is not None and best["passed"]:
+        return {"passed": True, "attempts": best["attempt"], "history": history,
+                "code": best["code"], "report": best["report"], "solid": best["solid"]}
+    # Model codegen failed verification after all retries. The spec is typed + validated, so fall back
+    # to the DETERMINISTIC builder — build(spec) renders any valid spec correctly by construction. The
+    # model's loft/revolve codegen is occasionally non-deterministic (freelances instead of the loft
+    # idiom); this guarantees the frontend always gets correct geometry for a correct spec.
+    from .builder import emit_code
+    try:
+        solid = build(spec)
+        rep = verify(solid, spec).to_dict()
+        history.append({"attempt": len(history) + 1, "status": "builder_fallback",
+                        "category": "ok" if rep["passed"] else "fail"})
+        return {"passed": rep["passed"], "attempts": len(history), "history": history,
+                "code": emit_code(spec), "report": rep, "solid": solid, "fallback": True}
+    except Exception:  # noqa: BLE001 — builder failed too (degenerate spec); return model best-effort
+        if best is not None:
+            return {"passed": best["passed"], "attempts": best["attempt"], "history": history,
+                    "code": best["code"], "report": best["report"], "solid": best["solid"]}
         return {"passed": False, "attempts": len(history), "history": history, "code": None, "report": None, "solid": None}
-    return {"passed": best["passed"], "attempts": best["attempt"], "history": history,
-            "code": best["code"], "report": best["report"], "solid": best["solid"]}
 
 
 class Handler(BaseHTTPRequestHandler):
