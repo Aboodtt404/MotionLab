@@ -128,26 +128,51 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         route = self.path.rstrip("/")
-        if route not in ("/generate", "/plan", "/edit"):
+        if route not in ("/generate", "/plan", "/edit", "/critique"):
             return self._json(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or b"{}")
             if route == "/generate":
                 self._json(200, self._generate(body))
+            elif route == "/critique":   # render → VLM look-critique of a greeble spec (Stage C)
+                self._json(200, self._critique(body))
             else:   # /plan and /edit operate on multi-part assemblies (the planner)
                 self._json(200, self._assembly(route, body))
         except Exception as e:  # noqa: BLE001
             self._json(400, {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-800:]})
 
-    def _generate(self, body: dict) -> dict:
+    def _spec_of(self, body: dict) -> Spec:
         # text→spec via the model (Track A front-end) when a raw prompt is given; else a typed spec.
-        spec = prompt_to_spec(body["prompt"]) if (body.get("prompt") and not body.get("spec")) else Spec(**body["spec"])
+        return prompt_to_spec(body["prompt"]) if (body.get("prompt") and not body.get("spec")) else Spec(**body["spec"])
+
+    def _generate(self, body: dict) -> dict:
+        spec = self._spec_of(body)
+        refine_hist = None
+        if body.get("refine"):   # Stage C: render→VLM critique loop nudges the greeble params first
+            from .critique import refine
+            spec, refine_hist = refine(spec, rounds=int(body.get("rounds", 2)))
         out = (_run_model(spec, int(body.get("max_attempts", 3))) if body.get("use_model") else _run_golden(spec))
-        return {"passed": out["passed"], "attempts": out["attempts"], "history": out["history"], "code": out["code"],
+        resp = {"passed": out["passed"], "attempts": out["attempts"], "history": out["history"], "code": out["code"],
                 "spec": spec.model_dump(exclude_none=True),
                 "inspection": _inspection(out["report"]) if out["report"] else [],
                 "mesh_stl_b64": _stl_b64(out["solid"]) if out.get("solid") is not None else None}
+        if refine_hist is not None:
+            resp["refine_history"] = refine_hist
+            if out.get("solid") is not None:
+                from .render import render_views
+                resp["render_png_b64"] = base64.b64encode(render_views(out["solid"], 1)[0]).decode()
+        return resp
+
+    def _critique(self, body: dict) -> dict:
+        from .critique import critique
+        from .render import render_views
+        spec = self._spec_of(body)
+        solid = build(spec)
+        c = critique(spec, solid)
+        return {"verdict": c["verdict"], "scores": c.get("scores", {}), "suggest": c.get("suggest", {}),
+                "notes": c.get("notes", ""), "spec": spec.model_dump(exclude_none=True),
+                "render_png_b64": base64.b64encode(render_views(solid, 1)[0]).decode()}
 
     def _assembly(self, route: str, body: dict) -> dict:
         from .assembly import Assembly, build_assembly, verify_assembly
