@@ -12,9 +12,18 @@ import random
 
 import cadquery as cq
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+from OCP.BRepGProp import BRepGProp
+from OCP.GProp import GProp_GProps
 
 from .selectors import CQ_EDGE
 from .spec import Spec, expected_holes
+
+
+def _ensure_positive(r):
+    """After fuzzy greeble booleans on curved/tilted faces, OCCT can return a VALID but INSIDE-OUT solid
+    (negative signed volume → inverted export normals). Reverse it so orientation points outward (>0)."""
+    g = GProp_GProps(); BRepGProp.VolumeProperties_s(r.val().wrapped, g)
+    return cq.Workplane(obj=cq.Shape(r.val().wrapped.Reversed())) if g.Mass() < 0 else r
 
 
 def _greeble_layout(L: float, W: float, H: float, g) -> tuple:
@@ -36,6 +45,15 @@ def _greeble_layout(L: float, W: float, H: float, g) -> tuple:
     cx, cy = L / nx, W / ny
     gw = gd = g.groove
     cuts: list = []; raises: list = []
+
+    def add_recess(cx, cy, w, h, d):                         # a recessed panel + (bevel>0) a shallow wider lip
+        cuts.append(((round(cx - w / 2, 4), round(cy - h / 2, 4), round(tz - d, 4)),
+                     (round(w, 4), round(h, 4), round(d + over, 4))))
+        b = min(g.bevel, g.margin * 0.6, d * 0.8)            # keep the lip off the grooves + above the floor
+        if b > 0:                                            # stepped rim around the mouth = machined-edge look
+            cuts.append(((round(cx - w / 2 - b, 4), round(cy - h / 2 - b, 4), round(tz - b, 4)),
+                         (round(w + 2 * b, 4), round(h + 2 * b, 4), round(b + over, 4))))
+
     for i in range(1, nx):                                   # grooves (cut) at constant x (run along Y)
         x = -L / 2 + i * cx
         cuts.append(((x - gw / 2, -W / 2, tz - gd), (gw, W, gd + over)))
@@ -66,16 +84,23 @@ def _greeble_layout(L: float, W: float, H: float, g) -> tuple:
                 sm = g.margin * 0.6; sw = max(0.8, (rw - sm) / 2); sh = max(0.8, (rh - sm) / 2); d = g.depth * df
                 for sx in (-1, 1):
                     for sy in (-1, 1):
-                        ox = px + sx * (sw + sm) / 2; oy = py + sy * (sh + sm) / 2
-                        cuts.append(((ox - sw / 2, oy - sh / 2, tz - d), (round(sw, 4), round(sh, 4), round(d + over, 4))))
+                        add_recess(px + sx * (sw + sm) / 2, py + sy * (sh + sm) / 2, sw, sh, d)
             else:                                            # plain RECESSED panel
-                d = g.depth * df
-                cuts.append(((px - rw / 2, py - rh / 2, tz - d), (round(rw, 4), round(rh, 4), round(d + over, 4))))
+                add_recess(px, py, rw, rh, g.depth * df)
     return cuts, raises
 
 
 GREEBLE_OVER = 0.5      # radial/face overshoot so cutters never share a face with the part (robust booleans)
 GREEBLE_FUZZY = 1e-3    # OCCT fuzzy-boolean tolerance for near-tangent cuts on the CURVED face (SetFuzzyValue)
+
+# emitted self-contained orientation fix (matches _ensure_positive) — fuzzy greeble booleans can flip a
+# valid solid inside-out (negative signed volume); reverse it so the exported normals point outward.
+_EMIT_ORIENT_FIX = [
+    "from OCP.GProp import GProp_GProps as _GP",
+    "from OCP.BRepGProp import BRepGProp as _BG",
+    "_gpv = _GP(); _BG.VolumeProperties_s(result.val().wrapped, _gpv)",
+    "result = cq.Workplane(obj=cq.Shape(result.val().wrapped.Reversed())) if _gpv.Mass() < 0 else result",
+]
 
 
 def _greeble_layout_cyl(R: float, H: float, g) -> tuple:
@@ -100,6 +125,15 @@ def _greeble_layout_cyl(R: float, H: float, g) -> tuple:
     cell_ang = 2 * math.pi / nth; cell_z = H / nz
     aw = R * cell_ang                                          # nominal arc/tangential width of a cell
     cuts: list = []; rings: list = []; raises: list = []
+
+    def add_recess(th, oy, oz, ww, hh, d):                   # radial recess + (bevel>0) a shallow wider lip
+        cuts.append((round(th, 4), (round(R - d, 4), round(oy - ww / 2, 4), round(oz - hh / 2, 4)),
+                     (round(d + over, 4), round(ww, 4), round(hh, 4))))
+        b = min(g.bevel, g.margin * 0.6, d * 0.8)
+        if b > 0:                                            # stepped rim at the +R mouth = machined-edge look
+            cuts.append((round(th, 4), (round(R - b, 4), round(oy - ww / 2 - b, 4), round(oz - hh / 2 - b, 4)),
+                         (round(b + over, 4), round(ww + 2 * b, 4), round(hh + 2 * b, 4))))
+
     # vertical grooves (constant θ): thin radial box at each angular grid line, full height
     for i in range(nth):
         th = math.degrees(i * cell_ang)
@@ -131,13 +165,9 @@ def _greeble_layout_cyl(R: float, H: float, g) -> tuple:
                 sm = g.margin * 0.6; sw = max(0.8, (w - sm) / 2); sh = max(0.8, (h - sm) / 2); d = g.depth * df
                 for sy in (-1, 1):
                     for sz in (-1, 1):
-                        oy = sy * (sw + sm) / 2; oz = zc + sz * (sh + sm) / 2
-                        cuts.append((round(th, 4), (round(R - d, 4), round(oy - sw / 2, 4), round(oz - sh / 2, 4)),
-                                     (round(d + over, 4), round(sw, 4), round(sh, 4))))
+                        add_recess(th, sy * (sw + sm) / 2, zc + sz * (sh + sm) / 2, sw, sh, d)
             else:                                             # plain RECESSED panel (flat-bottomed pocket)
-                d = g.depth * df
-                cuts.append((round(th, 4), (round(R - d, 4), round(-w / 2, 4), round(zc - h / 2, 4)),
-                             (round(d + over, 4), round(w, 4), round(h, 4))))
+                add_recess(th, 0.0, zc, w, h, g.depth * df)
     return cuts, rings, raises
 
 
@@ -148,6 +178,122 @@ def _cyl_ring_cutter(z0: float, gd: float, R: float) -> cq.Solid:
     outer = cq.Solid.makeCylinder(R + over, gd, cq.Vector(0, 0, z0))
     inner = cq.Solid.makeCylinder(R - gd, gd + 1.0, cq.Vector(0, 0, z0 - 0.5))
     return outer.cut(inner)
+
+
+def _apply_radial_greeble(r, cuts, rings, raises):
+    """Apply a radial greeble layout (cylinder OR revolve — same rotated-box + ring descriptors) to the
+    solid. DEFER CLEANING: every op clean=False, then one clean() — a per-op clean under fuzzy tol
+    fragments the solid into slivers and a later fuzzy UNION on that compound collapses to empty. Rings
+    first (most fragile), then cuts, then raises; pass GREEBLE_FUZZY (near-tangent curved-face booleans)."""
+    for z0, gd, Rr in rings:
+        r = r.cut(_cyl_ring_cutter(z0, gd, Rr), tol=GREEBLE_FUZZY, clean=False)
+    for th, corner, (sx, sy, sz) in cuts:
+        r = r.cut(cq.Solid.makeBox(sx, sy, sz, cq.Vector(*corner)).rotate((0, 0, 0), (0, 0, 1), th),
+                  tol=GREEBLE_FUZZY, clean=False)
+    for th, corner, (sx, sy, sz) in raises:
+        r = r.union(cq.Solid.makeBox(sx, sy, sz, cq.Vector(*corner)).rotate((0, 0, 0), (0, 0, 1), th),
+                    tol=GREEBLE_FUZZY, clean=False)
+    return _ensure_positive(r.clean())
+
+
+def _radius_at(profile, z: float) -> float:
+    """Outer radius of a revolved meridian `profile` ([[r,z],..]) at height z — piecewise-linear over the
+    segments that span z, taking the MAX (handles re-entrant meridians). Falls back to the max r."""
+    best = None
+    for (r0, z0), (r1, z1) in zip(profile, profile[1:]):
+        lo, hi = sorted((z0, z1))
+        if lo - 1e-9 <= z <= hi + 1e-9 and abs(z1 - z0) > 1e-9:
+            ri = r0 + (r1 - r0) * (z - z0) / (z1 - z0)
+            best = ri if best is None else max(best, ri)
+        elif abs(z1 - z0) <= 1e-9 and abs(z - z0) < 1e-9:
+            best = max(r0, r1) if best is None else max(best, r0, r1)
+    return best if best is not None else max((r for r, _ in profile), default=0.0)
+
+
+def _greeble_layout_rev(profile, g) -> tuple:
+    """Greeble layout for a REVOLVE body (axis on Z, radius varies with z per `profile`). A turned body is
+    a stack of local-radius cylinders, so this reuses the cylinder rotated-box + ring descriptors — but
+    each z-band uses its LOCAL radius `_radius_at(zc)` (so cutters follow the taper). Same (cuts, rings,
+    raises) format as `_greeble_layout_cyl` ⇒ shares `_apply_radial_greeble`/emit. Stage C."""
+    zs = [z for _, z in profile]
+    zmin, zmax = min(zs), max(zs); H = zmax - zmin
+    Rmax = max(r for r, _ in profile)
+    rng = random.Random(g.seed); over, gd = GREEBLE_OVER, g.groove
+    circ = 2 * math.pi * Rmax
+    nth = max(1, round(circ / g.panel)); nz = max(1, round(H / g.panel)) if H else 1
+    max_cells = 48
+    if nth * nz > max_cells:
+        f = (nth * nz / max_cells) ** 0.5
+        nth = max(1, round(nth / f)); nz = max(1, round(nz / f))
+    cell_ang = 2 * math.pi / nth; cell_z = H / nz
+    cuts: list = []; rings: list = []; raises: list = []
+
+    def add_recess(th, R, oy, oz, ww, hh, d):
+        cuts.append((round(th, 4), (round(R - d, 4), round(oy - ww / 2, 4), round(oz - hh / 2, 4)),
+                     (round(d + over, 4), round(ww, 4), round(hh, 4))))
+        b = min(g.bevel, g.margin * 0.6, d * 0.8)
+        if b > 0:
+            cuts.append((round(th, 4), (round(R - b, 4), round(oy - ww / 2 - b, 4), round(oz - hh / 2 - b, 4)),
+                         (round(b + over, 4), round(ww + 2 * b, 4), round(hh + 2 * b, 4))))
+
+    for j in range(1, nz):                                    # ring grooves at the LOCAL radius per z line
+        z = zmin + j * cell_z
+        rings.append((round(z - gd / 2, 4), round(gd, 4), round(_radius_at(profile, z), 4)))
+
+    def focal_w(zc):
+        rr = abs(zc - (zmin + H / 2)) / (H / 2) if H else 0.0
+        if g.focal == "center":
+            return max(0.15, 1.0 - 0.7 * min(1.0, rr))
+        if g.focal == "edges":
+            return max(0.15, 0.3 + 0.7 * min(1.0, rr))
+        return 1.0
+
+    for i in range(nth):
+        th = math.degrees((i + 0.5) * cell_ang)
+        for j in range(nz):
+            zc = zmin + (j + 0.5) * cell_z; R = _radius_at(profile, zc)
+            roll = rng.random(); kind = rng.random(); sub = rng.random(); df = 0.6 + 0.4 * rng.random()
+            if R <= 1.0 or roll >= g.density * focal_w(zc):
+                continue
+            cuts.append((round(th, 4), (round(R - gd, 4), round(-gd / 2, 4), round(zmin + j * cell_z, 4)),
+                         (round(gd + over, 4), round(gd, 4), round(cell_z, 4))))   # vertical groove segment
+            w = max(1.0, R * cell_ang - 2 * g.margin); h = max(1.0, cell_z - 2 * g.margin)
+            if kind < g.raised:
+                raises.append((round(th, 4), (round(R - over, 4), round(-w / 2, 4), round(zc - h / 2, 4)),
+                               (round(g.raise_h + over, 4), round(w, 4), round(h, 4))))
+            elif g.levels >= 2 and sub < g.subdiv:
+                sm = g.margin * 0.6; sw = max(0.8, (w - sm) / 2); sh = max(0.8, (h - sm) / 2); d = g.depth * df
+                for sy in (-1, 1):
+                    for sz in (-1, 1):
+                        add_recess(th, R, sy * (sw + sm) / 2, zc + sz * (sh + sm) / 2, sw, sh, d)
+            else:
+                add_recess(th, R, 0.0, zc, w, h, g.depth * df)
+    return cuts, rings, raises
+
+
+def _greeble_loft(r, spec, g):
+    """Greeble the loft's TOP (+Z-most) face. A ruled loft has PLANAR faces, so reuse the flat box layout
+    in that face's own frame: lay cutters in canonical XY (surface at z=0, +z outward), then `.moved` onto
+    the face plane. Covers the tapered-bar / engineered-arm look; fuzzy tol + deferred clean. Stage C."""
+    face = max(r.val().Faces(), key=lambda f: f.normalAt().z)   # the upward-facing planar face
+    n = face.normalAt(); c = face.Center()
+    gx = cq.Vector(1, 0, 0)
+    u = (gx - n.multiply(gx.dot(n)))
+    u = u.normalized() if u.Length > 1e-6 else cq.Vector(0, 1, 0)
+    v = n.cross(u)
+    pts = [vx.toTuple() for vx in face.Vertices()]
+    us = [(cq.Vector(*p) - c).dot(u) for p in pts]; vs = [(cq.Vector(*p) - c).dot(v) for p in pts]
+    Lu, Lv = max(us) - min(us), max(vs) - min(vs)
+    origin = c + u.multiply((max(us) + min(us)) / 2) + v.multiply((max(vs) + min(vs)) / 2)  # face bbox center
+    cuts, raises = _greeble_layout(Lu * 0.94, Lv * 0.94, 10.0, g)   # inset off the slanted face edges
+    loc = cq.Plane(origin=origin.toTuple(), xDir=u.toTuple(), normal=n.toTuple()).location
+    for corner, (sx, sy, sz) in cuts:
+        box = cq.Solid.makeBox(sx, sy, sz, cq.Vector(*corner)).translate(cq.Vector(0, 0, -5.0)).moved(loc)
+        r = r.cut(box, tol=GREEBLE_FUZZY, clean=False)
+    for corner, (sx, sy, sz) in raises:
+        box = cq.Solid.makeBox(sx, sy, sz, cq.Vector(*corner)).translate(cq.Vector(0, 0, -5.0)).moved(loc)
+        r = r.union(box, tol=GREEBLE_FUZZY, clean=False)
+    return _ensure_positive(r.clean())
 
 
 def build(spec: Spec) -> cq.Workplane:
@@ -217,22 +363,18 @@ def build(spec: Spec) -> cq.Workplane:
             r = r.union(cq.Solid.makeBox(sx, sy, sz, cq.Vector(*corner)))
     elif g is not None and spec.shape == "cylinder":
         # Stage C: greeble the CYLINDER lateral face. Radial flat-box cutters (built at +X, rotated to θ)
-        # + ring grooves — near-tangent to the curved surface, so pass GREEBLE_FUZZY as the boolean `tol`
-        # (OCCT SetFuzzyValue; greeble-detail-research.md's #1 risk). Sequential, never a Compound cutter.
-        # DEFER CLEANING: every op clean=False, then one clean() at the end — a per-op clean under fuzzy
-        # tol fragments the solid into slivers, and a later fuzzy UNION on that compound collapses to
-        # empty. Rings first (the most fragile op), then cuts, then raises.
-        R_ = spec.envelope["diameter"] / 2.0; H_ = spec.envelope["height"]
-        cuts, rings, raises = _greeble_layout_cyl(R_, H_, g)
-        for z0, gd, Rr in rings:
-            r = r.cut(_cyl_ring_cutter(z0, gd, Rr), tol=GREEBLE_FUZZY, clean=False)
-        for th, corner, (sx, sy, sz) in cuts:
-            box = cq.Solid.makeBox(sx, sy, sz, cq.Vector(*corner)).rotate((0, 0, 0), (0, 0, 1), th)
-            r = r.cut(box, tol=GREEBLE_FUZZY, clean=False)
-        for th, corner, (sx, sy, sz) in raises:
-            box = cq.Solid.makeBox(sx, sy, sz, cq.Vector(*corner)).rotate((0, 0, 0), (0, 0, 1), th)
-            r = r.union(box, tol=GREEBLE_FUZZY, clean=False)
-        r = r.clean()
+        # + ring grooves — near-tangent to the curved surface (the research's #1 robustness risk); the
+        # shared helper applies them with fuzzy tol + deferred clean. Never a Compound cutter.
+        cuts, rings, raises = _greeble_layout_cyl(spec.envelope["diameter"] / 2.0, spec.envelope["height"], g)
+        r = _apply_radial_greeble(r, cuts, rings, raises)
+    elif g is not None and spec.shape == "revolve":
+        # Stage C: greeble a REVOLVE (turned body) — a stack of local-radius cylinders, so it reuses the
+        # cylinder radial machinery with a per-z-band radius (cutters follow the taper).
+        cuts, rings, raises = _greeble_layout_rev(spec.profile or [], g)
+        r = _apply_radial_greeble(r, cuts, rings, raises)
+    elif g is not None and spec.shape == "loft":
+        # Stage C: greeble the loft's top planar face in its own (tilted) frame.
+        r = _greeble_loft(r, spec, g)
     # all through-holes (single + patterns + ANY axis) as explicit cylinder cutters
     for px, py, pz, d, axis in expected_holes(spec):
         r = r.cut(_hole_cutter(px, py, pz, d, axis, spec))
@@ -382,9 +524,11 @@ def emit_code(spec: Spec) -> str:
         L.append(f"_graise = {_raises}")
         L.append("for _c, _s in _gcuts: result = result.cut(cq.Solid.makeBox(_s[0], _s[1], _s[2], cq.Vector(*_c)))")
         L.append("for _c, _s in _graise: result = result.union(cq.Solid.makeBox(_s[0], _s[1], _s[2], cq.Vector(*_c)))")
-    elif _g is not None and spec.shape == "cylinder":
-        # cylinder greeble (Stage C): radial rotated-box cutters + ring grooves, near-tangent ⇒ fuzzy tol.
-        _ccuts, _crings, _craise = _greeble_layout_cyl(e["diameter"] / 2.0, e["height"], _g)
+    elif _g is not None and spec.shape in ("cylinder", "revolve"):
+        # cylinder/revolve greeble (Stage C): radial rotated-box cutters + ring grooves, near-tangent ⇒
+        # fuzzy tol + deferred clean. Same descriptor format for both (revolve uses per-band radii).
+        _ccuts, _crings, _craise = (_greeble_layout_cyl(e["diameter"] / 2.0, e["height"], _g)
+                                    if spec.shape == "cylinder" else _greeble_layout_rev(spec.profile or [], _g))
         L.append(f"_gcuts = {_ccuts}")
         L.append(f"_grings = {_crings}")
         L.append(f"_graise = {_craise}")
@@ -398,6 +542,31 @@ def emit_code(spec: Spec) -> str:
         L.append("for _th, _c, _s in _graise: result = result.union("
                  "cq.Solid.makeBox(_s[0], _s[1], _s[2], cq.Vector(*_c)).rotate((0,0,0),(0,0,1),_th), tol=_gtol, clean=False)")
         L.append("result = result.clean()")
+        L.extend(_EMIT_ORIENT_FIX)
+    elif _g is not None and spec.shape == "loft":
+        # loft greeble (Stage C): box layout placed on the top planar face. Layout sized here (from the
+        # built loft's top face); the face frame is RE-DERIVED at runtime from `result` so it stays exact.
+        _ls = _loft_solid(spec); _fc = max(_ls.val().Faces(), key=lambda f: f.normalAt().z)
+        _nn = _fc.normalAt(); _cc = _fc.Center()
+        _ux = cq.Vector(1, 0, 0); _u = (_ux - _nn.multiply(_ux.dot(_nn)))
+        _u = _u.normalized() if _u.Length > 1e-6 else cq.Vector(0, 1, 0)
+        _vv = _nn.cross(_u); _pp = [q.toTuple() for q in _fc.Vertices()]
+        _us = [(cq.Vector(*q) - _cc).dot(_u) for q in _pp]; _vs = [(cq.Vector(*q) - _cc).dot(_vv) for q in _pp]
+        _cuts, _raises = _greeble_layout((max(_us) - min(_us)) * 0.94, (max(_vs) - min(_vs)) * 0.94, 10.0, _g)
+        L.append(f"_gcuts = {_cuts}"); L.append(f"_graise = {_raises}; _gtol = {GREEBLE_FUZZY}")
+        L.append("_f = max(result.val().Faces(), key=lambda f: f.normalAt().z); _n = _f.normalAt(); _c = _f.Center()")
+        L.append("_ux = cq.Vector(1,0,0); _u = (_ux - _n.multiply(_ux.dot(_n)))")
+        L.append("_u = _u.normalized() if _u.Length > 1e-6 else cq.Vector(0,1,0); _v = _n.cross(_u)")
+        L.append("_p = [q.toTuple() for q in _f.Vertices()]")
+        L.append("_us = [(cq.Vector(*q)-_c).dot(_u) for q in _p]; _vs = [(cq.Vector(*q)-_c).dot(_v) for q in _p]")
+        L.append("_org = _c + _u.multiply((max(_us)+min(_us))/2) + _v.multiply((max(_vs)+min(_vs))/2)")
+        L.append("_loc = cq.Plane(origin=_org.toTuple(), xDir=_u.toTuple(), normal=_n.toTuple()).location")
+        L.append("for _q, _s in _gcuts: result = result.cut(cq.Solid.makeBox(_s[0],_s[1],_s[2],cq.Vector(*_q))"
+                 ".translate(cq.Vector(0,0,-5.0)).moved(_loc), tol=_gtol, clean=False)")
+        L.append("for _q, _s in _graise: result = result.union(cq.Solid.makeBox(_s[0],_s[1],_s[2],cq.Vector(*_q))"
+                 ".translate(cq.Vector(0,0,-5.0)).moved(_loc), tol=_gtol, clean=False)")
+        L.append("result = result.clean()")
+        L.extend(_EMIT_ORIENT_FIX)
     for px, py, pz, d, axis in expected_holes(spec):
         dx, dy, dz = _DIR[axis]
         ext = _axis_extent(spec, axis)

@@ -435,6 +435,43 @@ def _nearest_cone(cones: List[Cone], x: float, y: float, window: float) -> Optio
     return min(cands, key=lambda c: (c.x - x) ** 2 + (c.y - y) ** 2) if cands else None
 
 
+def _verify_greeble_rebuild(solid, spec: Spec, m, tol: float) -> Report:
+    """Greeble verification for shapes with no closed-form base volume (revolve/loft): build the SAME
+    spec WITHOUT the greeble feature, measure it = base, then confirm (a) detail actually moved volume,
+    (b) the bbox only grew by the raised-panel protrusion (recesses don't grow it), (c) still a valid
+    single solid. Short-circuits the per-feature analysis like the box/cylinder greeble branch."""
+    from .builder import _ensure_positive, _greeble_layout_rev, build
+    bare = spec.model_copy(deep=True)
+    bare.features = [f for f in bare.features if f.type != "greeble"]
+    bm = measure(_ensure_positive(build(bare)))   # orientation-normalize so the base volume sign matches m
+    gb = next(f for f in spec.features if f.type == "greeble")
+    # raised flat slabs grow the RADIAL bbox (dx/dy) — their flat corners reach past R+raise_h by a chord
+    # bulge; derive the exact bound from the shared layout (as the cylinder branch does). dz (axial) holds.
+    rh = getattr(gb, "raise_h", 0.0) if gb.raised > 0 else 0.0
+    if spec.shape == "revolve":
+        # raised flat slabs grow the RADIAL bbox (dx/dy); dz (axial) holds. Exact bound from the layout.
+        radial_reach = 0.0
+        if rh > 0:
+            _, _, _raises = _greeble_layout_rev(spec.profile or [], gb)
+            for _th, _c, _s in _raises:
+                radial_reach = max(radial_reach, ((_c[0] + _s[0]) ** 2 + (_s[1] / 2.0) ** 2) ** 0.5)
+        tops = (max(bm.dx, 2 * radial_reach), max(bm.dy, 2 * radial_reach), bm.dz)
+    else:
+        # loft (top-face greeble): raises protrude along the face normal (≈+Z) by raise_h; allow each axis
+        # a small growth (recesses don't grow the bbox). Generous but bounded — catches a ballooned result.
+        tops = (bm.dx + rh + 1.0, bm.dy + rh + 1.0, bm.dz + rh + 1.0)
+    rows: List[Row] = []
+    for name, b, meas, top in (("envelope · dx", bm.dx, m.dx, tops[0]),
+                               ("envelope · dy", bm.dy, m.dy, tops[1]),
+                               ("envelope · dz", bm.dz, m.dz, tops[2])):
+        ok = b - tol <= meas <= top + tol
+        rows.append(Row(name, round(b, 4), round(meas, 4), ok, "ok" if ok else "dimensional"))
+    changed = abs(bm.volume - m.volume)
+    ok = changed > max(1e-6, 1e-3 * bm.volume) and m.volume < 1.6 * bm.volume
+    rows.append(Row("greeble · detail", 0.0, round(m.volume - bm.volume, 2), ok, "ok" if ok else "selector-binding"))
+    return Report(m.valid, m.solids, m.volume, rows)
+
+
 def verify(solid, spec: Spec) -> Report:
     m = measure(solid)
     tol = spec.tolerance
@@ -444,6 +481,8 @@ def verify(solid, spec: Spec) -> Report:
     # revolve has its own (axisymmetric) verification — the prismatic hole/fillet/leftover logic
     # below assumes box/cylinder topology and would mis-flag a turned body's walls as "unexpected".
     if spec.shape == "revolve":
+        if any(f.type == "greeble" for f in spec.features):   # greebled turned body (Stage C)
+            return _verify_greeble_rebuild(solid, spec, m, tol)
         return Report(m.valid, m.solids, m.volume, _verify_revolve(solid, spec, tol))
     if spec.shape == "sweep":
         # a constant round section swept along the path ⇒ vol = π·r²·(path length). Back-compute the
@@ -454,6 +493,9 @@ def verify(solid, spec: Spec) -> Report:
         rows.append(Row("sweep · profile ⌀ (from volume)", d, round(d_meas, 4) if d_meas else None,
                         d_meas is not None and abs(d_meas - d) <= tol, "ok" if (d_meas is not None and abs(d_meas - d) <= tol) else "dimensional"))
         return Report(m.valid, m.solids, m.volume, rows)
+
+    if spec.shape == "loft" and any(f.type == "greeble" for f in spec.features):   # greebled bar (Stage C)
+        return _verify_greeble_rebuild(solid, spec, m, tol)
 
     def dim(name, exp, meas, cat_fail="dimensional"):
         if meas is None:

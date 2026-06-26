@@ -42,6 +42,8 @@ CASES = [
     ("cyl fuel tank",    "cylinder", {"diameter": 120, "height": 200},            dict(panel=40, depth=3, density=0.6)),
     ("cyl pod (edges)",  "cylinder", {"diameter": 80,  "height": 120},            dict(panel=30, density=0.5, focal="edges")),
     ("cyl hull tube",    "cylinder", {"diameter": 150, "height": 250},            dict(panel=18, depth=3, density=0.8)),
+    ("box beveled",      "box",      {"length": 200, "width": 120, "height": 15}, dict(panel=40, depth=3, density=0.6, bevel=1.0)),
+    ("cyl beveled",      "cylinder", {"diameter": 120, "height": 200},            dict(panel=40, depth=3, density=0.6, bevel=1.0)),
 ]
 
 # dense / extreme geometry — the near-tangent-boolean robustness probe (Stage C).
@@ -49,6 +51,23 @@ STRESS = [
     ("cyl dense+raised", "cylinder", {"diameter": 120, "height": 200}, dict(panel=8,  density=0.9, depth=3, raised=0.4)),
     ("cyl thin tall",    "cylinder", {"diameter": 40,  "height": 300}, dict(panel=10, density=0.85)),
     ("cyl wide short",   "cylinder", {"diameter": 300, "height": 60},  dict(panel=12, density=0.8, focal="center")),
+]
+
+# revolve (turned bodies) + loft (tapered bar) — Stage C curved/tilted faces. Built as explicit Specs
+# (they need a profile / top dims). (label, spec).
+CURVED = [
+    ("rev nozzle", Spec(object="nozzle", shape="revolve", envelope={"angle": 360.0},
+                        profile=[[40, 0], [40, 40], [25, 90], [25, 120]],
+                        features=[{"type": "greeble", "face": "side", "panel": 30, "depth": 3, "density": 0.6}])),
+    ("rev tank+dome", Spec(object="tank", shape="revolve", envelope={"angle": 360.0},
+                          profile=[[0, 0], [50, 0], [50, 120], [35, 160], [0, 175]],
+                          features=[{"type": "greeble", "face": "side", "panel": 35, "depth": 4, "density": 0.7, "focal": "center"}])),
+    ("rev stepped+bevel", Spec(object="stepped", shape="revolve", envelope={"angle": 360.0},
+                              profile=[[30, 0], [30, 50], [45, 50], [45, 100]],
+                              features=[{"type": "greeble", "panel": 25, "density": 0.8, "bevel": 1.0}])),
+    ("loft bar", Spec(object="arm", shape="loft",
+                      envelope={"length": 160, "width": 60, "height": 40, "width_top": 30, "height_top": 20},
+                      features=[{"type": "greeble", "panel": 28, "depth": 3, "density": 0.7}])),
 ]
 
 
@@ -68,13 +87,32 @@ def _check(label: str, spec: Spec) -> bool:
     return ok
 
 
+def _sweep_noop() -> bool:
+    """greeble on a SWEEP is a documented no-op (deferred) — it must still BUILD a valid solid, not crash."""
+    spec = Spec(object="tube", shape="sweep", envelope={"diameter": 16},
+                path=[[0, 0, 0], [0, 0, 60], [40, 0, 90]],
+                features=[{"type": "greeble", "panel": 20, "density": 0.6}])
+    try:
+        rep = verify(build(spec), spec)
+        ok = rep.valid and rep.solids == 1
+    except Exception as e:  # noqa: BLE001
+        ok = False; print(f"    sweep+greeble raised {type(e).__name__}: {e}")
+    print(f"  [{'ok ' if ok else 'FAIL'}] sweep+greeble no-op builds a valid solid")
+    return ok
+
+
 def main() -> int:
     print("GREEBLE — golden (box + cylinder):")
     g_ok = sum(_check(lbl, _greeble(sh, env, **gp)) for lbl, sh, env, gp in CASES)
+    print("GREEBLE — curved/tilted bodies (revolve + loft):")
+    c_ok = sum(_check(lbl, spec) for lbl, spec in CURVED)
     print("GREEBLE — robustness stress (dense curved-face booleans):")
     s_ok = sum(_check(lbl, _greeble(sh, env, **gp)) for lbl, sh, env, gp in STRESS)
-    total = len(CASES) + len(STRESS); ok = g_ok + s_ok
-    print(f"\nGREEBLE {ok}/{total}  (golden {g_ok}/{len(CASES)} · stress {s_ok}/{len(STRESS)})")
+    print("GREEBLE — sweep no-op (deferred shape):")
+    n_ok = int(_sweep_noop())
+    total = len(CASES) + len(CURVED) + len(STRESS) + 1; ok = g_ok + c_ok + s_ok + n_ok
+    print(f"\nGREEBLE {ok}/{total}  (golden {g_ok}/{len(CASES)} · curved {c_ok}/{len(CURVED)} · "
+          f"stress {s_ok}/{len(STRESS)} · sweep-noop {n_ok}/1)")
     return 0 if ok == total else 1
 
 

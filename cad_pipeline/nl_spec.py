@@ -123,10 +123,10 @@ PARSER_HINT = (
     "height,width_top,height_top} revolve:profile=[[r,z],..] sweep:{diameter}+path=[[x,y,z],..]. "
     "features: through_hole/hole_pattern/fillet/chamfer/var_fillet/pocket/counterbore/countersink/"
     "draft/shell/thread/mirror/greeble. greeble{panel,depth,density,seed}=procedural sci-fi detail pass "
-    "(panel grid + recessed panels) for greebled/detailed/panelled/industrial parts — on a box (top face) "
-    "or a cylinder (side face: hull tubes/tanks/pods). "
+    "(panel grid + recessed panels) for greebled/detailed/panelled/industrial parts — on a box (top face), "
+    "cylinder/revolve (side face: hull tubes/tanks/pods/nozzles/domes), or loft (top face). "
     "A STRAIGHT round body (just diameter + length/height, no bent path) is a CYLINDER, not a sweep; "
-    "use sweep ONLY for a tube that follows a 3D path. "
+    "use sweep ONLY for a tube that follows a 3D path. greeble.bevel>0 for beveled/chamfered/machined-rim panels. "
     "Holes default to the z axis. Output ONLY the JSON.\nDescription: ")
 
 

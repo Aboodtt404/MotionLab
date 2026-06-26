@@ -152,10 +152,12 @@ class Greeble(BaseModel):
     panels (greeble-detail-research.md). Cosmetic + purely SUBTRACTIVE, so the envelope is unchanged.
     Deterministic via `seed`. Recesses are inset `margin` from the grooves so cutters stay disjoint
     (no near-coincident booleans → robust). Density < 1 gives the non-uniform, focal look ('detail
-    everywhere = no detail'). The builder dispatches on `spec.shape`: a BOX greebles its top (+Z) face
-    (Stage A/B); a CYLINDER greebles its lateral (+R) face via the unrolled arc-length×height grid with
-    radial cutters + fuzzy-boolean tolerance (Stage C, greeble-detail-research.md's deferred robustness
-    case). focal `center`→busy mid-height band, `edges`→busy top/bottom rings."""
+    everywhere = no detail'). The builder dispatches on `spec.shape` (Stage A/B = box; Stage C = curved/
+    tilted bodies): BOX → top (+Z) face; CYLINDER → lateral (+R) face (unrolled arc-length×height grid,
+    radial cutters + fuzzy-boolean tol — the research's deferred robustness case); REVOLVE → lateral face
+    via per-z-band local radius (cutters follow the taper); LOFT → top planar face in its own tilted
+    frame. SWEEP is NOT supported (a bent, varying-frame tube — deferred; greeble is a no-op on a sweep).
+    focal `center`→busy mid-height band, `edges`→busy top/bottom rings."""
     type: Literal["greeble"] = "greeble"
     face: Literal["top", "side"] = "top"   # box top (+Z) face; cylinder lateral (+R) face = "side"
     panel: float = 20.0               # nominal panel cell size (mm) — sets the subdivision granularity
@@ -170,6 +172,7 @@ class Greeble(BaseModel):
     raised: float = 0.3               # fraction of detailed cells that RAISE a panel (additive) vs recess
     raise_h: float = 1.5              # raised-panel protrusion off the face (mm) — grows box height / cyl ⌀ by this
     focal: Literal["none", "center", "edges"] = "center"  # density weighting → non-uniform, focal points
+    bevel: float = 0.0                # >0 ⇒ a shallow wider STEP around each recess mouth (machined rim look)
 
 
 Feature = Annotated[
