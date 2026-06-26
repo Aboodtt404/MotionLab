@@ -150,11 +150,14 @@ class Greeble(BaseModel):
     """A procedural hard-surface DETAIL PASS on a face (the sci-fi/filmic look): subdivide the face into
     a grid of panels, cut panel-line grooves along the grid, and recess a seeded `density` fraction of
     panels (greeble-detail-research.md). Cosmetic + purely SUBTRACTIVE, so the envelope is unchanged.
-    Deterministic via `seed`. Stage A = box top (+Z) face. Recesses are inset `margin` from the grooves
-    so cutters stay disjoint (no near-coincident booleans → robust). Density < 1 gives the non-uniform,
-    focal look ('detail everywhere = no detail')."""
+    Deterministic via `seed`. Recesses are inset `margin` from the grooves so cutters stay disjoint
+    (no near-coincident booleans → robust). Density < 1 gives the non-uniform, focal look ('detail
+    everywhere = no detail'). The builder dispatches on `spec.shape`: a BOX greebles its top (+Z) face
+    (Stage A/B); a CYLINDER greebles its lateral (+R) face via the unrolled arc-length×height grid with
+    radial cutters + fuzzy-boolean tolerance (Stage C, greeble-detail-research.md's deferred robustness
+    case). focal `center`→busy mid-height band, `edges`→busy top/bottom rings."""
     type: Literal["greeble"] = "greeble"
-    face: Literal["top"] = "top"      # top (+Z) face
+    face: Literal["top", "side"] = "top"   # box top (+Z) face; cylinder lateral (+R) face = "side"
     panel: float = 20.0               # nominal panel cell size (mm) — sets the subdivision granularity
     depth: float = 2.0                # recessed-panel depth
     density: float = 0.5              # fraction of panels DETAILED (0..1); <1 ⇒ focal points + rest areas
@@ -165,7 +168,7 @@ class Greeble(BaseModel):
     levels: int = 2                   # 1 = flat cells; ≥2 = some cells subdivide into 2×2 finer sub-recesses
     subdiv: float = 0.35              # fraction of detailed cells that subdivide (when levels≥2)
     raised: float = 0.3               # fraction of detailed cells that RAISE a panel (additive) vs recess
-    raise_h: float = 1.5              # raised-panel protrusion above the top face (mm) — grows height by this
+    raise_h: float = 1.5              # raised-panel protrusion off the face (mm) — grows box height / cyl ⌀ by this
     focal: Literal["none", "center", "edges"] = "center"  # density weighting → non-uniform, focal points
 
 

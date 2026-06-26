@@ -486,14 +486,31 @@ def verify(solid, spec: Spec) -> Report:
     # is still valid/single (Report.passed), then return — like mirror, it short-circuits the prismatic
     # leftover analysis that would mis-flag the recesses as "unexpected".
     gb = next((f for f in spec.features if f.type == "greeble"), None)
-    if gb is not None and spec.shape == "box":
-        base = e["length"] * e["width"] * e["height"]
-        # L/W unchanged; height may GROW by the raised-panel protrusion (raise_h). Re-check height here
-        # against H + raise_h (the box envelope rows above used plain H and may have flagged it).
+    if gb is not None and spec.shape in ("box", "cylinder"):
         raise_h = getattr(gb, "raise_h", 0.0) if gb.raised > 0 else 0.0
+        if spec.shape == "box":
+            # L/W unchanged; height may GROW by the raised-panel protrusion (raise_h). Re-check height
+            # here against H + raise_h (the box envelope rows above used plain H and may have flagged it).
+            base = e["length"] * e["width"] * e["height"]
+            grow_row = "envelope · height"; grow = raise_h
+        else:
+            # cylinder side greeble: ⌀ may GROW where raised panels protrude radially; height holds. A
+            # raised slab is FLAT (tangent to the curve), so its CORNERS reach past R+raise_h by a chord
+            # bulge — derive the exact bound from the shared layout (build/emit/verifier agree on it).
+            R = e["diameter"] / 2.0
+            base = math.pi * R ** 2 * e["height"]
+            grow_row = "envelope · ⌀"
+            max_reach = R
+            if raise_h > 0:
+                from .builder import _greeble_layout_cyl
+                _, _, _raises = _greeble_layout_cyl(R, e["height"], gb)
+                for _th, _c, _s in _raises:
+                    max_reach = max(max_reach, ((_c[0] + _s[0]) ** 2 + (_s[1] / 2.0) ** 2) ** 0.5)
+            grow = 2 * max_reach - e["diameter"]
         for row in rows:
-            if row.name == "envelope · height":
-                row.within_tol = e["height"] - tol <= (row.measured or 0) <= e["height"] + raise_h + tol
+            if row.name == grow_row:
+                lo = (e["height"] if spec.shape == "box" else e["diameter"])
+                row.within_tol = lo - tol <= (row.measured or 0) <= lo + grow + tol
                 row.category = "ok" if row.within_tol else "dimensional"
         changed = abs(base - m.volume)   # detail present = volume moved (recesses remove, raises add)
         ok = changed > max(1e-6, 1e-3 * base) and m.volume < 1.6 * base

@@ -50,10 +50,11 @@ _SYSTEM = (
     '  {"type":"countersink","diameter":D,"csk_diameter":Dc,"csk_angle":deg,"at":[x,y]?}\n'
     '  {"type":"thread","diameter":D,"pitch":P,"kind":"internal"|"external"}   '
     '{"type":"mirror","plane":"XY"|"XZ"|"YZ"}\n'
-    '  {"type":"greeble","panel":mm?,"depth":mm?,"density":0..1?,"seed":int?}  (box-only) — a procedural '
-    'sci-fi DETAIL pass: panel-line grid + recessed panels on the top face. Use for "greebled / detailed / '
-    'panelled / industrial / hull-panel / sci-fi-surface" parts. panel≈cell size (default 20), density≈how '
-    'busy (default 0.5), depth default 2.\n\n'
+    '  {"type":"greeble","panel":mm?,"depth":mm?,"density":0..1?,"seed":int?} — a procedural '
+    'sci-fi DETAIL pass: panel-line grid + recessed panels. Works on a BOX (top face) or a CYLINDER '
+    '(lateral/side face — for hull tubes, fuel tanks, pods: shape it as a cylinder with diameter+height). '
+    'Use for "greebled / detailed / panelled / industrial / hull-panel / sci-fi-surface" parts. '
+    'panel≈cell size (default 20), density≈how busy (default 0.5), depth default 2.\n\n'
     "RULES:\n"
     "- Units are mm. Default tolerance 0.1 if unstated. Output ONE json block, nothing after it.\n"
     "- RADIUS r ⇒ diameter = 2*r. diameter/⌀ d ⇒ diameter = d.\n"
@@ -122,7 +123,10 @@ PARSER_HINT = (
     "height,width_top,height_top} revolve:profile=[[r,z],..] sweep:{diameter}+path=[[x,y,z],..]. "
     "features: through_hole/hole_pattern/fillet/chamfer/var_fillet/pocket/counterbore/countersink/"
     "draft/shell/thread/mirror/greeble. greeble{panel,depth,density,seed}=procedural sci-fi detail pass "
-    "(panel grid + recessed panels) for greebled/detailed/panelled/industrial box parts. "
+    "(panel grid + recessed panels) for greebled/detailed/panelled/industrial parts — on a box (top face) "
+    "or a cylinder (side face: hull tubes/tanks/pods). "
+    "A STRAIGHT round body (just diameter + length/height, no bent path) is a CYLINDER, not a sweep; "
+    "use sweep ONLY for a tube that follows a 3D path. "
     "Holes default to the z axis. Output ONLY the JSON.\nDescription: ")
 
 

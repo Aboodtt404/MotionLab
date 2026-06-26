@@ -102,10 +102,13 @@ _EXAMPLES = {
                 '.box) — base L×W at z=-H/2, tapering inward by `angle`° up to the top. Do this FIRST, then '
                 'add other features.',
                 'result = cq.Workplane("XY").workplane(offset=-H / 2).rect(L, W).extrude(H, taper=angle)'),
-    "greeble": ('greeble = procedural hard-surface detail pass on a box top: subdivide into a grid of '
+    "greeble": ('greeble = procedural hard-surface detail pass: subdivide a face into a grid of '
                 'panels (~`panel` mm), cut panel-line GROOVES along the grid + recess a seeded `density` '
                 'fraction of panels (depth `depth`), recesses inset `margin` off the grooves. Cut each box '
-                'SEQUENTIALLY (a Compound cutter inverts the solid in OCCT); cutters protrude above the top.',
+                'SEQUENTIALLY (a Compound cutter inverts the solid in OCCT); cutters protrude above the top. '
+                'On a BOX greeble the top face (axis-aligned cutters); on a CYLINDER greeble the side face '
+                '(radial rotated-box cutters near-tangent to the surface ⇒ pass tol=1e-3 fuzzy + defer '
+                'clean). NOTE: greeble is built by the deterministic builder, not generated here.',
                 'import random as _rnd\n'
                 '_rng = _rnd.Random(seed); _tz = H/2; _over = 0.5\n'
                 '_nx = max(1, round(L/panel)); _ny = max(1, round(W/panel)); _cx = L/_nx; _cy = W/_ny\n'
