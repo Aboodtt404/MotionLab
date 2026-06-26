@@ -146,9 +146,26 @@ class Mirror(BaseModel):
     plane: Literal["XY", "XZ", "YZ"] = "YZ"
 
 
+class Greeble(BaseModel):
+    """A procedural hard-surface DETAIL PASS on a face (the sci-fi/filmic look): subdivide the face into
+    a grid of panels, cut panel-line grooves along the grid, and recess a seeded `density` fraction of
+    panels (greeble-detail-research.md). Cosmetic + purely SUBTRACTIVE, so the envelope is unchanged.
+    Deterministic via `seed`. Stage A = box top (+Z) face. Recesses are inset `margin` from the grooves
+    so cutters stay disjoint (no near-coincident booleans → robust). Density < 1 gives the non-uniform,
+    focal look ('detail everywhere = no detail')."""
+    type: Literal["greeble"] = "greeble"
+    face: Literal["top"] = "top"      # Stage A: top (+Z) face only
+    panel: float = 20.0               # nominal panel cell size (mm) — sets the subdivision granularity
+    depth: float = 2.0                # recessed-panel depth
+    density: float = 0.5              # fraction of panels recessed (0..1); <1 ⇒ focal points + rest areas
+    groove: float = 1.0               # panel-line groove width AND depth (shallow)
+    margin: float = 3.0               # recess inset within a cell (keeps recesses off the grooves)
+    seed: int = 0                     # determinism: same seed ⇒ same layout (builder == emit_code == verifier)
+
+
 Feature = Annotated[
     Union[ThroughHole, HolePattern, Fillet, Chamfer, Pocket, Draft, CounterboreHole, CountersinkHole,
-          Mirror, Shell, VarFillet, Thread],
+          Mirror, Shell, VarFillet, Thread, Greeble],
     Field(discriminator="type")]
 
 

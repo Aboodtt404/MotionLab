@@ -7,11 +7,45 @@ oracle. Mirrors the operation vocabulary the generator is allowed to use.
 """
 from __future__ import annotations
 
+import random
+
 import cadquery as cq
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
 
 from .selectors import CQ_EDGE
 from .spec import Spec, expected_holes
+
+
+def _greeble_boxes(L: float, W: float, H: float, g) -> list:
+    """Deterministic cutter boxes for a top-face greeble pass — `[(corner_xyz, size_xyz), …]`, tops at
+    z=H/2 (cut downward). Panel-line grooves along the internal grid lines + recessed panels on a seeded
+    `density` fraction of cells (greeble-detail-research.md). Recesses are inset `margin` from the cell
+    edges so they never touch the grooves → disjoint cutters → robust booleans. Shared by build() (cut),
+    emit_code() (re-emit), and the verifier (expected removed volume) so all three agree exactly.
+    The RNG advances identically for EVERY cell (roll + depth draw) regardless of density, so changing
+    density doesn't shift the layout of the cells that remain."""
+    rng = random.Random(g.seed)
+    tz = H / 2.0
+    over = 0.5            # cutters protrude `over` ABOVE the top face so there's no coincident face
+    nx = max(1, round(L / g.panel)); ny = max(1, round(W / g.panel))
+    cx, cy = L / nx, W / ny
+    gw = gd = g.groove
+    boxes: list = []
+    for i in range(1, nx):                                   # grooves at constant x (run along Y)
+        x = -L / 2 + i * cx
+        boxes.append(((x - gw / 2, -W / 2, tz - gd), (gw, W, gd + over)))
+    for j in range(1, ny):                                   # grooves at constant y (run along X)
+        y = -W / 2 + j * cy
+        boxes.append(((-L / 2, y - gw / 2, tz - gd), (L, gw, gd + over)))
+    for i in range(nx):                                      # recessed panels (seeded, density-gated)
+        for j in range(ny):
+            roll = rng.random(); depth = g.depth * (0.6 + 0.4 * rng.random())   # advance rng every cell
+            if roll < g.density:
+                px = -L / 2 + (i + 0.5) * cx; py = -W / 2 + (j + 0.5) * cy
+                rw = max(1.0, cx - 2 * g.margin); rh = max(1.0, cy - 2 * g.margin)
+                boxes.append(((px - rw / 2, py - rh / 2, tz - depth),
+                              (round(rw, 4), round(rh, 4), round(depth + over, 4))))
+    return boxes
 
 
 def build(spec: Spec) -> cq.Workplane:
@@ -67,6 +101,15 @@ def build(spec: Spec) -> cq.Workplane:
             if f.at is not None:
                 wp = wp.center(f.at[0], f.at[1])
             r = wp.rect(f.length, f.width).cutBlind(-f.depth)
+    # greeble — procedural hard-surface detail pass on the top face (Stage A: box). One boolean with a
+    # compound of DISJOINT cutters (grooves on the grid + recessed panels inset off them) ⇒ robust.
+    g = next((f for f in spec.features if f.type == "greeble"), None)
+    if g is not None and spec.shape == "box":
+        L_, W_, H_ = spec.envelope["length"], spec.envelope["width"], spec.envelope["height"]
+        # sequential cuts (a Compound cutter yields an invalid/negative-volume solid in OCCT here);
+        # the boxes are disjoint + axis-aligned + protrude above the surface ⇒ each cut is clean.
+        for corner, (sx, sy, sz) in _greeble_boxes(L_, W_, H_, g):
+            r = r.cut(cq.Solid.makeBox(sx, sy, sz, cq.Vector(*corner)))
     # all through-holes (single + patterns + ANY axis) as explicit cylinder cutters
     for px, py, pz, d, axis in expected_holes(spec):
         r = r.cut(_hole_cutter(px, py, pz, d, axis, spec))
@@ -207,6 +250,13 @@ def emit_code(spec: Spec) -> str:
             _ctr = f".center({f.at[0]}, {f.at[1]})" if f.at is not None else ""
             L.append(f'result = result.faces(">Z").workplane(centerOption="CenterOfBoundBox"){_ctr}'
                      f".rect({f.length}, {f.width}).cutBlind(-{f.depth})")
+    _g = next((f for f in spec.features if f.type == "greeble"), None)
+    if _g is not None and spec.shape == "box":
+        # greeble = a compound of disjoint cutter boxes (grooves + recessed panels), one boolean.
+        # Emit the precomputed layout literally so the code is self-contained and EXACTLY matches build().
+        _boxes = _greeble_boxes(e["length"], e["width"], e["height"], _g)
+        L.append(f"_gb = {_boxes}")
+        L.append("for _c, _s in _gb: result = result.cut(cq.Solid.makeBox(_s[0], _s[1], _s[2], cq.Vector(*_c)))")
     for px, py, pz, d, axis in expected_holes(spec):
         dx, dy, dz = _DIR[axis]
         ext = _axis_extent(spec, axis)

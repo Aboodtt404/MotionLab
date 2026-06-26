@@ -102,6 +102,25 @@ _EXAMPLES = {
                 '.box) — base L×W at z=-H/2, tapering inward by `angle`° up to the top. Do this FIRST, then '
                 'add other features.',
                 'result = cq.Workplane("XY").workplane(offset=-H / 2).rect(L, W).extrude(H, taper=angle)'),
+    "greeble": ('greeble = procedural hard-surface detail pass on a box top: subdivide into a grid of '
+                'panels (~`panel` mm), cut panel-line GROOVES along the grid + recess a seeded `density` '
+                'fraction of panels (depth `depth`), recesses inset `margin` off the grooves. Cut each box '
+                'SEQUENTIALLY (a Compound cutter inverts the solid in OCCT); cutters protrude above the top.',
+                'import random as _rnd\n'
+                '_rng = _rnd.Random(seed); _tz = H/2; _over = 0.5\n'
+                '_nx = max(1, round(L/panel)); _ny = max(1, round(W/panel)); _cx = L/_nx; _cy = W/_ny\n'
+                'for _i in range(1,_nx):\n'
+                '    _x = -L/2 + _i*_cx\n'
+                '    result = result.cut(cq.Solid.makeBox(groove, W, groove+_over, cq.Vector(_x-groove/2, -W/2, _tz-groove)))\n'
+                'for _j in range(1,_ny):\n'
+                '    _y = -W/2 + _j*_cy\n'
+                '    result = result.cut(cq.Solid.makeBox(L, groove, groove+_over, cq.Vector(-L/2, _y-groove/2, _tz-groove)))\n'
+                'for _i in range(_nx):\n'
+                '    for _j in range(_ny):\n'
+                '        _roll = _rng.random(); _d = depth*(0.6+0.4*_rng.random())\n'
+                '        if _roll < density:\n'
+                '            _px = -L/2+(_i+0.5)*_cx; _py = -W/2+(_j+0.5)*_cy; _rw = max(1.0,_cx-2*margin); _rh = max(1.0,_cy-2*margin)\n'
+                '            result = result.cut(cq.Solid.makeBox(_rw, _rh, _d+_over, cq.Vector(_px-_rw/2, _py-_rh/2, _tz-_d)))'),
     "counterbore": ('counterbored hole (recess for a socket-head screw): pilot ⌀ + a larger flat recess, '
                     'drilled from the top face.',
                     'result = result.faces(">Z").workplane().pushPoints([(x, y)]).cboreHole(diameter, cbore_diameter, cbore_depth)'),

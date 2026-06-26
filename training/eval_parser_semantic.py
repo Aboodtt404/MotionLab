@@ -103,7 +103,7 @@ def run(label, model, think, system, fmt):
 
 CONFIGS = {
     "base": ("base+fewshot", "qwen3.6-27b", True, _SYSTEM, lambda nl: "input: "+nl),
-    "parser": ("parser-finetuned", "parser2", False, "", lambda nl: PARSER_HINT+nl),
+    "parser": ("parser-finetuned", "parser3", False, "", lambda nl: PARSER_HINT+nl),
 }
 which = sys.argv[1:] or ["base", "parser"]
 for k in which:

@@ -480,6 +480,20 @@ def verify(solid, spec: Spec) -> Report:
         dim("envelope · ⌀", e["diameter"], max(m.dx, m.dy))
         dim("envelope · height", e["height"], m.dz)
 
+    # greeble — a procedural COSMETIC detail pass (many seeded recesses + grooves) the per-feature
+    # inventory can't enumerate. The envelope (above) confirms it stayed subtractive (didn't grow/shrink
+    # the part); here we confirm detail was actually cut (volume dropped into a sane band) and the solid
+    # is still valid/single (Report.passed), then return — like mirror, it short-circuits the prismatic
+    # leftover analysis that would mis-flag the recesses as "unexpected".
+    gb = next((f for f in spec.features if f.type == "greeble"), None)
+    if gb is not None and spec.shape == "box":
+        base = e["length"] * e["width"] * e["height"]
+        removed = base - m.volume
+        ok = removed > max(1e-6, 1e-3 * base) and removed < 0.6 * base
+        rows.append(Row("greeble · detail cut", 0.0, round(removed, 2), ok,
+                        "ok" if ok else "selector-binding"))
+        return Report(m.valid, m.solids, m.volume, rows)
+
     # mirror — verify SYMMETRY about the plane: vol(part ∪ reflect(part)) == vol(part). A part that
     # ignored the mirror (still asymmetric) makes the union bigger. Returns early — the mirror
     # duplicates features, which the per-feature inventory below doesn't model (symmetry is the check).
