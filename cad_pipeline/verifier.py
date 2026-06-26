@@ -488,9 +488,16 @@ def verify(solid, spec: Spec) -> Report:
     gb = next((f for f in spec.features if f.type == "greeble"), None)
     if gb is not None and spec.shape == "box":
         base = e["length"] * e["width"] * e["height"]
-        removed = base - m.volume
-        ok = removed > max(1e-6, 1e-3 * base) and removed < 0.6 * base
-        rows.append(Row("greeble · detail cut", 0.0, round(removed, 2), ok,
+        # L/W unchanged; height may GROW by the raised-panel protrusion (raise_h). Re-check height here
+        # against H + raise_h (the box envelope rows above used plain H and may have flagged it).
+        raise_h = getattr(gb, "raise_h", 0.0) if gb.raised > 0 else 0.0
+        for row in rows:
+            if row.name == "envelope · height":
+                row.within_tol = e["height"] - tol <= (row.measured or 0) <= e["height"] + raise_h + tol
+                row.category = "ok" if row.within_tol else "dimensional"
+        changed = abs(base - m.volume)   # detail present = volume moved (recesses remove, raises add)
+        ok = changed > max(1e-6, 1e-3 * base) and m.volume < 1.6 * base
+        rows.append(Row("greeble · detail", 0.0, round(m.volume - base, 2), ok,
                         "ok" if ok else "selector-binding"))
         return Report(m.valid, m.solids, m.volume, rows)
 

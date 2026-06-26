@@ -154,13 +154,19 @@ class Greeble(BaseModel):
     so cutters stay disjoint (no near-coincident booleans → robust). Density < 1 gives the non-uniform,
     focal look ('detail everywhere = no detail')."""
     type: Literal["greeble"] = "greeble"
-    face: Literal["top"] = "top"      # Stage A: top (+Z) face only
+    face: Literal["top"] = "top"      # top (+Z) face
     panel: float = 20.0               # nominal panel cell size (mm) — sets the subdivision granularity
     depth: float = 2.0                # recessed-panel depth
-    density: float = 0.5              # fraction of panels recessed (0..1); <1 ⇒ focal points + rest areas
+    density: float = 0.5              # fraction of panels DETAILED (0..1); <1 ⇒ focal points + rest areas
     groove: float = 1.0               # panel-line groove width AND depth (shallow)
-    margin: float = 3.0               # recess inset within a cell (keeps recesses off the grooves)
+    margin: float = 3.0               # element inset within a cell (keeps detail off the grooves)
     seed: int = 0                     # determinism: same seed ⇒ same layout (builder == emit_code == verifier)
+    # --- Stage B: hierarchy + raised panels + focal mask (defaults give the richer "filmic" look) ---
+    levels: int = 2                   # 1 = flat cells; ≥2 = some cells subdivide into 2×2 finer sub-recesses
+    subdiv: float = 0.35              # fraction of detailed cells that subdivide (when levels≥2)
+    raised: float = 0.3               # fraction of detailed cells that RAISE a panel (additive) vs recess
+    raise_h: float = 1.5              # raised-panel protrusion above the top face (mm) — grows height by this
+    focal: Literal["none", "center", "edges"] = "center"  # density weighting → non-uniform, focal points
 
 
 Feature = Annotated[

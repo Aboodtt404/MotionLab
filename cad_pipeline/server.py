@@ -59,6 +59,14 @@ def _run_golden(spec: Spec) -> dict:
 def _run_model(spec: Spec, max_attempts: int) -> dict:
     """Thin generate→verify→retry that ALSO keeps the winning code+solid (loop.run discards
     them). Re-execs the model's code in-process to export its geometry — dev-only, trusted."""
+    # greeble is a PROCEDURAL, deterministic feature — the builder is exact and ~instant, while asking
+    # the LLM to regenerate the (long) greeble program is slow (seen: 150s+) and adds no value. Build it.
+    if any(f.type == "greeble" for f in spec.features):
+        from .builder import emit_code
+        solid = build(spec); rep = verify(solid, spec).to_dict()
+        return {"passed": rep["passed"], "attempts": 1, "history": [{"attempt": 1, "status": "ok",
+                "category": "ok" if rep["passed"] else "fail"}], "code": emit_code(spec),
+                "report": rep, "solid": solid, "fallback": True}
     gen = VLLMGenerator(model=os.environ.get("CAD_MODEL", "qwen3.6-27b"))
     feedback = None
     history, best = [], None

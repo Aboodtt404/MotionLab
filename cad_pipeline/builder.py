@@ -16,36 +16,61 @@ from .selectors import CQ_EDGE
 from .spec import Spec, expected_holes
 
 
-def _greeble_boxes(L: float, W: float, H: float, g) -> list:
-    """Deterministic cutter boxes for a top-face greeble pass — `[(corner_xyz, size_xyz), …]`, tops at
-    z=H/2 (cut downward). Panel-line grooves along the internal grid lines + recessed panels on a seeded
-    `density` fraction of cells (greeble-detail-research.md). Recesses are inset `margin` from the cell
-    edges so they never touch the grooves → disjoint cutters → robust booleans. Shared by build() (cut),
-    emit_code() (re-emit), and the verifier (expected removed volume) so all three agree exactly.
-    The RNG advances identically for EVERY cell (roll + depth draw) regardless of density, so changing
-    density doesn't shift the layout of the cells that remain."""
+def _greeble_layout(L: float, W: float, H: float, g) -> tuple:
+    """Deterministic greeble layout for a top-face pass → (cut_boxes, raise_boxes), each a list of
+    (corner_xyz, size_xyz). Panel-line grooves on the grid + DETAILED cells that either recess (cut) or
+    raise (additive) a panel, with a `density` weighted by a `focal` mask and a `levels`/`subdiv`
+    hierarchy that splits some cells into 2×2 finer recesses (greeble-detail-research.md). Cut tops
+    overshoot the surface and raises dip into it ⇒ no coincident faces; all elements inset `margin`
+    off the grooves ⇒ disjoint. Shared by build(), emit_code(), and the verifier so they agree exactly.
+    RNG advances identically for EVERY cell (fixed draw order) regardless of outcome → stable layout."""
     rng = random.Random(g.seed)
     tz = H / 2.0
-    over = 0.5            # cutters protrude `over` ABOVE the top face so there's no coincident face
+    over = 0.5
     nx = max(1, round(L / g.panel)); ny = max(1, round(W / g.panel))
+    max_cells = 48                       # bound the boolean count (each cell → ≤4 cuts) so dense/large
+    if nx * ny > max_cells:              # panels stay fast; deterministic, coarsens the grid uniformly
+        f = (nx * ny / max_cells) ** 0.5
+        nx = max(1, round(nx / f)); ny = max(1, round(ny / f))
     cx, cy = L / nx, W / ny
     gw = gd = g.groove
-    boxes: list = []
-    for i in range(1, nx):                                   # grooves at constant x (run along Y)
+    cuts: list = []; raises: list = []
+    for i in range(1, nx):                                   # grooves (cut) at constant x (run along Y)
         x = -L / 2 + i * cx
-        boxes.append(((x - gw / 2, -W / 2, tz - gd), (gw, W, gd + over)))
+        cuts.append(((x - gw / 2, -W / 2, tz - gd), (gw, W, gd + over)))
     for j in range(1, ny):                                   # grooves at constant y (run along X)
         y = -W / 2 + j * cy
-        boxes.append(((-L / 2, y - gw / 2, tz - gd), (L, gw, gd + over)))
-    for i in range(nx):                                      # recessed panels (seeded, density-gated)
+        cuts.append(((-L / 2, y - gw / 2, tz - gd), (L, gw, gd + over)))
+
+    def focal_w(px, py):                                     # density weight by region (non-uniform look)
+        if g.focal == "center":
+            r = ((px / (L / 2)) ** 2 + (py / (W / 2)) ** 2) ** 0.5      # 0 at center → ~1.4 at corners
+            return max(0.15, 1.0 - 0.7 * min(1.0, r))                   # busier in the middle
+        if g.focal == "edges":
+            r = max(abs(px) / (L / 2), abs(py) / (W / 2))
+            return max(0.15, 0.3 + 0.7 * r)                            # busier near the border
+        return 1.0
+
+    for i in range(nx):
         for j in range(ny):
-            roll = rng.random(); depth = g.depth * (0.6 + 0.4 * rng.random())   # advance rng every cell
-            if roll < g.density:
-                px = -L / 2 + (i + 0.5) * cx; py = -W / 2 + (j + 0.5) * cy
-                rw = max(1.0, cx - 2 * g.margin); rh = max(1.0, cy - 2 * g.margin)
-                boxes.append(((px - rw / 2, py - rh / 2, tz - depth),
-                              (round(rw, 4), round(rh, 4), round(depth + over, 4))))
-    return boxes
+            px = -L / 2 + (i + 0.5) * cx; py = -W / 2 + (j + 0.5) * cy
+            roll = rng.random(); kind = rng.random(); sub = rng.random(); df = 0.6 + 0.4 * rng.random()
+            if roll >= g.density * focal_w(px, py):
+                continue
+            rw = max(1.0, cx - 2 * g.margin); rh = max(1.0, cy - 2 * g.margin)
+            if kind < g.raised:                              # RAISED panel (additive; dips into the part)
+                raises.append(((px - rw / 2, py - rh / 2, tz - over),
+                               (round(rw, 4), round(rh, 4), round(g.raise_h + over, 4))))
+            elif g.levels >= 2 and sub < g.subdiv:           # SUBDIVIDED: 2×2 finer recesses (hierarchy)
+                sm = g.margin * 0.6; sw = max(0.8, (rw - sm) / 2); sh = max(0.8, (rh - sm) / 2); d = g.depth * df
+                for sx in (-1, 1):
+                    for sy in (-1, 1):
+                        ox = px + sx * (sw + sm) / 2; oy = py + sy * (sh + sm) / 2
+                        cuts.append(((ox - sw / 2, oy - sh / 2, tz - d), (round(sw, 4), round(sh, 4), round(d + over, 4))))
+            else:                                            # plain RECESSED panel
+                d = g.depth * df
+                cuts.append(((px - rw / 2, py - rh / 2, tz - d), (round(rw, 4), round(rh, 4), round(d + over, 4))))
+    return cuts, raises
 
 
 def build(spec: Spec) -> cq.Workplane:
@@ -106,10 +131,13 @@ def build(spec: Spec) -> cq.Workplane:
     g = next((f for f in spec.features if f.type == "greeble"), None)
     if g is not None and spec.shape == "box":
         L_, W_, H_ = spec.envelope["length"], spec.envelope["width"], spec.envelope["height"]
-        # sequential cuts (a Compound cutter yields an invalid/negative-volume solid in OCCT here);
-        # the boxes are disjoint + axis-aligned + protrude above the surface ⇒ each cut is clean.
-        for corner, (sx, sy, sz) in _greeble_boxes(L_, W_, H_, g):
+        cuts, raises = _greeble_layout(L_, W_, H_, g)
+        # sequential booleans (a Compound cutter yields an invalid/negative-volume solid in OCCT here);
+        # disjoint + axis-aligned boxes that overshoot/dip the surface ⇒ each op is clean. Cut then raise.
+        for corner, (sx, sy, sz) in cuts:
             r = r.cut(cq.Solid.makeBox(sx, sy, sz, cq.Vector(*corner)))
+        for corner, (sx, sy, sz) in raises:
+            r = r.union(cq.Solid.makeBox(sx, sy, sz, cq.Vector(*corner)))
     # all through-holes (single + patterns + ANY axis) as explicit cylinder cutters
     for px, py, pz, d, axis in expected_holes(spec):
         r = r.cut(_hole_cutter(px, py, pz, d, axis, spec))
@@ -252,11 +280,13 @@ def emit_code(spec: Spec) -> str:
                      f".rect({f.length}, {f.width}).cutBlind(-{f.depth})")
     _g = next((f for f in spec.features if f.type == "greeble"), None)
     if _g is not None and spec.shape == "box":
-        # greeble = a compound of disjoint cutter boxes (grooves + recessed panels), one boolean.
-        # Emit the precomputed layout literally so the code is self-contained and EXACTLY matches build().
-        _boxes = _greeble_boxes(e["length"], e["width"], e["height"], _g)
-        L.append(f"_gb = {_boxes}")
-        L.append("for _c, _s in _gb: result = result.cut(cq.Solid.makeBox(_s[0], _s[1], _s[2], cq.Vector(*_c)))")
+        # greeble = grooves + recessed/subdivided panels (cut) and raised panels (union). Emit the
+        # precomputed layout literally so the code is self-contained and EXACTLY matches build().
+        _cuts, _raises = _greeble_layout(e["length"], e["width"], e["height"], _g)
+        L.append(f"_gcuts = {_cuts}")
+        L.append(f"_graise = {_raises}")
+        L.append("for _c, _s in _gcuts: result = result.cut(cq.Solid.makeBox(_s[0], _s[1], _s[2], cq.Vector(*_c)))")
+        L.append("for _c, _s in _graise: result = result.union(cq.Solid.makeBox(_s[0], _s[1], _s[2], cq.Vector(*_c)))")
     for px, py, pz, d, axis in expected_holes(spec):
         dx, dy, dz = _DIR[axis]
         ext = _axis_extent(spec, axis)
