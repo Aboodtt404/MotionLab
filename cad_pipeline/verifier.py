@@ -467,7 +467,10 @@ def _verify_greeble_rebuild(solid, spec: Spec, m, tol: float) -> Report:
         ok = b - tol <= meas <= top + tol
         rows.append(Row(name, round(b, 4), round(meas, 4), ok, "ok" if ok else "dimensional"))
     changed = abs(bm.volume - m.volume)
-    ok = changed > max(1e-6, 1e-3 * bm.volume) and m.volume < 1.6 * bm.volume
+    # detail registered = greeble produced SOME geometry (absolute floor catches a true no-op / builder
+    # bug) + didn't balloon the part. Whether the detail is rich/filmic ENOUGH is the VLM critique's job,
+    # NOT a volume ratio — a shallow panel pass on a large body is legitimately small.
+    ok = changed > 0.5 and m.volume < 1.6 * bm.volume
     rows.append(Row("greeble · detail", 0.0, round(m.volume - bm.volume, 2), ok, "ok" if ok else "selector-binding"))
     return Report(m.valid, m.solids, m.volume, rows)
 
@@ -554,8 +557,8 @@ def verify(solid, spec: Spec) -> Report:
                 lo = (e["height"] if spec.shape == "box" else e["diameter"])
                 row.within_tol = lo - tol <= (row.measured or 0) <= lo + grow + tol
                 row.category = "ok" if row.within_tol else "dimensional"
-        changed = abs(base - m.volume)   # detail present = volume moved (recesses remove, raises add)
-        ok = changed > max(1e-6, 1e-3 * base) and m.volume < 1.6 * base
+        changed = abs(base - m.volume)   # detail present = greeble produced geometry (absolute floor
+        ok = changed > 0.5 and m.volume < 1.6 * base   # catches a no-op); "filmic enough" is the VLM's job
         rows.append(Row("greeble · detail", 0.0, round(m.volume - base, 2), ok,
                         "ok" if ok else "selector-binding"))
         return Report(m.valid, m.solids, m.volume, rows)

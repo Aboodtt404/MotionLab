@@ -43,6 +43,28 @@ class Assembly(BaseModel):
     fillet_joints: float = 0.0
 
 
+class AsmPatch(BaseModel):
+    """A small EDIT delta (so an edit doesn't regenerate the whole assembly): components to ADD-or-REPLACE
+    (matched by name) and component names to REMOVE."""
+    upsert: List[Component] = Field(default_factory=list)
+    remove: List[str] = Field(default_factory=list)
+
+
+def apply_patch(asm: Assembly, patch: AsmPatch) -> Assembly:
+    """Apply an edit delta: drop `remove` names, then add/replace each `upsert` component by name."""
+    out = asm.model_copy(deep=True)
+    rm = set(patch.remove)
+    comps = [c for c in out.components if c.name not in rm]
+    pos = {c.name: i for i, c in enumerate(comps)}
+    for comp in patch.upsert:
+        if comp.name in pos:
+            comps[pos[comp.name]] = comp
+        else:
+            pos[comp.name] = len(comps); comps.append(comp)
+    out.components = comps
+    return out
+
+
 def _place(solid: cq.Solid, comp: Component) -> cq.Solid:
     rx, ry, rz = comp.rotate
     s = solid
@@ -53,6 +75,78 @@ def _place(solid: cq.Solid, comp: Component) -> cq.Solid:
     if rz:
         s = s.rotate((0, 0, 0), (0, 0, 1), rz)
     return s.translate(cq.Vector(*comp.at))
+
+
+def _bare_solid(part: Spec):
+    """Build a part WITHOUT its greeble pass — connectivity depends on the gross shape, and greeble adds
+    hundreds of faces that make the distance probe slow. The bare solid's overlap ≈ the greebled one's."""
+    p = part.model_copy(deep=True)
+    p.features = [f for f in p.features if f.type != "greeble"]
+    return build(p).val()
+
+
+def _solid_gap(s1: cq.Solid, s2: cq.Solid):
+    """(min distance, unit direction from s1's nearest point toward s2's) between two placed solids."""
+    m = BRepExtrema_DistShapeShape(s1.wrapped, s2.wrapped)
+    d = m.Value()
+    p1, p2 = m.PointOnShape1(1), m.PointOnShape2(1)
+    v = cq.Vector(p2.X() - p1.X(), p2.Y() - p1.Y(), p2.Z() - p1.Z())
+    return d, (v.normalized() if v.Length > 1e-9 else cq.Vector(1, 0, 0))
+
+
+def repair_connectivity(asm: Assembly, margin: float = 1.5, max_iter: int = 16) -> Assembly:
+    """Deterministically snap disconnected parts together so a fused assembly is ONE solid — the LLM
+    planner routinely leaves gaps at joints, so verify_assembly reports 'disconnected'. Group parts by
+    real solid proximity (union-find over BRepExtrema distance), then rigidly translate each non-anchor
+    group toward the largest (anchor) group along the closest-point direction until they overlap by
+    `margin`; re-evaluate each round. Distances use the BARE (un-greebled) solids (fast, same gross
+    overlap). Mutates each moved component's `at` so the fix persists in the editable Assembly. No model."""
+    if not asm.fuse or len(asm.components) < 2:
+        return asm
+    bare = [None] * len(asm.components)
+    for i, c in enumerate(asm.components):
+        try:
+            bare[i] = _bare_solid(c.part)
+        except Exception:  # noqa: BLE001 — an unbuildable part can't be snapped; skip it
+            pass
+    idx = [i for i, s in enumerate(bare) if s is not None]
+    if len(idx) < 2:
+        return asm
+    for _ in range(max_iter):
+        placed = {i: _place(bare[i], asm.components[i]) for i in idx}
+        parent = {i: i for i in idx}
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]; x = parent[x]
+            return x
+        for a in range(len(idx)):
+            for b in range(a + 1, len(idx)):
+                if _solid_gap(placed[idx[a]], placed[idx[b]])[0] < 0.4:   # touching/overlapping ⇒ connected
+                    parent[find(idx[a])] = find(idx[b])
+        groups: dict = {}
+        for i in idx:
+            groups.setdefault(find(i), []).append(i)
+        if len(groups) == 1:
+            return asm                                   # fully connected
+        order = sorted(groups.values(), key=lambda g: -len(g))
+        anchor, moved = order[0], False
+        for g in order[1:]:                              # snap the nearest non-anchor group to the anchor
+            best = None
+            for i in g:
+                for j in anchor:
+                    d, direction = _solid_gap(placed[i], placed[j])
+                    if best is None or d < best[0]:
+                        best = (d, direction)
+            if best is not None:
+                step = best[1].multiply(best[0] + margin)   # close the gap + overlap by margin
+                for i in g:                                 # rigid move of the whole group (keeps layout)
+                    cx, cy, cz = asm.components[i].at
+                    asm.components[i].at = (round(cx + step.x, 3), round(cy + step.y, 3), round(cz + step.z, 3))
+                moved = True
+                break                                       # re-evaluate groups after one move
+        if not moved:
+            break
+    return asm
 
 
 def _placed_solids(asm: Assembly) -> List[cq.Solid]:

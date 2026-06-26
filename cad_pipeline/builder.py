@@ -37,7 +37,7 @@ def _greeble_layout(L: float, W: float, H: float, g) -> tuple:
     rng = random.Random(g.seed)
     tz = H / 2.0
     over = 0.5
-    nx = max(1, round(L / g.panel)); ny = max(1, round(W / g.panel))
+    nx = max(2, round(L / g.panel)); ny = max(2, round(W / g.panel))   # ≥2 ⇒ always ≥1 groove ⇒ detail registers
     max_cells = 48                       # bound the boolean count (each cell → ≤4 cuts) so dense/large
     if nx * ny > max_cells:              # panels stay fast; deterministic, coarsens the grid uniformly
         f = (nx * ny / max_cells) ** 0.5
@@ -117,7 +117,7 @@ def _greeble_layout_cyl(R: float, H: float, g) -> tuple:
     rng = random.Random(g.seed)
     over, gd = GREEBLE_OVER, g.groove
     circ = 2 * math.pi * R
-    nth = max(1, round(circ / g.panel)); nz = max(1, round(H / g.panel))
+    nth = max(2, round(circ / g.panel)); nz = max(2, round(H / g.panel))   # ≥2 ⇒ grooves always cut ⇒ detail
     max_cells = 48                       # bound the boolean count (each cell → ≤4 cuts), like the box path
     if nth * nz > max_cells:
         f = (nth * nz / max_cells) ** 0.5
@@ -220,7 +220,7 @@ def _greeble_layout_rev(profile, g) -> tuple:
     Rmax = max(r for r, _ in profile)
     rng = random.Random(g.seed); over, gd = GREEBLE_OVER, g.groove
     circ = 2 * math.pi * Rmax
-    nth = max(1, round(circ / g.panel)); nz = max(1, round(H / g.panel)) if H else 1
+    nth = max(2, round(circ / g.panel)); nz = max(2, round(H / g.panel)) if H else 1
     max_cells = 48
     if nth * nz > max_cells:
         f = (nth * nz / max_cells) ** 0.5

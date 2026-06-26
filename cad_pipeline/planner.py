@@ -14,7 +14,7 @@ import json
 import re
 import urllib.request
 
-from .assembly import Assembly
+from .assembly import Assembly, AsmPatch, apply_patch, repair_connectivity
 
 # Short + directive (reliable under structured output), now asking for FUNCTIONAL detail.
 _SYSTEM = (
@@ -94,11 +94,15 @@ def _normalize(data: dict) -> dict:
 
 
 _EDIT_SYSTEM = (
-    "You EDIT an existing parametric assembly. You are given the current assembly JSON and an edit "
-    "instruction. Output ONLY the FULL modified assembly JSON (same schema) inside a single ```json block. "
-    "Apply ONLY the requested change and keep everything else identical (same names/dims/placements). "
-    "Preserve connectivity — adjacent parts must still OVERLAP at their joints so the fused result is one solid. "
-    "Each feature is a flat object with a \"type\" key (e.g. {\"type\":\"fillet\",\"radius\":3,\"edges\":\"top\"})."
+    "You EDIT a parametric assembly. Given the current assembly JSON and an instruction, output ONLY a "
+    "small PATCH (NOT the whole assembly): "
+    "`upsert` = the components to ADD or REPLACE — give each in full (name; part {shape, envelope, "
+    "features [...], tolerance 0.1}; at [x,y,z]; rotate [rx,ry,rz]); to REPLACE an existing part reuse its "
+    "EXACT name, to add a new one use a new name. "
+    "`remove` = names of components to delete. "
+    "Apply ONLY the requested change — do NOT echo unchanged components. Keep new/changed parts OVERLAPPING "
+    "their neighbours at the joints. Each feature is a flat object with a \"type\" key "
+    "(e.g. {\"type\":\"greeble\",\"panel\":20,\"density\":0.6})."
 )
 
 
@@ -169,6 +173,20 @@ def _outline(prompt: str, base_url: str, model: str, timeout: float) -> list:
     return []
 
 
+def _ask_patch(system: str, user: str, base_url: str, model: str, timeout: float) -> AsmPatch:
+    """Call the model for an edit PATCH (small delta), validated → AsmPatch; retry with temperature."""
+    last = None
+    for temp in (0.0, 0.4, 0.7):
+        try:
+            raw = json.loads(_extract_json(_chat(system, user, base_url, model, timeout, temp,
+                                                 AsmPatch.model_json_schema())))
+            norm = _normalize({"components": raw.get("upsert", [])})   # tolerate feature-format drift
+            return AsmPatch(upsert=norm["components"], remove=raw.get("remove", []))
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            last = e
+    raise ValueError(f"could not produce a valid edit patch: {last}")
+
+
 def _default_joint_blend(asm: Assembly) -> None:
     """A fused frame whose joints aren't blended reads as 'blocks jammed together'. If the model
     didn't ask for a joint fillet, set one scaled to part thickness so the deterministic builder
@@ -199,6 +217,7 @@ def plan(prompt: str, base_url: str = "http://localhost:8002/v1",
     else:
         user = "input: " + prompt
     asm = _ask(_SYSTEM, user, base_url, model, timeout)
+    asm = repair_connectivity(asm)   # snap the model's gappy joints so the fused result is one solid
     _default_joint_blend(asm)
     return asm
 
@@ -208,6 +227,8 @@ def edit(asm: Assembly, instruction: str, base_url: str = "http://localhost:8002
     """current assembly + an edit instruction → modified, re-validated Assembly (the edit-loop).
     Parametric editing is a structured JSON transform — change params/parts, keep the rest."""
     user = f"current assembly:\n{asm.model_dump_json()}\n\nedit: {instruction}"
-    out = _ask(_EDIT_SYSTEM, user, base_url, model, timeout)
+    patch = _ask_patch(_EDIT_SYSTEM, user, base_url, model, timeout)   # a small delta, not the whole asm
+    out = apply_patch(asm, patch)
+    out = repair_connectivity(out)   # keep the edited assembly connected
     _default_joint_blend(out)
     return out
