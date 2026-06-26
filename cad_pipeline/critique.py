@@ -115,6 +115,82 @@ def _apply(spec: Spec, suggest: dict) -> bool:
     return changed
 
 
+_ASM_RUBRIC = (
+    "You are a concept artist reviewing a grey 3D BLOCKOUT of a '{obj}' (a fused multi-part hard-surface "
+    "model). Judge whether the assembled FORM reads as a '{obj}': are the major parts present, sensibly "
+    "PROPORTIONED, and placed? Is it richly built or a few plain blocks? Flag: missing_parts (key parts "
+    "absent), wrong_proportion (a part too big/small/long), misplaced (a part in the wrong spot), too_plain "
+    "(reads as bare blocks, lacks sci-fi surface detail), or good.\n"
+    "Reply with ONLY a JSON object, no prose:\n"
+    '{{"verdict":"good|missing_parts|wrong_proportion|misplaced|too_plain",'
+    '"issues":["short phrase", ...],'
+    '"edits":["one concrete change instruction", ...]}}\n'
+    "Each `edits` item must be a SINGLE concrete parametric change an editor can apply, e.g. "
+    "'make the wings 1.5x longer', 'add a cockpit canopy box at the front', 'greeble the fuselage', "
+    "'move the engines outward'. Give 1-3 edits; if it already reads well, verdict=good and edits=[]."
+)
+
+
+def critique_assembly(asm, object_name: str | None = None, base_url: str = "http://localhost:8002/v1",
+                      model: str = "qwen3.6-27b", timeout: float = 120.0) -> dict:
+    """Render the fused assembly and ask the VLM whether it reads as the named object → {verdict, issues,
+    edits}. `edits` are natural-language single-change instructions for the planner's edit loop."""
+    from .assembly import build_assembly
+    obj = object_name or getattr(asm, "object", "object")
+    try:
+        solid = build_assembly(asm)
+    except Exception as e:  # noqa: BLE001
+        return {"verdict": "error", "issues": [f"build failed: {type(e).__name__}"], "edits": []}
+    images = [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(p).decode()}}
+              for p in render_views(solid, n=2)]
+    messages = [{"role": "user", "content": [{"type": "text", "text": _ASM_RUBRIC.format(obj=obj)}, *images]}]
+    for _ in range(2):
+        try:
+            out = _chat(base_url, model, messages, timeout, think=False, max_tokens=500)
+        except Exception as e:  # noqa: BLE001
+            return {"verdict": "error", "issues": [f"vlm call failed: {type(e).__name__}"], "edits": []}
+        parsed = _parse(out)
+        if parsed and "verdict" in parsed:
+            parsed.setdefault("issues", []); parsed.setdefault("edits", [])
+            return parsed
+    return {"verdict": "error", "issues": ["unparseable VLM critique"], "edits": []}
+
+
+def refine_assembly(asm, object_name: str | None = None, rounds: int = 2,
+                    base_url: str = "http://localhost:8002/v1", model: str = "qwen3.6-27b",
+                    timeout: float = 180.0) -> tuple:
+    """Render → critique → apply each suggested edit via the planner, KEEPING an edit only if the assembly
+    stays valid + a single connected solid (a VLM edit that breaks the fuse is discarded). Bounded loop;
+    stops on 'good'/no edits/no kept change. Returns (asm, history) — history[i] = that round's critique."""
+    from .assembly import verify_assembly
+    from .planner import edit as _edit
+    obj = object_name or getattr(asm, "object", "object")
+    history: list = []
+    cur_solids = verify_assembly(asm)["solids"]
+    for _ in range(max(1, rounds)):
+        c = critique_assembly(asm, obj, base_url, model, timeout)
+        history.append(c)
+        if c["verdict"] in ("good", "error") or not c.get("edits"):
+            break
+        kept = False
+        for instr in c["edits"][:3]:
+            try:
+                cand = _edit(asm, instr, base_url, model, timeout)
+                rep = verify_assembly(cand)
+                ok_valid = next((r["within_tol"] for r in rep["rows"] if "valid" in r["name"]), False)
+                # keep an edit only if it stays valid and does NOT worsen fragmentation (fewer/equal
+                # disconnected solids) — improvements toward one connected body are accepted, edits that
+                # shatter the model are discarded. (Requiring solids==1 outright would reject every step
+                # on a still-fragmented blockout.)
+                if ok_valid and rep["solids"] <= cur_solids:
+                    asm = cand; cur_solids = rep["solids"]; kept = True
+            except Exception:  # noqa: BLE001 — a bad edit is skipped, not fatal
+                continue
+        if not kept:
+            break
+    return asm, history
+
+
 def refine(spec: Spec, rounds: int = 2, **kw) -> tuple[Spec, list]:
     """Build → critique → apply suggestions → rebuild, up to `rounds`. Stops early on verdict 'good',
     no suggestions, or no change. Returns (refined_spec, history) — history[i] = the critique that round."""

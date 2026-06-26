@@ -179,6 +179,10 @@ class Handler(BaseHTTPRequestHandler):
         from .planner import edit, plan
         asm = (plan(body["prompt"]) if route == "/plan"
                else edit(Assembly(**body["assembly"]), body["instruction"]))
+        refine_hist = None
+        if route == "/plan" and body.get("refine"):   # render→VLM critique loop improves the blockout
+            from .critique import refine_assembly
+            asm, refine_hist = refine_assembly(asm, asm.object, rounds=int(body.get("rounds", 2)))
         rep = verify_assembly(asm)
         insp = [{"name": r["name"], "expected": r["expected"], "measured": r["measured"],
                  "delta": None, "within_tol": r["within_tol"], "category": r["category"]} for r in rep["rows"]]
@@ -186,8 +190,13 @@ class Handler(BaseHTTPRequestHandler):
             insp.append({"name": f"part · {c['name']}", "expected": "ok",
                          "measured": "ok" if c["passed"] else ", ".join(c["fails"]) or "fail",
                          "delta": None, "within_tol": c["passed"], "category": "component"})
-        return {"passed": rep["passed"], "assembly": asm.model_dump(), "components": len(asm.components),
-                "object": asm.object, "inspection": insp, "mesh_stl_b64": _stl_b64(build_assembly(asm))}
+        out = {"passed": rep["passed"], "assembly": asm.model_dump(), "components": len(asm.components),
+               "object": asm.object, "inspection": insp, "mesh_stl_b64": _stl_b64(build_assembly(asm))}
+        if refine_hist is not None:
+            out["refine_history"] = refine_hist
+            from .render import render_views
+            out["render_png_b64"] = base64.b64encode(render_views(build_assembly(asm), 1)[0]).decode()
+        return out
 
     def log_message(self, *_):  # quiet
         pass

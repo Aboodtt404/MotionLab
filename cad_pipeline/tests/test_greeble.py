@@ -101,6 +101,23 @@ def _sweep_noop() -> bool:
     return ok
 
 
+def _greebled_assembly() -> bool:
+    """Greebled parts must survive placement + fuse + seam-blend as ONE valid solid (planner can now put
+    greeble on assembly parts) — non-gated (no model)."""
+    from ..assembly import Assembly, Component, verify_assembly
+    hull = Spec(object="hull", shape="box", envelope={"length": 100, "width": 60, "height": 24},
+                features=[{"type": "greeble", "panel": 28, "density": 0.6, "bevel": 0.8}])
+    pod = Spec(object="pod", shape="box", envelope={"length": 60, "width": 40, "height": 20},
+               features=[{"type": "greeble", "panel": 20, "density": 0.7}])
+    asm = Assembly(object="ship", fuse=True, fillet_joints=2.0,
+                   components=[Component(name="hull", part=hull),
+                               Component(name="pod", part=pod, at=(75, 0, 0))])   # 10mm overlap
+    rep = verify_assembly(asm)
+    ok = rep["passed"] and rep["solids"] == 1
+    print(f"  [{'ok ' if ok else 'FAIL'}] greebled parts fuse to one valid solid (solids={rep['solids']})")
+    return ok
+
+
 def main() -> int:
     print("GREEBLE — golden (box + cylinder):")
     g_ok = sum(_check(lbl, _greeble(sh, env, **gp)) for lbl, sh, env, gp in CASES)
@@ -110,9 +127,11 @@ def main() -> int:
     s_ok = sum(_check(lbl, _greeble(sh, env, **gp)) for lbl, sh, env, gp in STRESS)
     print("GREEBLE — sweep no-op (deferred shape):")
     n_ok = int(_sweep_noop())
-    total = len(CASES) + len(CURVED) + len(STRESS) + 1; ok = g_ok + c_ok + s_ok + n_ok
+    print("GREEBLE — in an assembly (planner can greeble hero parts):")
+    a_ok = int(_greebled_assembly())
+    total = len(CASES) + len(CURVED) + len(STRESS) + 2; ok = g_ok + c_ok + s_ok + n_ok + a_ok
     print(f"\nGREEBLE {ok}/{total}  (golden {g_ok}/{len(CASES)} · curved {c_ok}/{len(CURVED)} · "
-          f"stress {s_ok}/{len(STRESS)} · sweep-noop {n_ok}/1)")
+          f"stress {s_ok}/{len(STRESS)} · sweep-noop {n_ok}/1 · assembly {a_ok}/1)")
     return 0 if ok == total else 1
 
 

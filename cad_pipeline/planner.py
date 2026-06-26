@@ -44,7 +44,11 @@ _SYSTEM = (
     "csk_angle = INCLUDED angle, usually 90), mirror{plane 'YZ'|'XZ'|'XY'} (box only — reflects the part "
     "across the plane to make it left/right symmetric), shell{thickness, open_face 'top'|'bottom'|'none'} "
     "(box only — hollow it to a thin wall, for enclosures/housings), thread{diameter, pitch, kind "
-    "'internal'|'external', at:[x,y]} (a tapped hole or threaded stud — cosmetic callout). Examples: a motor mount = a small "
+    "'internal'|'external', at:[x,y]} (a tapped hole or threaded stud — cosmetic callout), "
+    "greeble{panel, depth, density 0..1, bevel, focal 'center'|'edges'|'none'} (the SCI-FI SURFACE-DETAIL "
+    "pass — panel-line grooves + recessed/raised panels; add it to a hull/fuselage/engine/wing/panel part "
+    "for the filmic detailed look. Works on box (top face), cylinder/revolve (side), loft (top). density≈how "
+    "busy 0.5, panel≈cell size 20, bevel>0 for machined rims). Examples: a motor mount = a small "
     "cylinder boss + a bolt_circle of holes; a hub/baseplate = a center bore + a bolt pattern + corner mounting "
     "holes; an arm = a loft tapering to its motor end; lighten plates with a pocket. Don't leave parts as bare "
     "blocks — but keep to a few sensible features each. fillet/chamfer apply to BOX parts only "
@@ -57,7 +61,7 @@ _SYSTEM = (
 
 
 _FEAT_TYPES = {"through_hole", "hole_pattern", "fillet", "chamfer", "pocket", "draft",
-               "counterbore", "countersink", "mirror", "shell", "var_fillet", "thread"}
+               "counterbore", "countersink", "mirror", "shell", "var_fillet", "thread", "greeble"}
 
 
 def _extract_json(txt: str) -> str:
@@ -98,15 +102,16 @@ _EDIT_SYSTEM = (
 )
 
 
-def _chat(system: str, user: str, base_url: str, model: str, timeout: float, temperature: float) -> str:
-    # Structured output: vLLM constrains generation to the Assembly JSON schema — guaranteed
-    # parseable (no truncation / reasoning-prefix failures) and far faster (no free-form thinking).
+def _chat(system: str, user: str, base_url: str, model: str, timeout: float, temperature: float,
+          schema: dict | None = None) -> str:
+    # Structured output: vLLM constrains generation to the JSON schema (Assembly by default, or the
+    # outline schema for stage 1) — guaranteed parseable (no truncation / reasoning-prefix failures).
     payload = json.dumps({
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "temperature": temperature, "max_tokens": 6000,
         "response_format": {"type": "json_schema",
-                            "json_schema": {"name": "assembly", "schema": Assembly.model_json_schema()}},
+                            "json_schema": {"name": "out", "schema": schema or Assembly.model_json_schema()}},
     }).encode()
     req = urllib.request.Request(base_url + "/chat/completions", data=payload,
                                  headers={"Content-Type": "application/json"})
@@ -129,20 +134,71 @@ def _ask(system: str, user: str, base_url: str, model: str, timeout: float) -> A
     raise ValueError(f"could not produce a valid assembly: {last}")
 
 
+# Stage 1 of the two-stage plan (CAD-HLLM: high-level parts outline → parameter completion). One-shot
+# decomposition under-detailes hero objects ("crude skeletons"); committing to a generous parts list FIRST
+# fixes the part count + which surfaces carry sci-fi detail, then Stage 2 (_SYSTEM) realizes the geometry.
+_OUTLINE_SYSTEM = (
+    "List the PARTS of the described object as a JSON parts list. Be GENEROUS and realistic — a hero "
+    "sci-fi/mechanical object has MANY parts (e.g. a gunship: fuselage, cockpit canopy, 2 wings, 2 engine "
+    "nacelles, tail fin, 2 wing cannons, 2 landing skids). For EACH part give: name; role (one phrase); "
+    "shape (box|cylinder|loft|revolve|sweep — loft=tapered arm/wing, revolve=round/turned, sweep=pipe/cable); "
+    "greeble (true if it's a large HULL/fuselage/wing/engine SURFACE that should carry sci-fi panel detail). "
+    "Output {\"parts\":[...]}. Aim for the REAL part count (often 6-14), not 2-3 blobs."
+)
+_OUTLINE_SCHEMA = {
+    "type": "object", "properties": {"parts": {"type": "array", "items": {
+        "type": "object", "properties": {
+            "name": {"type": "string"}, "role": {"type": "string"},
+            "shape": {"type": "string", "enum": ["box", "cylinder", "loft", "revolve", "sweep"]},
+            "greeble": {"type": "boolean"}},
+        "required": ["name", "shape"]}}}, "required": ["parts"],
+}
+
+
+def _outline(prompt: str, base_url: str, model: str, timeout: float) -> list:
+    """Stage 1 → a high-level parts list (richer than one-shot tends to produce). [] on failure."""
+    for temp in (0.2, 0.6):
+        try:
+            data = json.loads(_extract_json(_chat(_OUTLINE_SYSTEM, "object: " + prompt, base_url, model,
+                                                  timeout, temp, _OUTLINE_SCHEMA)))
+            parts = data.get("parts") or []
+            if parts:
+                return parts
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return []
+
+
 def _default_joint_blend(asm: Assembly) -> None:
     """A fused frame whose joints aren't blended reads as 'blocks jammed together'. If the model
     didn't ask for a joint fillet, set one scaled to part thickness so the deterministic builder
     rounds the seams (the verifier re-checks it stays one valid solid). Capped small so it's a
     machined-radius blend, not a feasibility risk on thin plates."""
     if asm.fuse and asm.fillet_joints <= 0 and asm.components:
+        # Don't auto-blend large or greebled assemblies — the seam-blend is O(edges*parts) and explodes
+        # with greeble's many edges, and rounded joints add little once parts carry surface detail.
+        greebled = any(any(f.type == "greeble" for f in c.part.features) for c in asm.components)
+        if len(asm.components) > 5 or greebled:
+            return
         hs = [c.part.envelope.get("height", 5.0) for c in asm.components]
         asm.fillet_joints = round(max(1.0, min(3.0, (sum(hs) / len(hs)) * 0.3)), 2)
 
 
 def plan(prompt: str, base_url: str = "http://localhost:8002/v1",
          model: str = "qwen3.6-27b", timeout: float = 180.0) -> Assembly:
-    """prompt → validated multi-part Assembly (the planner)."""
-    asm = _ask(_SYSTEM, "input: " + prompt, base_url, model, timeout)
+    """prompt → validated multi-part Assembly (the planner). Two-stage (CAD-HLLM): a high-level parts
+    outline commits to a rich part set first, then Stage 2 realizes geometry; one-shot is the fallback."""
+    parts = _outline(prompt, base_url, model, timeout)
+    if parts:
+        listing = "; ".join(
+            f"{p['name']} ({p.get('role', '')}, {p.get('shape', 'box')}{', GREEBLED' if p.get('greeble') else ''})"
+            for p in parts)
+        user = (f"input: {prompt}\nRealize THIS parts list as the assembly — one component per part, each "
+                f"with dimensions, the functional features it needs (GREEBLE the parts marked GREEBLED), and "
+                f"placements that OVERLAP at the joints:\n{listing}")
+    else:
+        user = "input: " + prompt
+    asm = _ask(_SYSTEM, user, base_url, model, timeout)
     _default_joint_blend(asm)
     return asm
 

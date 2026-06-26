@@ -108,7 +108,12 @@ def _blend_joints(fused: cq.Solid, placed: List[cq.Solid], radius: float) -> Tup
     (OCP gives up on the whole set), so we blend ONE part-pair joint at a time on the evolving
     solid, stepping the radius down per joint, and SKIP any joint that won't take a fillet — a
     partial blend is fine; a failed blend must never break the assembly."""
-    if radius <= 0:
+    if radius <= 0 or len(placed) > 8:
+        return fused, 0
+    # Seam detection is O(edges x parts) with a BRep distance probe per pair; greeble adds hundreds of
+    # edges per part, so on a many-part greebled assembly it explodes (effectively hangs). Skip the
+    # cosmetic blend past an edge budget — the surface detail, not rounded joints, is the look there.
+    if len(cq.Workplane(obj=fused).edges().vals()) > 1200:
         return fused, 0
     groups = _seam_groups(fused, placed)
     solid, total = fused, 0
