@@ -129,13 +129,14 @@ export class StudioScene {
 
   buildHard() {
     const spec = this.state.spec, e = spec.envelope, acc = 0xa78bfa;
+    const P = (v: any) => Number(v) || 0;   // feature params are number|string|number[] now — coerce for the preview
     const surf = this.hardMat();
     const edgeMat = new THREE.LineBasicMaterial({ color: acc, transparent: true, opacity: 0.8 });
     let geo: THREE.BufferGeometry, height: number, maxDim: number;
     if (spec.shape === "box") {
       const L = e.length * S, W = e.width * S, H = e.height * S; height = H; maxDim = Math.max(e.length, e.width, e.height);
       const fillet = spec.features.find((f) => f.type === "fillet");
-      const r = fillet ? Math.min(fillet.params.radius * S, Math.min(L, W, H) * 0.49) : 0;
+      const r = fillet ? Math.min(P(fillet.params.radius) * S, Math.min(L, W, H) * 0.49) : 0;
       geo = r > 0.0015 ? this.roundedBox(L, H, W, r) : new THREE.BoxGeometry(L, H, W);
     } else {
       const rr = (e.diameter / 2) * S, H = e.height * S; height = H; maxDim = Math.max(e.diameter, e.height);
@@ -146,17 +147,17 @@ export class StudioScene {
 
     const topY = height + 0.004;
     spec.features.filter((f) => f.type === "through_hole").forEach((f) => {
-      const inner = Math.max(0.004, (f.params.diameter / 2) * S);
+      const inner = Math.max(0.004, (P(f.params.diameter) / 2) * S);
       const ring = new THREE.Mesh(new THREE.RingGeometry(inner, inner + 0.016, 48), new THREE.MeshBasicMaterial({ color: acc, side: THREE.DoubleSide, transparent: true }));
       ring.rotation.x = -Math.PI / 2;
-      if (spec.shape === "box") ring.position.set(-e.length * S / 2 + (f.params.from_edge || 0) * S, topY, 0);
+      if (spec.shape === "box") ring.position.set(P(f.params.pos_x) * S, topY, P(f.params.pos_y) * S);
       else ring.position.set(0, topY, 0);
       this.partGroup.add(ring);
     });
     spec.features.filter((f) => f.type === "pocket").forEach((f) => {
       if (spec.shape !== "box") return;
-      const pg = new THREE.Mesh(new THREE.BoxGeometry(f.params.length * S, f.params.depth * S, f.params.width * S), new THREE.MeshStandardMaterial({ color: 0x6e7480, metalness: 0.2, roughness: 0.7 }));
-      pg.position.y = height - (f.params.depth * S) / 2 + 0.0006; this.partGroup.add(pg);
+      const pg = new THREE.Mesh(new THREE.BoxGeometry(P(f.params.length) * S, P(f.params.depth) * S, P(f.params.width) * S), new THREE.MeshStandardMaterial({ color: 0x6e7480, metalness: 0.2, roughness: 0.7 }));
+      pg.position.y = height - (P(f.params.depth) * S) / 2 + 0.0006; this.partGroup.add(pg);
     });
 
     this.target.y = height / 2; this.fitR = maxDim * S * 2.5 + 0.7; if (!this.radius) this.radius = this.fitR;
@@ -248,11 +249,15 @@ export class StudioScene {
     this.disposeGroup(this.partGroup);
     if (this.state.branch === "organic") {
       if (this.state.meshGlb) this.buildFromGlb(this.state.meshGlb);     // real Track B mesh (TRELLIS.2)
-      else this.buildBlob();                                             // procedural preview (no mesh yet)
+      else {                                                             // film idle: clean empty stage (no
+        this.partMesh = undefined; this.edgeLines = undefined;          // fake procedural preview — organic
+        this.target.set(0, 0.5, 0); this.fitR = 3; if (!this.radius) this.radius = this.fitR;  // output isn't previewable
+        this.shadowMesh.scale.set(1.6, 1.6, 1.6);
+      }
     } else if (this.state.meshStl) this.buildFromStl(this.state.meshStl);  // real pipeline mesh
-    else this.buildHard();                                               // procedural preview
+    else this.buildHard();                                               // robotics: live procedural preview of the spec
     this.updateView();
-    this.glowMesh.visible = true;
+    this.glowMesh.visible = this.state.branch === "hard" || !!this.state.meshGlb;
   }
 
   updateView() {
