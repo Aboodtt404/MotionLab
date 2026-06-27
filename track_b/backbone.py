@@ -49,11 +49,15 @@ def _pipeline():
 
 
 def generate(image, out_glb: str, *, seed: int = 42, pipeline_type: str = "512",
-             texture_size: int = 2048, decimation: int = 1_000_000) -> str:
+             texture_size: int | None = None, decimation: int = 1_000_000) -> str:
     """image (path or PIL.Image) → a GLB with PBR at `out_glb`. pipeline_type ∈ {'512','1024',
-    '1024_cascade','1536_cascade'} trades speed for fidelity ('512' fast eval; '1024_cascade' = hero)."""
+    '1024_cascade','1536_cascade'} trades speed for fidelity ('512' fast eval; '1536_cascade' = hero).
+    texture_size defaults by tier: hero (cascade) tiers bake 4K PBR maps, fast tiers stay 2K (keeps
+    Preview light); pass an explicit value to override."""
     from PIL import Image
     import o_voxel
+    if texture_size is None:
+        texture_size = 4096 if "cascade" in pipeline_type else 2048   # hero tiers → sharper 4K PBR
     img = Image.open(image) if isinstance(image, str) else image
     mesh = _pipeline().run(img, seed=seed, pipeline_type=pipeline_type)[0]
     mesh.simplify(16777216)   # nvdiffrast index limit
