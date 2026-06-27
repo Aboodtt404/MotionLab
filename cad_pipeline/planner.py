@@ -14,14 +14,36 @@ import json
 import re
 import urllib.request
 
-from .assembly import Assembly, AsmPatch, apply_patch, repair_connectivity
+from .assembly import Assembly, AsmPatch, apply_patch, repair_connectivity, solve_layout
 
 # Short + directive (reliable under structured output), now asking for FUNCTIONAL detail.
 _SYSTEM = (
-    "Output a CAD assembly as JSON. Decompose the object into components — for EACH part produce one "
-    "component: name; part {shape 'box'|'cylinder'|'loft'|'revolve'; envelope (box ⇒ length,width,height; "
+    "Output a CAD assembly as JSON {object, components:[...], mates:[...], fuse:true}. For EACH part produce one "
+    "component: name; role (one of 'seat','top','base','leg','support','arm','panel','body','hub','fastener','other'); "
+    "part {shape 'box'|'cylinder'|'loft'|'revolve'; envelope (box ⇒ length,width,height; "
     "cylinder ⇒ diameter,height; loft ⇒ length,width,height,width_top,height_top); features [...]; "
-    "tolerance 0.1}; at [x,y,z] in mm; rotate [rx,ry,rz] in degrees.\n"
+    "tolerance 0.1}.\n"
+    "Do NOT set coordinates — describe HOW PARTS CONNECT with `mates` (named relationships); a deterministic "
+    "solver computes positions. Mate kinds:\n"
+    "  ground {kind:'ground', a:'part'} — the part rests on the floor (z=0).\n"
+    "  stack {kind:'stack', a:'upper', b:'lower', overlap:3} — a sits on top of b (a 1–4 mm overlap fuses them).\n"
+    "  radial {kind:'radial', parts:['leg1','leg2','leg3','leg4'], around:'seat', count:4, radius:55, splay_deg:10} — "
+    "the parts arranged evenly AROUND the vertical axis of `around` (legs of a stool/table, spokes, drone arms, "
+    "landing gear); splay_deg leans each one outward; radial legs auto-touch the floor.\n"
+    "  coaxial {kind:'coaxial', a, b} — a shares b's vertical axis (a hub/boss/disc centered on another).\n"
+    "  flush {kind:'flush', a, b, side:'+x'|'-x'|'+y'|'-y'|'+z'|'-z', overlap:3} — a butted against that face of b.\n"
+    "  mirror {kind:'mirror', a, b, plane:'YZ'|'XZ'|'XY'} — a is the mirror image of b (left/right pairs).\n"
+    "  attach {kind:'attach', a, b} — generic: a snaps to the nearest face of b (use only when none of the above fit).\n"
+    "EVERY component must be reachable through mates (no floating parts); the structure must rest on the floor.\n"
+    "PROPORTIONS: a leg/support spans MOST of the object's height — a ~120 mm-tall stool has ~100 mm legs and "
+    "a thin seat, NOT short stubs under a thick disc. Size parts so the whole reaches the requested overall size.\n"
+    "WORKED EXAMPLES (placement is ALL via mates, never coordinates):\n"
+    "  • 4-legged stool → components: seat(role 'seat', cylinder ⌀140×16), leg1..leg4(role 'leg', box 16×16×110). "
+    "mates: [radial(parts=[leg1..4], around='seat', count=4, radius=55, splay_deg=10), stack(a='seat', b='leg1', overlap=4)].\n"
+    "  • shelf bracket (L) → vertical(role 'support', box) + horizontal(role 'top', box); mates: [ground(vertical), "
+    "flush(a='horizontal', b='vertical', side='+z')].\n"
+    "  • quadcopter frame → body(role 'body', cylinder) + arm1..4(role 'arm', loft tapering to the motor end); "
+    "mates: [radial(parts=[arm1..4], around='body', count=4, radius=70)].\n"
     "Use 'loft' for any arm/strut/spar/leg — it is a TAPERED bar (engineered, not a blunt block): it tapers "
     "along its length (local X) from width×height at the hub end down to width_top×height_top at the tip "
     "(typically ~half). REAL frames use tapered arms — prefer loft over box for limbs. A loft can also "
@@ -53,10 +75,10 @@ _SYSTEM = (
     "holes; an arm = a loft tapering to its motor end; lighten plates with a pocket. Don't leave parts as bare "
     "blocks — but keep to a few sensible features each. fillet/chamfer apply to BOX parts only "
     "(cylinder, loft and revolve have no straight vertical edges) — never fillet/chamfer those shapes.\n"
-    "Produce ONE component per part the request implies (e.g. '4 arms' ⇒ 4 arms, and add their motor mounts "
-    "and landing standoffs where appropriate) and NEVER an empty list; infer reasonable sizes for anything "
-    "unstated. Center near the origin; adjacent parts MUST OVERLAP a few mm at their joints so the fused "
-    "result is one connected solid; set fuse=true."
+    "Produce ONE component per part the request implies (e.g. '4 arms' ⇒ 4 arms, '4 legs' ⇒ 4 legs) and NEVER "
+    "an empty list; infer reasonable sizes for anything unstated. SCALE the part count to the object — a stool "
+    "is ~5 parts (seat + 4 legs), a hero ship is 8–14; don't pad simple objects or under-build complex ones. "
+    "Give every part a `role` and connect ALL of them with `mates` (never coordinates); set fuse=true."
 )
 
 
@@ -96,13 +118,14 @@ def _normalize(data: dict) -> dict:
 _EDIT_SYSTEM = (
     "You EDIT a parametric assembly. Given the current assembly JSON and an instruction, output ONLY a "
     "small PATCH (NOT the whole assembly): "
-    "`upsert` = the components to ADD or REPLACE — give each in full (name; part {shape, envelope, "
-    "features [...], tolerance 0.1}; at [x,y,z]; rotate [rx,ry,rz]); to REPLACE an existing part reuse its "
-    "EXACT name, to add a new one use a new name. "
+    "`upsert` = the components to ADD or REPLACE — give each in full (name; role; part {shape, envelope, "
+    "features [...], tolerance 0.1}); to REPLACE an existing part reuse its EXACT name, to add a new one use a "
+    "new name. Do NOT set coordinates — placement is computed from mates. "
     "`remove` = names of components to delete. "
-    "Apply ONLY the requested change — do NOT echo unchanged components. Keep new/changed parts OVERLAPPING "
-    "their neighbours at the joints. Each feature is a flat object with a \"type\" key "
-    "(e.g. {\"type\":\"greeble\",\"panel\":20,\"density\":0.6})."
+    "`mates` = include the FULL updated mate list ONLY if the edit changes how parts connect (e.g. you added a "
+    "part that must be mated, using radial/stack/ground/coaxial/flush/mirror); otherwise omit it. "
+    "Apply ONLY the requested change — do NOT echo unchanged components. Each feature is a flat object with a "
+    "\"type\" key (e.g. {\"type\":\"greeble\",\"panel\":20,\"density\":0.6})."
 )
 
 
@@ -142,17 +165,19 @@ def _ask(system: str, user: str, base_url: str, model: str, timeout: float) -> A
 # decomposition under-detailes hero objects ("crude skeletons"); committing to a generous parts list FIRST
 # fixes the part count + which surfaces carry sci-fi detail, then Stage 2 (_SYSTEM) realizes the geometry.
 _OUTLINE_SYSTEM = (
-    "List the PARTS of the described object as a JSON parts list. Be GENEROUS and realistic — a hero "
-    "sci-fi/mechanical object has MANY parts (e.g. a gunship: fuselage, cockpit canopy, 2 wings, 2 engine "
-    "nacelles, tail fin, 2 wing cannons, 2 landing skids). For EACH part give: name; role (one phrase); "
-    "shape (box|cylinder|loft|revolve|sweep — loft=tapered arm/wing, revolve=round/turned, sweep=pipe/cable); "
-    "greeble (true if it's a large HULL/fuselage/wing/engine SURFACE that should carry sci-fi panel detail). "
-    "Output {\"parts\":[...]}. Aim for the REAL part count (often 6-14), not 2-3 blobs."
+    "List the PARTS of the described object as a JSON parts list, realistic for THAT object — scale the count "
+    "to its real structure, don't pad or under-build. A stool ≈ 5 (seat + 4 legs); a chair ≈ 6; a table ≈ 5; "
+    "a bracket ≈ 2–3; a hero sci-fi ship ≈ 8–14 (fuselage, cockpit, wings, nacelles, fin, cannons, skids). "
+    "For EACH part give: name; role (one of 'seat','top','base','leg','support','arm','panel','body','hub',"
+    "'fastener','other'); shape (box|cylinder|loft|revolve|sweep — loft=tapered arm/wing/leg, revolve=round/"
+    "turned, sweep=pipe/cable); greeble (true ONLY for a large HULL/fuselage/wing/engine SURFACE that should "
+    "carry sci-fi panel detail — never for furniture/simple props). Output {\"parts\":[...]}."
 )
 _OUTLINE_SCHEMA = {
     "type": "object", "properties": {"parts": {"type": "array", "items": {
         "type": "object", "properties": {
-            "name": {"type": "string"}, "role": {"type": "string"},
+            "name": {"type": "string"},
+            "role": {"type": "string", "enum": ["seat", "top", "base", "leg", "support", "arm", "panel", "body", "hub", "fastener", "other"]},
             "shape": {"type": "string", "enum": ["box", "cylinder", "loft", "revolve", "sweep"]},
             "greeble": {"type": "boolean"}},
         "required": ["name", "shape"]}}}, "required": ["parts"],
@@ -196,7 +221,11 @@ def _default_joint_blend(asm: Assembly) -> None:
         # Don't auto-blend large or greebled assemblies — the seam-blend is O(edges*parts) and explodes
         # with greeble's many edges, and rounded joints add little once parts carry surface detail.
         greebled = any(any(f.type == "greeble" for f in c.part.features) for c in asm.components)
-        if len(asm.components) > 5 or greebled:
+        # Only blend ALL-BOX assemblies: filleting boolean seams on curved/tapered parts (loft/revolve/
+        # cylinder/sweep) makes OCCT SEGFAULT (crashes the process, uncatchable) — the blend is cosmetic,
+        # so skip it the moment any part isn't a box. Box-box seams are the safe, designed case.
+        non_box = any(c.part.shape != "box" for c in asm.components)
+        if len(asm.components) > 5 or greebled or non_box:
             return
         hs = [c.part.envelope.get("height", 5.0) for c in asm.components]
         asm.fillet_joints = round(max(1.0, min(3.0, (sum(hs) / len(hs)) * 0.3)), 2)
@@ -209,15 +238,16 @@ def plan(prompt: str, base_url: str = "http://localhost:8002/v1",
     parts = _outline(prompt, base_url, model, timeout)
     if parts:
         listing = "; ".join(
-            f"{p['name']} ({p.get('role', '')}, {p.get('shape', 'box')}{', GREEBLED' if p.get('greeble') else ''})"
+            f"{p['name']} (role {p.get('role', 'other')}, {p.get('shape', 'box')}{', GREEBLED' if p.get('greeble') else ''})"
             for p in parts)
-        user = (f"input: {prompt}\nRealize THIS parts list as the assembly — one component per part, each "
-                f"with dimensions, the functional features it needs (GREEBLE the parts marked GREEBLED), and "
-                f"placements that OVERLAP at the joints:\n{listing}")
+        user = (f"input: {prompt}\nRealize THIS parts list as the assembly — one component per part with its "
+                f"role, dimensions, and the functional features it needs (GREEBLE the parts marked GREEBLED); "
+                f"connect every part with `mates` (radial/stack/ground/coaxial/flush/mirror), NOT coordinates:\n{listing}")
     else:
         user = "input: " + prompt
     asm = _ask(_SYSTEM, user, base_url, model, timeout)
-    asm = repair_connectivity(asm)   # snap the model's gappy joints so the fused result is one solid
+    asm = solve_layout(asm)          # resolve the mate graph → placements (legs splay, seat on top, etc.)
+    asm = repair_connectivity(asm)   # bounded fallback: close any small remaining gaps (won't collapse spread)
     _default_joint_blend(asm)
     return asm
 
@@ -229,6 +259,7 @@ def edit(asm: Assembly, instruction: str, base_url: str = "http://localhost:8002
     user = f"current assembly:\n{asm.model_dump_json()}\n\nedit: {instruction}"
     patch = _ask_patch(_EDIT_SYSTEM, user, base_url, model, timeout)   # a small delta, not the whole asm
     out = apply_patch(asm, patch)
-    out = repair_connectivity(out)   # keep the edited assembly connected
+    out = solve_layout(out)          # re-resolve placement from the (possibly edited) mate graph
+    out = repair_connectivity(out)   # bounded fallback for any small remaining gaps
     _default_joint_blend(out)
     return out

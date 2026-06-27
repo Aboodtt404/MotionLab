@@ -12,7 +12,8 @@ sub-spec (reusing the part verifier), and the ASSEMBLY adds two checks the parts
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+import math
+from typing import List, Literal, Optional, Tuple
 
 import cadquery as cq
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
@@ -25,16 +26,43 @@ from .spec import Spec
 from .verifier import measure, verify
 
 
+Role = Literal["seat", "top", "base", "leg", "support", "arm", "panel", "body", "hub", "fastener", "other"]
+
+
 class Component(BaseModel):
     name: str = "part"
     part: Spec
+    role: Role = "other"                                    # semantic role → drives structural placement rules
+    # at/rotate are the RESOLVED placement — solve_layout() writes them from the mate graph. They stay so
+    # everything downstream (_place, build_assembly, verify_assembly) is unchanged; a mate-less component
+    # falls back to whatever at/rotate it carries (manual specs still work).
     at: Tuple[float, float, float] = (0.0, 0.0, 0.0)        # translation (mm)
     rotate: Tuple[float, float, float] = (0.0, 0.0, 0.0)    # degrees about X, Y, Z (applied in order)
+
+
+class Mate(BaseModel):
+    """A NAMED structural relationship between parts (the generator emits these, not coordinates — see
+    docs/research/sources.md 'emit named relationships, not coordinates'). solve_layout() resolves the
+    whole graph deterministically into each component's at/rotate."""
+    kind: Literal["ground", "stack", "coaxial", "radial", "flush", "mirror", "attach"]
+    a: Optional[str] = None                 # primary part (ground/stack/coaxial/flush/mirror/attach)
+    b: Optional[str] = None                 # reference part (a is placed relative to b)
+    parts: List[str] = Field(default_factory=list)   # radial: the group of parts arranged around an axis
+    around: Optional[str] = None            # radial: part whose Z axis is the circle center (None ⇒ origin)
+    count: Optional[int] = None             # radial: how many (defaults to len(parts))
+    radius: Optional[float] = None          # radial: circle radius mm (defaults from `around` part)
+    splay_deg: float = 0.0                  # radial: outward lean of each part (° about its tangent)
+    z: Optional[float] = None               # radial: explicit z for the group (else grounded/inferred)
+    side: Optional[str] = None              # flush: "+x"|"-x"|"+y"|"-y"|"+z"|"-z"
+    plane: Optional[str] = None             # mirror: "YZ"|"XZ"|"XY"
+    overlap: float = 1.5                    # stack/flush/attach: mm the parts overlap at the joint
+    offset: Tuple[float, float] = (0.0, 0.0)  # stack: extra XY offset of a on b
 
 
 class Assembly(BaseModel):
     object: str = "assembly"
     components: List[Component] = Field(default_factory=list)
+    mates: List[Mate] = Field(default_factory=list)   # structural relationships → solve_layout resolves placement
     fuse: bool = True   # True ⇒ one printed frame (joints fuse); False ⇒ keep parts separate
     # Joint blending (mm): after fusing, fillet the boolean-created seam edges so parts read as
     # one machined/printed body, not blocks jammed together. 0 = off. The blend must keep the
@@ -45,13 +73,16 @@ class Assembly(BaseModel):
 
 class AsmPatch(BaseModel):
     """A small EDIT delta (so an edit doesn't regenerate the whole assembly): components to ADD-or-REPLACE
-    (matched by name) and component names to REMOVE."""
+    (matched by name), component names to REMOVE, and optionally a replacement `mates` list when the edit
+    changes how parts connect (e.g. adding a part that needs to be mated)."""
     upsert: List[Component] = Field(default_factory=list)
     remove: List[str] = Field(default_factory=list)
+    mates: Optional[List[Mate]] = None
 
 
 def apply_patch(asm: Assembly, patch: AsmPatch) -> Assembly:
-    """Apply an edit delta: drop `remove` names, then add/replace each `upsert` component by name."""
+    """Apply an edit delta: drop `remove` names, add/replace each `upsert` component by name, and replace
+    the mate graph if the patch supplies one (else keep the existing mates so solve_layout re-resolves)."""
     out = asm.model_copy(deep=True)
     rm = set(patch.remove)
     comps = [c for c in out.components if c.name not in rm]
@@ -62,6 +93,8 @@ def apply_patch(asm: Assembly, patch: AsmPatch) -> Assembly:
         else:
             pos[comp.name] = len(comps); comps.append(comp)
     out.components = comps
+    if patch.mates is not None:
+        out.mates = patch.mates
     return out
 
 
@@ -94,7 +127,131 @@ def _solid_gap(s1: cq.Solid, s2: cq.Solid):
     return d, (v.normalized() if v.Length > 1e-9 else cq.Vector(1, 0, 0))
 
 
-def repair_connectivity(asm: Assembly, margin: float = 1.5, max_iter: int = 16) -> Assembly:
+def _placed_bb(bare: cq.Solid, comp: Component):
+    """World-space bounding box of a component's bare solid after its current rotate+translate."""
+    return _place(bare, comp).BoundingBox()
+
+
+def solve_layout(asm: Assembly) -> Assembly:
+    """Resolve the NAMED mate graph → each component's at/rotate, deterministically. This replaces asking
+    the LLM for raw coordinates (which it's poor at). Patterns: ground (floor contact), radial (legs/spokes
+    around an axis, splayed), stack (a on top of b), coaxial, flush, mirror, attach (bounded snap). Parts
+    with no mate keep their given at/rotate. Mates are applied in dependency order so a support is placed
+    before what rests on it; bounding boxes are recomputed per mate from the live placement."""
+    comps = {c.name: c for c in asm.components}
+    bare: dict = {}
+    for c in asm.components:
+        try:
+            bare[c.name] = _bare_solid(c.part)
+        except Exception:  # noqa: BLE001
+            bare[c.name] = None
+
+    def bb(name: str):
+        b = bare.get(name)
+        return _placed_bb(b, comps[name]) if (b is not None and name in comps) else None
+
+    def set_at(name, x=None, y=None, z=None):
+        c = comps[name]; cx, cy, cz = c.at
+        c.at = (round(x if x is not None else cx, 3), round(y if y is not None else cy, 3), round(z if z is not None else cz, 3))
+
+    def ground(name):
+        b = bb(name)
+        if b: set_at(name, z=comps[name].at[2] - b.zmin)   # drop so min-z = 0
+
+    # map each part in a radial group → (axis x, axis y, group names) so a part stacked ON a leg group
+    # centers on the AXIS and rests on ALL of them (not on one leg's offset center).
+    radial_of: dict = {}
+    for m in asm.mates:
+        if m.kind == "radial":
+            cx, cy = (0.0, 0.0)
+            if m.around and m.around in comps and bare.get(m.around) is not None:
+                ab = _placed_bb(bare[m.around], comps[m.around]); cx, cy = ab.center.x, ab.center.y
+            for p in (m.parts or []):
+                radial_of[p] = (cx, cy, list(m.parts or []))
+
+    # order: radial → ground → coaxial → stack → flush → mirror → attach (supports before dependents)
+    order = {"radial": 0, "ground": 1, "coaxial": 2, "stack": 3, "flush": 4, "mirror": 5, "attach": 6}
+    for m in sorted(asm.mates, key=lambda m: order.get(m.kind, 9)):
+        try:
+            if m.kind == "radial":
+                names = [n for n in (m.parts or []) if n in comps]
+                if not names:
+                    continue
+                n = m.count or len(names)
+                cx, cy = (0.0, 0.0)
+                if m.around and m.around in comps:
+                    ab = bb(m.around)
+                    if ab: cx, cy = ab.center.x, ab.center.y
+                radius = m.radius
+                if radius is None:
+                    ab = bb(m.around) if m.around in comps else None
+                    radius = (max(ab.xlen, ab.ylen) * 0.4) if ab else 40.0
+                for i, nm in enumerate(names):
+                    ang = 2 * math.pi * i / max(1, n)
+                    # Orientation is ROLE-driven, not one-size: a LEG/BASE stands vertical and reaches the
+                    # floor; an ARM/SPOKE radiates HORIZONTALLY from the hub. Parts often taper along local X
+                    # (loft), so for a vertical leg we tip that long axis up to Z; a horizontal arm keeps its
+                    # natural X orientation and the Z-spin alone points it outward at this angle.
+                    vertical = comps[nm].role in ("leg", "base")
+                    stand = 0.0
+                    bs = bare.get(nm)
+                    if vertical and bs is not None:
+                        lb = bs.BoundingBox()
+                        if lb.xlen >= lb.ylen and lb.xlen >= lb.zlen:   # long axis X → tip up (X→Z)
+                            stand = -90.0
+                    comps[nm].rotate = (0.0, round(stand + m.splay_deg, 3), round(math.degrees(ang), 3))
+                    set_at(nm, x=cx + radius * math.cos(ang), y=cy + radius * math.sin(ang))
+                    if m.z is not None:
+                        set_at(nm, z=m.z)
+                    elif vertical:
+                        ground(nm)                                   # legs/base reach the floor
+                    elif m.around in comps:                          # arms/spokes sit at the hub's mid-height
+                        ab = bb(m.around)
+                        if ab: set_at(nm, z=ab.center.z)
+            elif m.kind == "ground" and m.a in comps:
+                ground(m.a)
+            elif m.kind == "coaxial" and m.a in comps and m.b in comps:
+                rb = bb(m.b)
+                if rb: set_at(m.a, x=rb.center.x, y=rb.center.y)
+            elif m.kind == "stack" and m.a in comps and m.b in comps:
+                ba = bb(m.a)
+                if m.b in radial_of:                              # stacking onto a radial group (e.g. seat on legs)
+                    cx, cy, grp = radial_of[m.b]
+                    tops = [bb(p).zmax for p in grp if bb(p) is not None]
+                    if ba and tops:
+                        set_at(m.a, x=cx + m.offset[0], y=cy + m.offset[1],
+                               z=comps[m.a].at[2] + (max(tops) - m.overlap - ba.zmin))  # centered on axis, on all legs
+                else:
+                    rb = bb(m.b)
+                    if ba and rb:
+                        set_at(m.a, x=rb.center.x + m.offset[0], y=rb.center.y + m.offset[1],
+                               z=comps[m.a].at[2] + (rb.zmax - m.overlap - ba.zmin))   # a's bottom onto b's top
+            elif m.kind == "flush" and m.a in comps and m.b in comps:
+                ba, rb = bb(m.a), bb(m.b); s = (m.side or "+z")
+                if ba and rb:
+                    ax = {"+x": rb.xmax - m.overlap - ba.xmin, "-x": rb.xmin + m.overlap - ba.xmax}.get(s)
+                    ay = {"+y": rb.ymax - m.overlap - ba.ymin, "-y": rb.ymin + m.overlap - ba.ymax}.get(s)
+                    az = {"+z": rb.zmax - m.overlap - ba.zmin, "-z": rb.zmin + m.overlap - ba.zmax}.get(s)
+                    set_at(m.a, x=comps[m.a].at[0] + ax if ax is not None else None,
+                           y=comps[m.a].at[1] + ay if ay is not None else None,
+                           z=comps[m.a].at[2] + az if az is not None else None)
+            elif m.kind == "mirror" and m.a in comps and m.b in comps:
+                bx, by, bz = comps[m.b].at; pl = (m.plane or "YZ")
+                set_at(m.a, x=-bx if pl == "YZ" else bx, y=-by if pl == "XZ" else by, z=-bz if pl == "XY" else bz)
+                comps[m.a].rotate = comps[m.b].rotate
+            elif m.kind == "attach" and m.a in comps and m.b in comps:
+                ba, rb = bb(m.a), bb(m.b)
+                if ba and rb:
+                    d, direction = _solid_gap(_place(bare[m.a], comps[m.a]), _place(bare[m.b], comps[m.b]))
+                    step = direction.multiply(d + m.overlap)
+                    cx, cy, cz = comps[m.a].at
+                    set_at(m.a, x=cx + step.x, y=cy + step.y, z=cz + step.z)
+        except Exception:  # noqa: BLE001 — a bad mate shouldn't crash the whole layout
+            continue
+    return asm
+
+
+def repair_connectivity(asm: Assembly, margin: float = 1.5, max_iter: int = 16, max_close: float = 18.0) -> Assembly:
     """Deterministically snap disconnected parts together so a fused assembly is ONE solid — the LLM
     planner routinely leaves gaps at joints, so verify_assembly reports 'disconnected'. Group parts by
     real solid proximity (union-find over BRepExtrema distance), then rigidly translate each non-anchor
@@ -137,7 +294,10 @@ def repair_connectivity(asm: Assembly, margin: float = 1.5, max_iter: int = 16) 
                     d, direction = _solid_gap(placed[i], placed[j])
                     if best is None or d < best[0]:
                         best = (d, direction)
-            if best is not None:
+            # ONLY close SMALL gaps. solve_layout already arranged the parts; a large gap means the part
+            # is intentionally apart (e.g. a splayed leg) — dragging it to the center would collapse the
+            # layout into a clump (the old bug). Leave it; the verifier flags it as disconnected instead.
+            if best is not None and best[0] <= max_close:
                 step = best[1].multiply(best[0] + margin)   # close the gap + overlap by margin
                 for i in g:                                 # rigid move of the whole group (keeps layout)
                     cx, cy, cz = asm.components[i].at
@@ -247,14 +407,15 @@ def build_assembly(asm: Assembly) -> cq.Workplane:
 
 def verify_assembly(asm: Assembly) -> dict:
     """Per-component local verify (build-failure-tolerant) + assembly connectivity & validity."""
-    comps, placed = [], []
+    comps, placed, built = [], [], []
     for c in asm.components:
         try:
             wp = build(c.part)
             rep = verify(wp, c.part)
             comps.append({"name": c.name, "passed": rep.passed,
                           "fails": [r.name for r in rep.rows if not r.within_tol]})
-            placed.append(_place(wp.val(), c))
+            ps = _place(wp.val(), c)
+            placed.append(ps); built.append((c, ps))
         except Exception as e:  # noqa: BLE001 — a part that won't build is a (caught) failure
             comps.append({"name": c.name, "passed": False, "fails": [f"build error: {type(e).__name__}"]})
     built_all = len(placed) == len(asm.components)
@@ -283,6 +444,32 @@ def verify_assembly(asm: Assembly) -> dict:
         {"name": "assembly · valid (watertight)", "expected": True, "measured": valid,
          "within_tol": valid, "category": "ok" if valid else "validity"},
     ]
+    # Structural-support check — catches the "connected but stacked/clumped" failure that the single-solid
+    # connectivity test misses (the research's 'false convergence'). Intent-aware via component roles:
+    #   • grounded   — the assembly rests on the floor (min-z ≈ 0), not floating or sunk
+    #   • legs reach — every leg/support part actually touches the floor (no stubby hovering legs)
+    #   • footprint  — ≥3 legs/supports/arms are SPREAD in XY, not piled at one center (the stool clump)
+    if built:
+        bbs = [(c, s.BoundingBox()) for c, s in built]
+        # ground contact is only EXPECTED for STANDING objects (those with legs/base); a free frame
+        # (drone, wall bracket, a 'support' member up in the air) legitimately floats — don't require z≈0
+        # unless the object actually stands on legs/base. 'support' is a generic strut, not a foot.
+        footed = [(c, b) for c, b in bbs if c.role in ("leg", "base")]
+        min_z = min(b.zmin for _, b in bbs)
+        grounded = (not footed) or abs(min_z) <= 2.0
+        legs = [(c, b) for c, b in bbs if c.role == "leg"]
+        legs_reach = all(b.zmin <= 2.0 for _, b in legs)   # legs must actually touch the floor
+        spread = [(c, b) for c, b in bbs if c.role in ("leg", "support", "arm")]
+        footprint_ok = True
+        if len(spread) >= 3:
+            cxs = [b.center.x for _, b in spread]; cys = [b.center.y for _, b in spread]
+            span = max(max(cxs) - min(cxs), max(cys) - min(cys))
+            footprint_ok = span > 10.0   # legs/arms must fan out, not clump at the axis (the old stool bug)
+        supported = grounded and legs_reach and footprint_ok
+        detail = "ok" if supported else ", ".join(
+            x for x, ok in [("not grounded", grounded), ("legs hover", legs_reach), ("clumped", footprint_ok)] if not ok)
+        rows.append({"name": "assembly · structurally supported", "expected": "ok", "measured": detail,
+                     "within_tol": supported, "category": "ok" if supported else "structure"})
     # Joint blending is informational — surface the count so a render's "smoothed joints" is
     # auditable. It FAILS only if blending corrupted the solid (no seams to blend, e.g. a single
     # part or parts that merely abut, is fine — n_blended=0 with a still-valid solid passes).
