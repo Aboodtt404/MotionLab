@@ -1,0 +1,19 @@
+{
+	admin off
+}
+# Single-origin proxy for MotionLab Studio: serve the built frontend + route the two backends under
+# /api/*. Fronted by a Cloudflare tunnel so the whole app works from one public HTTPS URL.
+# Separate instance from vast.ai's portal Caddy — admin off to avoid the :2019 clash.
+:8088 {
+	handle_path /api/cad/* {
+		reverse_proxy 127.0.0.1:8765
+	}
+	handle_path /api/trackb/* {
+		reverse_proxy 127.0.0.1:8770
+	}
+	handle {
+		root * /home/abdelrahman/MotionLab/frontend/dist
+		try_files {path} /index.html
+		file_server
+	}
+}

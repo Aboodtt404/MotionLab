@@ -30,9 +30,9 @@ export function Viewport() {
     scene.current?.update({
       branch: s.branch, spec: s.spec, style: s.style, organicDetail: s.organicDetail,
       symmetry: s.symmetry, targetHeight: s.targetHeight, view: s.view, heatmap: s.heatmap,
-      turntable: s.turntable, lightMood: s.lightMood, meshStl: s.meshStl,
+      turntable: s.turntable, lightMood: s.lightMood, meshStl: s.meshStl, meshGlb: s.meshGlb,
     });
-  }, [s.branch, s.spec, s.style, s.organicDetail, s.symmetry, s.targetHeight, s.view, s.heatmap, s.turntable, s.lightMood, s.meshStl]);
+  }, [s.branch, s.spec, s.style, s.organicDetail, s.symmetry, s.targetHeight, s.view, s.heatmap, s.turntable, s.lightMood, s.meshStl, s.meshGlb]);
 
   return <div ref={host} style={{ position: "absolute", inset: 0, cursor: "grab" }} />;
 }

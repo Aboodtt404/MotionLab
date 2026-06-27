@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import type { Spec } from "../types";
 
 const S = 0.02; // mm → world scale
@@ -16,6 +17,7 @@ export interface SceneState {
   turntable: boolean;
   lightMood: string;
   meshStl?: string | null; // base64 STL from the real pipeline (overrides the procedural mesh)
+  meshGlb?: string | null; // base64 GLB+PBR from Track B (TRELLIS.2 organic mesh)
 }
 
 const MOODS: Record<string, { amb: number; key: number; rim: number; fill: number; keyPos: [number, number, number] }> = {
@@ -221,10 +223,33 @@ export class StudioScene {
     const sc = maxDimWorld * 1.3 + 0.3; this.shadowMesh.scale.set(sc, sc, sc);
   }
 
+  // Track B: a TRELLIS.2 GLB (with its own PBR materials). glTF is Y-up + ~unit-cube; normalize to a
+  // fixed world size + sit on the ground. Async (GLTFLoader.parse is callback-based) — adds on load.
+  buildFromGlb(b64: string) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    new GLTFLoader().parse(bytes.buffer, "", (gltf) => {
+      const obj = gltf.scene;
+      const size = new THREE.Vector3(); new THREE.Box3().setFromObject(obj).getSize(size);
+      const maxDim = Math.max(size.x, size.y, size.z) || 1;
+      obj.scale.setScalar(1.6 / maxDim);                      // normalize to ~1.6 world units
+      const bb = new THREE.Box3().setFromObject(obj);
+      const ctr = new THREE.Vector3(); bb.getCenter(ctr);
+      obj.position.set(-ctr.x, -bb.min.y, -ctr.z);            // center XZ, sit on the ground plane
+      this.partGroup.add(obj);
+      this.target.y = (size.y * 1.6 / maxDim) / 2;
+      this.fitR = 1.6 * 2.2 + 0.7; if (!this.radius) this.radius = this.fitR;
+      const sc = 1.6 * 1.3 + 0.3; this.shadowMesh.scale.set(sc, sc, sc);
+    }, (err) => console.error("GLB parse failed", err));
+  }
+
   rebuild() {
     this.disposeGroup(this.partGroup);
-    if (this.state.branch === "organic") this.buildBlob();
-    else if (this.state.meshStl) this.buildFromStl(this.state.meshStl);  // real pipeline mesh
+    if (this.state.branch === "organic") {
+      if (this.state.meshGlb) this.buildFromGlb(this.state.meshGlb);     // real Track B mesh (TRELLIS.2)
+      else this.buildBlob();                                             // procedural preview (no mesh yet)
+    } else if (this.state.meshStl) this.buildFromStl(this.state.meshStl);  // real pipeline mesh
     else this.buildHard();                                               // procedural preview
     this.updateView();
     this.glowMesh.visible = true;
@@ -244,7 +269,7 @@ export class StudioScene {
 
   update(s: SceneState) {
     this.state = s;
-    const sig = JSON.stringify({ b: s.branch, sh: s.spec.shape, e: s.spec.envelope, f: s.spec.features, d: s.organicDetail, sym: s.symmetry, th: s.targetHeight, hm: s.heatmap, st: s.style, mesh: s.meshStl ? s.meshStl.length : 0 });
+    const sig = JSON.stringify({ b: s.branch, sh: s.spec.shape, e: s.spec.envelope, f: s.spec.features, d: s.organicDetail, sym: s.symmetry, th: s.targetHeight, hm: s.heatmap, st: s.style, mesh: s.meshStl ? s.meshStl.length : 0, glb: s.meshGlb ? s.meshGlb.length : 0 });
     if (sig !== this.sig) { this.sig = sig; this.rebuild(); }
     if (s.view !== this.view) this.updateView();
     if (s.lightMood !== this.mood) { this.mood = s.lightMood; this.applyMood(this.mood); }

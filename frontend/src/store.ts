@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { backendToSpec, editAssembly, generateBackend, generateFromPrompt, planAssembly, toInspection } from "./api";
+import { backendToSpec, editAssembly, generateBackend, generateFromPrompt, generateMesh, planAssembly, toInspection } from "./api";
 import type { Asset, Branch, Fab, FeatureType, InspectionRow, Mode, OrganicCheck, Spec, View } from "./types";
 
 /* ------------------------------------------------------------------ *
@@ -181,7 +181,7 @@ export const useStudio = create<StudioState>((set, get) => {
   const resetGen = () => ({
     genStatus: "idle" as const, genStep: 0, progress: 0, inspection: null, organicReport: null,
     retry: null, retryDiff: null, fidelity: 0, bestOfN: 0, approved: false, attempt: 0, attempts: 0,
-    meshStl: null, code: null, backendError: null,
+    meshStl: null, meshGlb: null, code: null, backendError: null,
   });
   const setSpec = (mut: (s: Spec) => void) => { const s = clone(get().spec); mut(s); set({ spec: s }); };
 
@@ -223,12 +223,32 @@ export const useStudio = create<StudioState>((set, get) => {
     genStatus: "idle", genStep: 0, progress: 0, attempt: 0, attempts: 0, retry: null, retryDiff: null,
     inspection: null, organicReport: null, fidelity: 0, bestOfN: 0, approved: false,
     addMenuOpen: false, libOpen: false, hollow: false, minWall: 1.5, activeVar: 0, assets: seedAssets,
-    meshStl: null, code: null, backendError: null, useModel: true, // real-backend wiring (live Phase-2 model)
+    meshStl: null, meshGlb: null, code: null, backendError: null, useModel: true, // real-backend wiring (live Phase-2 model)
     assemblyMode: false, assembly: null, assemblyObject: null,      // planner / edit-loop
 
     // planner (multi-part): first prompt PLANS, subsequent prompts EDIT the current design
     toggleAssemblyMode: () => set((s) => ({ assemblyMode: !s.assemblyMode })),
-    newDesign: () => { clearTimers(); set({ assembly: null, assemblyObject: null, meshStl: null, inspection: null, ...resetGen() }); },
+    newDesign: () => { clearTimers(); set({ assembly: null, assemblyObject: null, meshStl: null, meshGlb: null, inspection: null, ...resetGen() }); },
+
+    // Track B (organic): a reference image → a real TRELLIS.2 mesh via the Track-B service.
+    generateMeshFromImage: (imageB64: string, pipelineType = "512") => {
+      clearTimers();
+      set({ branch: "organic", genStatus: "running", genStep: 1, progress: 20, organicReport: null, backendError: null, meshGlb: null });
+      T(900, () => set({ genStep: 2, progress: 55 }));
+      generateMesh(imageB64, pipelineType).then((resp) => {
+        clearTimers();
+        const r = resp.report;
+        const organicReport: OrganicCheck[] = [
+          { label: "Mesh faces", value: String(r.faces), ok: true },
+          { label: "PBR maps", value: r.pbr.join(", ") || "none", ok: r.pbr.length > 0 },
+          { label: "Watertight", value: r.watertight ? "yes" : "no", ok: true },
+          { label: "Generated", value: `${resp.seconds ?? 0}s @ ${resp.pipeline_type || pipelineType}`, ok: true },
+        ];
+        const nm = (get().prompt.split(/[,.\n]/)[0].trim().slice(0, 22) || "organic asset").toLowerCase();
+        const assets = [{ id: "g" + Date.now(), name: nm, cls: "organic" as const, ver: "v1", pass: true }, ...get().assets].slice(0, 10);
+        set({ genStatus: "done", genStep: 4, progress: 100, meshGlb: resp.glb_b64 || null, organicReport, bestOfN: 0, approved: false, assets });
+      }).catch((err) => { clearTimers(); set({ genStatus: "idle", progress: 0, backendError: String(err?.message || err) }); });
+    },
     planOrEdit: () => {
       const st = get();
       if (st.genStatus === "running" || !st.prompt.trim()) return;

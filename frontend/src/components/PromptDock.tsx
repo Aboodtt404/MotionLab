@@ -12,7 +12,14 @@ export function PromptDock() {
     : warningsFor(s.branch, s.spec).length > 0 || (s.mode === "image" && !s.imageThumb) || s.genStatus === "running";
   const examples = EXAMPLES[s.branch];
   const btnLabel = asm ? (editing ? "Edit" : "Plan") : "Generate";
-  const onGo = () => { if (blocked) return; asm ? s.planOrEdit() : s.generate(); };
+  const onGo = () => {
+    if (blocked) return;
+    if (asm) return s.planOrEdit();
+    // Track B (organic): a reference image → real TRELLIS.2 mesh. (Text→organic needs the T2I front-end, not built yet.)
+    if (s.branch === "organic" && s.mode === "image" && s.imageThumb)
+      return s.generateMeshFromImage(s.imageThumb.split(",")[1] || s.imageThumb);
+    s.generate();
+  };
 
   const generateStyle: React.CSSProperties = {
     display: "flex", alignItems: "center", gap: 7, fontSize: 13.5, fontWeight: 600, fontFamily: "inherit",

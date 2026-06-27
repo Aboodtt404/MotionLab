@@ -2,7 +2,10 @@
  * the backend contract, POSTs /generate, and returns the REAL verifier report + mesh. */
 import type { InspectionRow, Spec } from "./types";
 
-const API_BASE = (import.meta as any).env?.VITE_CAD_API || "http://127.0.0.1:8765";
+// Same-origin API paths so one reverse proxy (Caddy) + one Cloudflare tunnel serves the whole app:
+// the proxy maps /api/cad/* → the cad backend (:8765) and /api/trackb/* → Track B (:8770). Override
+// with VITE_CAD_API for a direct-port setup.
+const API_BASE = (import.meta as any).env?.VITE_CAD_API || `${location.origin}/api/cad`;
 
 export interface BackendRow {
   name: string; expected: number | string; measured: number | string | null;
@@ -66,6 +69,24 @@ export const planAssembly = (prompt: string): Promise<AssemblyResponse> => post(
 /** EDIT the current assembly with an instruction (the edit-loop). */
 export const editAssembly = (assembly: any, instruction: string): Promise<AssemblyResponse> =>
   post({ assembly, instruction }, "/edit");
+
+/* ── Track B (organic): image → 3D mesh via the TRELLIS.2 service (separate port). ───────────── */
+const TRACKB_BASE = (import.meta as any).env?.VITE_TRACKB_API || `${location.origin}/api/trackb`;
+export interface MeshResponse {
+  glb_b64: string | null;
+  report: { faces: number; verts: number; watertight: boolean; pbr: string[]; size_mb: number };
+  seconds?: number;
+  pipeline_type?: string;
+}
+/** Organic image-to-3D: base64 image → a GLB (with PBR). pipelineType '512' (fast) … '1024_cascade' (hero). */
+export async function generateMesh(imageB64: string, pipelineType = "512"): Promise<MeshResponse> {
+  const res = await fetch(TRACKB_BASE + "/image2mesh", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ image_b64: imageB64, pipeline_type: pipelineType }),
+  });
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `HTTP ${res.status}`); }
+  return res.json();
+}
 
 /** Backend spec (flat features) → Studio Spec ({type,params}) so the editor reflects the interpretation. */
 export function backendToSpec(bs: any, base: Spec): Spec {

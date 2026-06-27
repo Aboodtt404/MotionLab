@@ -204,8 +204,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"cad_pipeline API on http://127.0.0.1:{port}  (POST /generate)")
+    host = os.environ.get("CAD_BIND", "127.0.0.1")   # set CAD_BIND=0.0.0.0 to reach it over the network
+    srv = ThreadingHTTPServer((host, port), Handler)
+    print(f"cad_pipeline API on http://{host}:{port}  (POST /generate)")
     srv.serve_forever()
     return 0
 
