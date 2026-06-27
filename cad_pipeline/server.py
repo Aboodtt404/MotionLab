@@ -20,7 +20,10 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import traceback
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cadquery as cq
@@ -39,6 +42,19 @@ def _stl_b64(solid) -> str:
         cq.exporters.export(solid.val() if isinstance(solid, cq.Workplane) else solid, p)
         with open(p, "rb") as fh:
             return base64.b64encode(fh.read()).decode()
+
+
+def _step_b64(solid) -> str | None:
+    """STEP (BREP) export — the parametric format robotics/CAD-CAM needs (not a mesh). Returns None if
+    the solid can't be written as STEP (e.g. a degenerate compound) so the frontend degrades gracefully."""
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "part.step")
+            cq.exporters.export(solid.val() if isinstance(solid, cq.Workplane) else solid, p, "STEP")
+            with open(p, "rb") as fh:
+                return base64.b64encode(fh.read()).decode()
+    except Exception:  # noqa: BLE001 — STEP is best-effort; STL always succeeds
+        return None
 
 
 def _inspection(report: dict) -> list:
@@ -110,10 +126,107 @@ def _run_model(spec: Spec, max_attempts: int) -> dict:
         return {"passed": False, "attempts": len(history), "history": history, "code": None, "report": None, "solid": None}
 
 
+def _spec_of(body: dict) -> Spec:
+    # text→spec via the model (Track A front-end) when a raw prompt is given; else a typed spec.
+    return prompt_to_spec(body["prompt"]) if (body.get("prompt") and not body.get("spec")) else Spec(**body["spec"])
+
+
+def _gen_job(body: dict) -> dict:
+    spec = _spec_of(body)
+    refine_hist = None
+    if body.get("refine"):   # Stage C: render→VLM critique loop nudges the greeble params first
+        from .critique import refine
+        spec, refine_hist = refine(spec, rounds=int(body.get("rounds", 2)))
+    out = (_run_model(spec, int(body.get("max_attempts", 3))) if body.get("use_model") else _run_golden(spec))
+    resp = {"passed": out["passed"], "attempts": out["attempts"], "history": out["history"], "code": out["code"],
+            "spec": spec.model_dump(exclude_none=True),
+            "inspection": _inspection(out["report"]) if out["report"] else [],
+            "mesh_stl_b64": _stl_b64(out["solid"]) if out.get("solid") is not None else None,
+            "step_b64": _step_b64(out["solid"]) if out.get("solid") is not None else None}
+    if refine_hist is not None:
+        resp["refine_history"] = refine_hist
+        if out.get("solid") is not None:
+            from .render import render_views
+            resp["render_png_b64"] = base64.b64encode(render_views(out["solid"], 1)[0]).decode()
+    return resp
+
+
+def _critique_job(body: dict) -> dict:
+    from .critique import critique
+    from .render import render_views
+    spec = _spec_of(body)
+    solid = build(spec)
+    c = critique(spec, solid)
+    return {"verdict": c["verdict"], "scores": c.get("scores", {}), "suggest": c.get("suggest", {}),
+            "notes": c.get("notes", ""), "spec": spec.model_dump(exclude_none=True),
+            "render_png_b64": base64.b64encode(render_views(solid, 1)[0]).decode()}
+
+
+def _assembly_job(route: str, body: dict) -> dict:
+    from .assembly import Assembly, build_assembly, verify_assembly
+    from .planner import edit, plan
+    asm = (plan(body["prompt"]) if route == "/plan"
+           else edit(Assembly(**body["assembly"]), body["instruction"]))
+    refine_hist = None
+    if route == "/plan" and body.get("refine"):   # render→VLM critique loop improves the blockout
+        from .critique import refine_assembly
+        asm, refine_hist = refine_assembly(asm, asm.object, rounds=int(body.get("rounds", 2)))
+    rep = verify_assembly(asm)
+    insp = [{"name": r["name"], "expected": r["expected"], "measured": r["measured"],
+             "delta": None, "within_tol": r["within_tol"], "category": r["category"]} for r in rep["rows"]]
+    for c in rep["components"]:
+        insp.append({"name": f"part · {c['name']}", "expected": "ok",
+                     "measured": "ok" if c["passed"] else ", ".join(c["fails"]) or "fail",
+                     "delta": None, "within_tol": c["passed"], "category": "component"})
+    asm_solid = build_assembly(asm)
+    out = {"passed": rep["passed"], "assembly": asm.model_dump(), "components": len(asm.components),
+           "object": asm.object, "inspection": insp, "mesh_stl_b64": _stl_b64(asm_solid),
+           "step_b64": _step_b64(asm_solid)}
+    if refine_hist is not None:
+        out["refine_history"] = refine_hist
+        from .render import render_views
+        out["render_png_b64"] = base64.b64encode(render_views(asm_solid, 1)[0]).decode()
+    return out
+
+
+# ── async job model — Track A's planner + model codegen can exceed Cloudflare's 100s tunnel limit, so
+#    POSTs enqueue a job and return {job_id}; the client polls GET /job/<id> with short requests. ──────
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
+_MAX_JOBS = 32
+
+
+def _new_job() -> str:
+    jid = uuid.uuid4().hex[:12]
+    with _jobs_lock:
+        _jobs[jid] = {"status": "running", "created": time.time(), "result": None, "error": None}
+        if len(_jobs) > _MAX_JOBS:
+            for k, _ in sorted(_jobs.items(), key=lambda kv: kv[1]["created"])[: len(_jobs) - _MAX_JOBS]:
+                _jobs.pop(k, None)
+    return jid
+
+
+def _run_job(jid: str, route: str, body: dict):
+    try:
+        if route == "/generate":
+            result = _gen_job(body)
+        elif route == "/critique":
+            result = _critique_job(body)
+        else:
+            result = _assembly_job(route, body)
+        with _jobs_lock:
+            if jid in _jobs:
+                _jobs[jid].update(status="done", result=result)
+    except Exception as e:  # noqa: BLE001
+        with _jobs_lock:
+            if jid in _jobs:
+                _jobs[jid].update(status="error", error=f"{type(e).__name__}: {e}", trace=traceback.format_exc()[-800:])
+
+
 class Handler(BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def do_OPTIONS(self):  # noqa: N802
@@ -126,77 +239,35 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):  # noqa: N802 — enqueue a job, return its id (poll GET /job/<id>)
         route = self.path.rstrip("/")
         if route not in ("/generate", "/plan", "/edit", "/critique"):
             return self._json(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or b"{}")
-            if route == "/generate":
-                self._json(200, self._generate(body))
-            elif route == "/critique":   # render → VLM look-critique of a greeble spec (Stage C)
-                self._json(200, self._critique(body))
-            else:   # /plan and /edit operate on multi-part assemblies (the planner)
-                self._json(200, self._assembly(route, body))
+            jid = _new_job()
+            threading.Thread(target=_run_job, args=(jid, route, body), daemon=True).start()
+            self._json(202, {"job_id": jid})
         except Exception as e:  # noqa: BLE001
             self._json(400, {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-800:]})
 
-    def _spec_of(self, body: dict) -> Spec:
-        # text→spec via the model (Track A front-end) when a raw prompt is given; else a typed spec.
-        return prompt_to_spec(body["prompt"]) if (body.get("prompt") and not body.get("spec")) else Spec(**body["spec"])
-
-    def _generate(self, body: dict) -> dict:
-        spec = self._spec_of(body)
-        refine_hist = None
-        if body.get("refine"):   # Stage C: render→VLM critique loop nudges the greeble params first
-            from .critique import refine
-            spec, refine_hist = refine(spec, rounds=int(body.get("rounds", 2)))
-        out = (_run_model(spec, int(body.get("max_attempts", 3))) if body.get("use_model") else _run_golden(spec))
-        resp = {"passed": out["passed"], "attempts": out["attempts"], "history": out["history"], "code": out["code"],
-                "spec": spec.model_dump(exclude_none=True),
-                "inspection": _inspection(out["report"]) if out["report"] else [],
-                "mesh_stl_b64": _stl_b64(out["solid"]) if out.get("solid") is not None else None}
-        if refine_hist is not None:
-            resp["refine_history"] = refine_hist
-            if out.get("solid") is not None:
-                from .render import render_views
-                resp["render_png_b64"] = base64.b64encode(render_views(out["solid"], 1)[0]).decode()
-        return resp
-
-    def _critique(self, body: dict) -> dict:
-        from .critique import critique
-        from .render import render_views
-        spec = self._spec_of(body)
-        solid = build(spec)
-        c = critique(spec, solid)
-        return {"verdict": c["verdict"], "scores": c.get("scores", {}), "suggest": c.get("suggest", {}),
-                "notes": c.get("notes", ""), "spec": spec.model_dump(exclude_none=True),
-                "render_png_b64": base64.b64encode(render_views(solid, 1)[0]).decode()}
-
-    def _assembly(self, route: str, body: dict) -> dict:
-        from .assembly import Assembly, build_assembly, verify_assembly
-        from .planner import edit, plan
-        asm = (plan(body["prompt"]) if route == "/plan"
-               else edit(Assembly(**body["assembly"]), body["instruction"]))
-        refine_hist = None
-        if route == "/plan" and body.get("refine"):   # render→VLM critique loop improves the blockout
-            from .critique import refine_assembly
-            asm, refine_hist = refine_assembly(asm, asm.object, rounds=int(body.get("rounds", 2)))
-        rep = verify_assembly(asm)
-        insp = [{"name": r["name"], "expected": r["expected"], "measured": r["measured"],
-                 "delta": None, "within_tol": r["within_tol"], "category": r["category"]} for r in rep["rows"]]
-        for c in rep["components"]:
-            insp.append({"name": f"part · {c['name']}", "expected": "ok",
-                         "measured": "ok" if c["passed"] else ", ".join(c["fails"]) or "fail",
-                         "delta": None, "within_tol": c["passed"], "category": "component"})
-        out = {"passed": rep["passed"], "assembly": asm.model_dump(), "components": len(asm.components),
-               "object": asm.object, "inspection": insp, "mesh_stl_b64": _stl_b64(build_assembly(asm))}
-        if refine_hist is not None:
-            out["refine_history"] = refine_hist
-            from .render import render_views
-            out["render_png_b64"] = base64.b64encode(render_views(build_assembly(asm), 1)[0]).decode()
-        return out
+    def do_GET(self):  # noqa: N802
+        route = self.path.rstrip("/")
+        if route.startswith("/job/"):
+            with _jobs_lock:
+                job = _jobs.get(route[len("/job/"):])
+                snap = dict(job) if job else None
+            if snap is None:
+                return self._json(404, {"error": "unknown job"})
+            if snap["status"] == "done":
+                return self._json(200, {"status": "done", **snap["result"]})
+            if snap["status"] == "error":
+                return self._json(200, {"status": "error", "error": snap["error"], "trace": snap.get("trace", "")})
+            return self._json(200, {"status": snap["status"], "elapsed": round(time.time() - snap["created"])})
+        if route in ("/health", "/"):
+            return self._json(200, {"ok": True, "jobs": len(_jobs)})
+        return self._json(404, {"error": "not found"})
 
     def log_message(self, *_):  # quiet
         pass
