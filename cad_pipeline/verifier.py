@@ -331,8 +331,12 @@ def _verify_revolve(solid, spec: Spec, tol: float) -> List[Row]:
         surf = BRepAdaptor_Surface(face); t = surf.GetType()
         if t in _AXISYM:
             lateral += 1
-            ax = _surface_axis(surf, t); d = ax.Direction(); loc = ax.Location()
-            if abs(d.Z()) < 0.99 or (loc.X() ** 2 + loc.Y() ** 2) ** 0.5 > tol + 1e-6:
+            ax = _surface_axis(surf, t); d = ax.Direction()
+            # A face TURNED about Z has its axis-DIRECTION along Z. An off-CENTRE but Z-aligned cylinder
+            # is a bored HOLE / feature (legitimate on a revolved part — e.g. mounting holes in a seat),
+            # NOT an axisymmetry error. Only a non-Z axis direction means the body was turned about the
+            # wrong axis, so only that counts as off-axis.
+            if abs(d.Z()) < 0.99:
                 off_axis += 1
         elif t == GeomAbs_Sphere:
             lateral += 1
