@@ -174,6 +174,21 @@ export function Settings() {
           <div style={{ fontSize: 10.5, color: C.sub2, lineHeight: 1.55 }}>
             Iterate with <b style={{ color: C.sub }}>Preview</b>, then run <b style={{ color: C.sub }}>Max detail</b> for the hero asset.
           </div>
+
+          {/* multi-view conditioning: synthesize 6 consistent views (MV-Adapter) so TRELLIS gets real
+              geometry on the unseen sides. Biggest win on asymmetric/detailed hero assets. */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+            {label("Geometry")}
+            <button onClick={() => s.setMultiView(!s.multiView)} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "10px 12px", borderRadius: 10, cursor: "pointer", fontFamily: fonts.ui, textAlign: "left", border: `1px solid ${s.multiView ? ac.line : C.border2}`, background: s.multiView ? ac.soft : C.inputBg, color: s.multiView ? C.text : C.sub }}>
+              <span style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+                <span style={{ fontSize: 12.5, fontWeight: s.multiView ? 600 : 500 }}>Multi-view (high fidelity)</span>
+                <span style={{ fontSize: 10, color: C.sub2, lineHeight: 1.4 }}>6 synthesized views → real unseen-side detail · +~30 s</span>
+              </span>
+              <span style={{ width: 34, height: 20, borderRadius: 999, background: s.multiView ? ac.a2 : C.border3, position: "relative", flex: "0 0 34px" }}>
+                <span style={{ position: "absolute", top: 2, left: s.multiView ? 16 : 2, width: 16, height: 16, borderRadius: "50%", background: "#fff" }} />
+              </span>
+            </button>
+          </div>
         </div>
       )}
     </div>

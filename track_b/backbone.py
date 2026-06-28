@@ -60,6 +60,12 @@ def generate(image, out_glb: str, *, seed: int = 42, pipeline_type: str = "512",
         texture_size = 4096 if "cascade" in pipeline_type else 2048   # hero tiers → sharper 4K PBR
     img = Image.open(image) if isinstance(image, str) else image
     mesh = _pipeline().run(img, seed=seed, pipeline_type=pipeline_type)[0]
+    return _export_glb(mesh, out_glb, texture_size, decimation)
+
+
+def _export_glb(mesh, out_glb: str, texture_size: int, decimation: int) -> str:
+    """Shared mesh → GLB-with-PBR export (used by both single- and multi-view paths)."""
+    import o_voxel
     mesh.simplify(16777216)   # nvdiffrast index limit
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs, coords=mesh.coords,
@@ -69,6 +75,42 @@ def generate(image, out_glb: str, *, seed: int = 42, pipeline_type: str = "512",
     os.makedirs(os.path.dirname(out_glb) or ".", exist_ok=True)
     glb.export(out_glb, extension_webp=True)
     return out_glb
+
+
+def generate_multi(images, out_glb: str, *, seed: int = 42, pipeline_type: str = "1024_cascade",
+                   texture_size: int | None = None, decimation: int = 1_000_000,
+                   mode: str = "stochastic") -> str:
+    """Multi-view variant of generate(): a list of CONSISTENT views of the SAME object → one GLB.
+
+    Uses reference-cycling conditioning (track_b/trellis_multiview.py). `images` is a list of paths or
+    PIL.Images, all showing the same object from different angles. `mode='stochastic'` is the only mode
+    that works on the single-image-trained checkpoint (see docs/research/multiview-conditioning-research.md)."""
+    from PIL import Image
+    from .trellis_multiview import enable_multi_image
+    if texture_size is None:
+        texture_size = 4096 if "cascade" in pipeline_type else 2048
+    imgs = [Image.open(i) if isinstance(i, str) else i for i in images]
+    pipe = enable_multi_image(_pipeline())
+    mesh = pipe.run_multi_image(imgs, seed=seed, pipeline_type=pipeline_type, mode=mode)[0]
+    return _export_glb(mesh, out_glb, texture_size, decimation)
+
+
+def generate_multiview(ref_image, out_glb: str, *, text: str = "", seed: int = 42,
+                       pipeline_type: str = "1024_cascade", num_views: int = 6,
+                       texture_size: int | None = None, decimation: int = 1_000_000,
+                       mode: str = "stochastic", on_stage=None) -> str:
+    """Full multi-view path: ONE hero image (FLUX concept or upload) → N consistent views via MV-Adapter
+    → multi-view TRELLIS reconstruction → GLB. The biggest quality lever for asymmetric/detailed assets
+    (the unseen sides get real geometry instead of a guess). ~16s views + a multi-view gen on top of the
+    normal mesh time. `on_stage(name)` is an optional progress callback."""
+    from .mvadapter_views import multiview
+    if on_stage:
+        on_stage("multiview")
+    views = multiview(ref_image, text=text or "a detailed, high quality sculpture", num_views=num_views, seed=seed)
+    if on_stage:
+        on_stage("generating")
+    return generate_multi(views, out_glb, seed=seed, pipeline_type=pipeline_type,
+                          texture_size=texture_size, decimation=decimation, mode=mode)
 
 
 def inspect_glb(glb_path: str) -> dict:

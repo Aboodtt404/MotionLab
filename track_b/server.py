@@ -32,9 +32,13 @@ import uuid
 # Phase-1 cinematic render (Blender/Cycles) — a subprocess, not a venv import (Blender has its own python).
 BLENDER = os.environ.get("BLENDER_BIN", os.path.expanduser("~/blender/blender"))
 CINEMATIC = os.path.join(os.path.dirname(__file__), "cinematic.py")
+# Cinematic MOTION pass (LTX-2.3 · 3DREAL) — a resident sidecar in its own venv; we proxy to it over localhost.
+LTX_SERVICE_URL = os.environ.get("LTX_SERVICE_URL", "http://127.0.0.1:8771")
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from ._gpulock import gpu_lock
 from .backbone import _pipeline, generate, inspect_glb
+from .cancel import Cancelled, cancel_hook
 
 _gpu = threading.Lock()           # one TRELLIS/FLUX job on the GPU at a time (single GPU, resident models)
 _jobs: dict = {}                  # job_id -> job dict (status/stage/result/error/times)
@@ -69,7 +73,7 @@ def _run_job(jid: str, kind: str, body: dict):
     try:
         if kind == "render":                             # Cycles photoreal beauty still + turntable (Blender subprocess)
             _set(jid, stage="rendering")
-            with _gpu, tempfile.TemporaryDirectory() as d:
+            with _gpu, gpu_lock(), tempfile.TemporaryDirectory() as d:
                 glb = os.path.join(d, "in.glb")
                 open(glb, "wb").write(base64.b64decode(body["glb_b64"]))
                 cmd = [BLENDER, "-b", "-P", CINEMATIC, "--", glb, d,
@@ -85,7 +89,35 @@ def _run_job(jid: str, kind: str, body: dict):
                     result["turntable_mp4_b64"] = base64.b64encode(open(mp4, "rb").read()).decode()
             _set(jid, status="done", stage="done", result=result)
             return
-        with _gpu:                                       # serialize GPU access across all jobs
+        if kind == "animate":                            # cinematic MOTION pass — proxy to the resident LTX sidecar
+            _set(jid, stage="animating")                 # LTX holds the GPU lock itself; no local _gpu needed here
+            import urllib.error
+            import urllib.request
+            payload = json.dumps({
+                "turntable_mp4_b64": body["turntable_mp4_b64"],
+                "first_frame_png_b64": body["first_frame_png_b64"],
+                "prompt": body.get("prompt", ""),
+                "variant": body.get("variant", "strong"),
+                "num_frames": int(body.get("num_frames", 49)),
+                "height": int(body.get("height", 768)),
+                "width": int(body.get("width", 768)),
+                "seed": seed,
+            }).encode()
+            req = urllib.request.Request(LTX_SERVICE_URL + "/animate", data=payload,
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=1800) as r:   # blocks ~40s+; tunnel-safe via our async job
+                    resp = json.loads(r.read())
+            except urllib.error.URLError as e:
+                raise RuntimeError(f"LTX motion service unreachable at {LTX_SERVICE_URL} — "
+                                   f"start it with ~/LTX-2/.venv/bin/python track_b/ltx_service.py ({e})")
+            if "mp4_b64" not in resp:
+                raise RuntimeError("LTX service: " + str(resp.get("error", resp)))
+            _set(jid, status="done", stage="done",
+                 result={"animated_mp4_b64": resp["mp4_b64"], "seconds": resp.get("seconds"),
+                         "variant": resp.get("variant")})
+            return
+        with _gpu, gpu_lock():                           # serialize GPU access across all jobs (+ cross-process)
             concept_b64 = None
             if kind == "text2mesh":
                 _set(jid, stage="concept")               # FLUX text → concept image
@@ -100,9 +132,18 @@ def _run_job(jid: str, kind: str, body: dict):
                 from PIL import Image
                 img = Image.open(io.BytesIO(base64.b64decode(body["image_b64"])))
             _set(jid, stage="generating")                # TRELLIS sampling + mesh extraction (the long part)
+            scancel = lambda: bool((_jobs.get(jid) or {}).get("cancel"))   # noqa: E731
+            if scancel():
+                raise Cancelled()
             with tempfile.TemporaryDirectory() as d:
                 out = os.path.join(d, "mesh.glb")
-                generate(img, out, seed=seed, pipeline_type=ptype)
+                with cancel_hook(_pipeline(), scancel):  # abort within ~1 sampler step if the job is cancelled
+                    if body.get("multiview"):            # hi-fi: hero → MV-Adapter 6 views → multi-view TRELLIS
+                        from .backbone import generate_multiview
+                        generate_multiview(img, out, text=body.get("prompt", ""), seed=seed,
+                                           pipeline_type=ptype, on_stage=lambda s: _set(jid, stage=s))
+                    else:
+                        generate(img, out, seed=seed, pipeline_type=ptype)
                 glb_b64 = base64.b64encode(open(out, "rb").read()).decode()
                 report = inspect_glb(out)
         result = {"glb_b64": glb_b64, "report": report, "pipeline_type": ptype,
@@ -110,6 +151,8 @@ def _run_job(jid: str, kind: str, body: dict):
         if concept_b64 is not None:
             result["concept_png_b64"] = concept_b64
         _set(jid, status="done", stage="done", result=result)
+    except Cancelled:
+        _set(jid, status="cancelled", stage="cancelled")   # user aborted; GPU lock already released
     except Exception as e:  # noqa: BLE001
         _set(jid, status="error", stage="error",
              error=f"{type(e).__name__}: {e}", trace=traceback.format_exc()[-800:])
@@ -142,7 +185,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         route = self.path.rstrip("/")
-        kind = {"/image2mesh": "image2mesh", "/text2mesh": "text2mesh", "/render": "render"}.get(route)
+        if route.startswith("/cancel/"):                 # cooperative cancel: flag the job; worker aborts at next step
+            jid = route[len("/cancel/"):]
+            with _jobs_lock:
+                ok = jid in _jobs
+                if ok:
+                    _jobs[jid]["cancel"] = True
+            return self._json(200 if ok else 404, {"ok": ok, "cancelling": jid})
+        kind = {"/image2mesh": "image2mesh", "/text2mesh": "text2mesh",
+                "/render": "render", "/animate": "animate"}.get(route)
         if kind is None:
             return self._json(404, {"error": "not found"})
         try:

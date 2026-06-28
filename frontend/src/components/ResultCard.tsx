@@ -169,6 +169,38 @@ function FilmResultCard() {
         <span style={{ fontSize: 10, color: C.faint, lineHeight: 1.5 }}>Path-traced in Blender/Cycles — photoreal lighting + materials (~1–2 min)</span>
       </div>
 
+      {/* cinematic MOTION pass — LTX-2.3 + 3DREAL turns the rendered turntable into a photoreal moving clip.
+          Offered only after a render exists (it consumes the turntable MP4 + beauty still as first frame). */}
+      {s.renderPng && s.renderMp4 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={exportLabel}>Cinematic motion · 3DREAL</span>
+            <div style={{ display: "flex", gap: 4 }}>
+              {(["light", "strong"] as const).map((v) => (
+                <button key={v} onClick={() => s.setAnimVariant(v)} disabled={s.animating} title={v === "light" ? "Faithful — stays close to the input" : "Aggressive — more photoreal detail"}
+                  style={{ fontSize: 9.5, textTransform: "uppercase", letterSpacing: ".06em", fontWeight: 700, padding: "3px 8px", borderRadius: 6, cursor: s.animating ? "default" : "pointer", fontFamily: mono, border: `1px solid ${s.animVariant === v ? ac.line : C.border3}`, background: s.animVariant === v ? ac.soft : "transparent", color: s.animVariant === v ? ac.a2 : C.sub }}>{v}</button>
+              ))}
+            </div>
+          </div>
+          {!s.animMp4 ? (
+            <HoverButton onClick={s.animateAsset} disabled={s.animating}
+              base={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, fontSize: 12, fontWeight: 600, padding: 10, borderRadius: 9, border: `1px solid ${ac.line}`, background: ac.soft, color: ac.a2, cursor: s.animating ? "wait" : "pointer", fontFamily: fonts.ui }}
+              hover={{ borderColor: ac.a2 }}>
+              {s.animating
+                ? <><span style={{ width: 13, height: 13, border: `2px solid ${C.border3}`, borderTopColor: ac.a2, borderRadius: "50%", display: "inline-block", animation: "vspin .7s linear infinite" }} />{s.animStage || "Animating…"}</>
+                : <><Bx n="film" size={15} />Animate — Render-to-Real (LTX-2.3)</>}
+            </HoverButton>
+          ) : (
+            <>
+              <video src={"data:video/mp4;base64," + s.animMp4} autoPlay loop muted playsInline style={{ width: "100%", display: "block", borderRadius: 10, border: `1px solid ${ac.line}` }} />
+              <ExportBtn b64={s.animMp4} label="Motion (MP4)" ext="mp4" mime="video/mp4" reason="no clip yet" />
+              <HoverButton onClick={s.animateAsset} disabled={s.animating} base={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, fontSize: 11, fontWeight: 500, padding: 7, borderRadius: 8, background: "transparent", border: "none", color: C.sub, cursor: "pointer", fontFamily: fonts.ui }} hover={{ color: C.text }}><Bx n="refresh" size={13} />Re-animate</HoverButton>
+            </>
+          )}
+          <span style={{ fontSize: 10, color: C.faint, lineHeight: 1.5 }}>Photoreal motion via LTX-2.3 + 3DREAL — keeps the turntable, makes materials real (~40s)</span>
+        </div>
+      )}
+
       <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
         <span style={exportLabel}>Export mesh</span>
         <div style={{ display: "flex", gap: 9 }}>

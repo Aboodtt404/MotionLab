@@ -110,32 +110,38 @@ async function _submit(route: string, body: any): Promise<string> {
   return (await res.json()).job_id;
 }
 
+/** Tell the server to actually abort the running job (not just stop polling). Fire-and-forget. */
+function _cancel(jobId: string): void {
+  fetch(`${TRACKB_BASE}/cancel/${jobId}`, { method: "POST" }).catch(() => {});
+}
+
 async function _poll(jobId: string, onProgress?: MeshProgress, shouldCancel?: () => boolean): Promise<MeshResponse> {
   for (;;) {
     await new Promise((r) => setTimeout(r, 3000));
-    if (shouldCancel?.()) throw new Error("cancelled");   // user abandoned — stop polling (server job may finish)
+    if (shouldCancel?.()) { _cancel(jobId); throw new Error("cancelled"); }   // abort the GPU job, not just polling
     let j: any;
     try {
       const res = await fetch(`${TRACKB_BASE}/job/${jobId}`);
       if (!res.ok) { if (res.status === 404) throw new Error("job expired"); continue; } // transient → keep polling
       j = await res.json();
     } catch { continue; }   // network blip → keep polling (the job keeps running server-side)
-    if (shouldCancel?.()) throw new Error("cancelled");
+    if (shouldCancel?.()) { _cancel(jobId); throw new Error("cancelled"); }
     if (j.status === "running" || j.status === "queued") { onProgress?.(j.stage, j.elapsed || 0); continue; }
     if (j.status === "error") throw new Error(j.error || "generation failed");
+    if (j.status === "cancelled") throw new Error("cancelled");
     if (j.status === "done") return j as MeshResponse;
   }
 }
 
 /** Organic image-to-3D: base64 image → a GLB (with PBR). pipelineType '512' … '1536_cascade' (max). */
-export async function generateMesh(imageB64: string, pipelineType = "1536_cascade", onProgress?: MeshProgress, seed?: number, shouldCancel?: () => boolean): Promise<MeshResponse> {
-  const jobId = await _submit("/image2mesh", { image_b64: imageB64, pipeline_type: pipelineType, ...(seed != null ? { seed } : {}) });
+export async function generateMesh(imageB64: string, pipelineType = "1536_cascade", onProgress?: MeshProgress, seed?: number, shouldCancel?: () => boolean, multiview = false): Promise<MeshResponse> {
+  const jobId = await _submit("/image2mesh", { image_b64: imageB64, pipeline_type: pipelineType, ...(seed != null ? { seed } : {}), ...(multiview ? { multiview: true } : {}) });
   return _poll(jobId, onProgress, shouldCancel);
 }
 
 /** Organic text-to-3D: prompt → FLUX concept image → TRELLIS GLB. The chat/description-driven path. */
-export async function generateMeshFromText(prompt: string, pipelineType = "1536_cascade", onProgress?: MeshProgress, seed?: number, shouldCancel?: () => boolean): Promise<MeshResponse> {
-  const jobId = await _submit("/text2mesh", { prompt, pipeline_type: pipelineType, ...(seed != null ? { seed } : {}) });
+export async function generateMeshFromText(prompt: string, pipelineType = "1536_cascade", onProgress?: MeshProgress, seed?: number, shouldCancel?: () => boolean, multiview = false): Promise<MeshResponse> {
+  const jobId = await _submit("/text2mesh", { prompt, pipeline_type: pipelineType, ...(seed != null ? { seed } : {}), ...(multiview ? { multiview: true } : {}) });
   return _poll(jobId, onProgress, shouldCancel);
 }
 
@@ -144,6 +150,17 @@ export interface RenderResponse { beauty_png_b64: string | null; turntable_mp4_b
 export async function renderAsset(glbB64: string, onProgress?: MeshProgress): Promise<RenderResponse> {
   const jobId = await _submit("/render", { glb_b64: glbB64, samples: 160, res: 1600, turn_frames: 36 });
   return _poll(jobId, onProgress) as unknown as Promise<RenderResponse>;
+}
+
+export interface AnimateResponse { animated_mp4_b64: string | null; seconds?: number; variant?: string; }
+/** Cinematic MOTION pass: the Cycles turntable + beauty still → photoreal clip via LTX-2.3 · 3DREAL.
+ * Async (the 22B render-to-real exceeds the tunnel limit), so submit → poll like the other Track-B jobs. */
+export async function animateAsset(turntableMp4B64: string, firstFramePngB64: string, prompt: string,
+  variant = "strong", onProgress?: MeshProgress): Promise<AnimateResponse> {
+  const jobId = await _submit("/animate", {
+    turntable_mp4_b64: turntableMp4B64, first_frame_png_b64: firstFramePngB64, prompt, variant,
+  });
+  return _poll(jobId, onProgress) as unknown as Promise<AnimateResponse>;
 }
 
 /** Backend spec (flat features) → Studio Spec ({type,params}) so the editor reflects the interpretation.

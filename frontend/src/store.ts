@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { backendToSpec, editAssembly, generateBackend, generateFromPrompt, generateMesh, generateMeshFromText, planAssembly, renderAsset as apiRenderAsset, toInspection } from "./api";
+import { animateAsset as apiAnimateAsset, backendToSpec, editAssembly, generateBackend, generateFromPrompt, generateMesh, generateMeshFromText, planAssembly, renderAsset as apiRenderAsset, toInspection } from "./api";
 import type { MeshResponse } from "./api";
 import type { Asset, Branch, Fab, FeatureType, InspectionRow, Mode, OrganicCheck, QualityTier, Spec, Team, View } from "./types";
 
@@ -266,6 +266,8 @@ export const useStudio = create<StudioState>((set, get) => {
     meshStl: null, meshStep: null, meshGlb: null, conceptImg: null, code: null, backendError: null, useModel: true, // real-backend wiring (live Phase-2 model)
     cancelRequested: false,                                          // film job cancel (polled, single GPU)
     renderPng: null, renderMp4: null, rendering: false, renderStage: "",  // cinematic Cycles render pass
+    animMp4: null, animating: false, animStage: "", animVariant: "strong",  // cinematic MOTION pass (LTX-2.3 · 3DREAL)
+    multiView: false,  // hi-fi: hero → MV-Adapter 6 views → TRELLIS run_multi_image (better unseen-side geometry)
     assemblyMode: false, assembly: null, assemblyObject: null,      // planner / edit-loop
 
     // planner (multi-part): first prompt PLANS, subsequent prompts EDIT the current design
@@ -281,15 +283,15 @@ export const useStudio = create<StudioState>((set, get) => {
     // Track B (organic): a reference image → a real TRELLIS.2 mesh via the Track-B service.
     generateMeshFromImage: (imageB64: string, pipelineType = "1536_cascade") => {
       clearTimers();
-      set({ branch: "organic", genStatus: "running", genStep: 1, progress: 15, organicReport: null, backendError: null, meshGlb: null, conceptImg: null, cancelRequested: false, renderPng: null, renderMp4: null });
-      generateMesh(imageB64, pipelineType, (stage, el) => set(organicProgress(stage, el)), get().seed, () => get().cancelRequested).then((resp) => {
+      set({ branch: "organic", genStatus: "running", genStep: 1, progress: 15, organicReport: null, backendError: null, meshGlb: null, conceptImg: null, cancelRequested: false, renderPng: null, renderMp4: null, animMp4: null });
+      generateMesh(imageB64, pipelineType, (stage, el) => set(organicProgress(stage, el)), get().seed, () => get().cancelRequested, get().multiView).then((resp) => {
         set({ genStatus: "done", cancelRequested: false, ...organicDone(resp, resp.concept_png_b64 ? "data:image/png;base64," + resp.concept_png_b64 : null, get) });
       }).catch((err) => get().onOrganicError(err));
     },
     generateMeshFromText: (prompt: string, pipelineType = "1536_cascade") => {
       clearTimers();
-      set({ branch: "organic", genStatus: "running", genStep: 0, progress: 10, organicReport: null, backendError: null, meshGlb: null, conceptImg: null, cancelRequested: false, renderPng: null, renderMp4: null });
-      generateMeshFromText(prompt, pipelineType, (stage, el) => set(organicProgress(stage, el)), get().seed, () => get().cancelRequested).then((resp) => {
+      set({ branch: "organic", genStatus: "running", genStep: 0, progress: 10, organicReport: null, backendError: null, meshGlb: null, conceptImg: null, cancelRequested: false, renderPng: null, renderMp4: null, animMp4: null });
+      generateMeshFromText(prompt, pipelineType, (stage, el) => set(organicProgress(stage, el)), get().seed, () => get().cancelRequested, get().multiView).then((resp) => {
         const concept = resp.concept_png_b64 ? "data:image/png;base64," + resp.concept_png_b64 : null;
         set({ genStatus: "done", cancelRequested: false, ...organicDone(resp, concept, get) });
       }).catch((err) => get().onOrganicError(err));
@@ -298,13 +300,28 @@ export const useStudio = create<StudioState>((set, get) => {
     renderAsset: () => {
       const glb = get().meshGlb;
       if (!glb || get().rendering) return;
-      set({ rendering: true, renderPng: null, renderMp4: null, renderStage: "rendering", backendError: null });
+      set({ rendering: true, renderPng: null, renderMp4: null, animMp4: null, animStage: "", renderStage: "rendering", backendError: null });
       apiRenderAsset(glb, (stage, el) => set({ renderStage: `${stage} · ${el}s` })).then((r) => {
         set({ rendering: false, renderStage: "",
               renderPng: r.beauty_png_b64 ? "data:image/png;base64," + r.beauty_png_b64 : null,
               renderMp4: r.turntable_mp4_b64 || null });
       }).catch((err) => { set({ rendering: false, renderStage: "", backendError: String(err?.message || err) }); });
     },
+    // Cinematic MOTION pass: the Cycles turntable + beauty still → photoreal clip via LTX-2.3 · 3DREAL.
+    // Needs a render first (it consumes renderMp4 + renderPng), so the UI only offers it once those exist.
+    animateAsset: () => {
+      const tt = get().renderMp4;            // turntable (raw base64) from the cinematic render
+      const beauty = get().renderPng;        // "data:image/png;base64,…" — strip the prefix for the backend
+      if (!tt || !beauty || get().animating) return;
+      const firstFrame = beauty.includes(",") ? beauty.split(",")[1] : beauty;
+      const base = (get().prompt || get().assemblyObject || "a cinematic sci-fi asset").trim();
+      const prompt = base + ", photorealistic, cinematic lighting, sharp focus, shot on film, high dynamic range";
+      set({ animating: true, animMp4: null, animStage: "queued", backendError: null });
+      apiAnimateAsset(tt, firstFrame, prompt, get().animVariant, (stage, el) => set({ animStage: `${stage} · ${el}s` }))
+        .then((r) => set({ animating: false, animStage: "", animMp4: r.animated_mp4_b64 || null }))
+        .catch((err) => set({ animating: false, animStage: "", backendError: String(err?.message || err) }));
+    },
+    setAnimVariant: (v: string) => set({ animVariant: v, animMp4: null }),  // switching variant invalidates the clip
     // Film iteration: bump the seed and re-run the same prompt/image → a different concept + mesh.
     reseed: () => {
       const seed = (get().seed + 1) % 100000;
@@ -351,6 +368,7 @@ export const useStudio = create<StudioState>((set, get) => {
       });
     },
     setQualityTier: (qualityTier: QualityTier) => set({ qualityTier }),
+    setMultiView: (multiView: boolean) => set({ multiView }),
 
     // branch (internal; the UI switches teams, not branches)
     setBranch: (branch: Branch) => {
