@@ -1,0 +1,68 @@
+/* GLB/glTF helpers shared by the viewport and the export actions — base64 ↔ three.js, and the two
+ * client-side exporters (GLTF binary, USDZ). The viewport loads the real TRELLIS.2 GLBs the backend
+ * returns; the inspector exports them (and the composed Assemble scene) without a round-trip. */
+import * as THREE from "three";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
+import { USDZExporter } from "three/examples/jsm/exporters/USDZExporter.js";
+
+export function b64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const a = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+  return a;
+}
+
+/** Parse a base64 GLB into its three.js scene graph (callback API wrapped as a promise). */
+export function parseGlbScene(b64: string): Promise<THREE.Object3D> {
+  return new Promise((res, rej) =>
+    new GLTFLoader().parse(b64ToBytes(b64).buffer as ArrayBuffer, "", (g) => res(g.scene), rej));
+}
+
+/** base64 GLB → USDZ archive bytes (PBR survives), fully client-side. */
+export async function glbToUsdz(b64: string): Promise<Uint8Array> {
+  const scene = await parseGlbScene(b64);
+  const out = await new USDZExporter().parseAsync(scene as any);
+  return out instanceof Uint8Array ? out : new Uint8Array(out as ArrayBuffer);
+}
+
+/** Any three.js object (a scene/group) → binary GLB bytes. Used for the Assemble scene + single objects. */
+export function exportGlb(obj: THREE.Object3D): Promise<Uint8Array> {
+  return new Promise((res, rej) =>
+    new GLTFExporter().parse(obj, (r: any) => res(r instanceof ArrayBuffer ? new Uint8Array(r) : new TextEncoder().encode(JSON.stringify(r))), rej, { binary: true }));
+}
+
+/** Any three.js object → USDZ archive bytes (for the composed Assemble scene / a single object). */
+export async function exportUsdz(obj: THREE.Object3D): Promise<Uint8Array> {
+  const out = await new USDZExporter().parseAsync(obj as any);
+  return out instanceof Uint8Array ? out : new Uint8Array(out as ArrayBuffer);
+}
+
+export function bytesToB64(bytes: Uint8Array): string {
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk) as any);
+  return btoa(bin);
+}
+
+export function downloadBytes(bytes: Uint8Array, name: string, mime: string) {
+  const blob = new Blob([bytes as any], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+export function downloadB64(b64: string, name: string, mime: string) {
+  downloadBytes(b64ToBytes(b64), name, mime);
+}
+
+/** Read a File (image upload) → bare base64 (no data: prefix), the shape the backend expects. */
+export function fileToB64(file: File): Promise<string> {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(",")[1] || "");
+    r.onerror = rej;
+    r.readAsDataURL(file);
+  });
+}

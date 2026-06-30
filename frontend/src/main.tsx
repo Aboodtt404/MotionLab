@@ -1,11 +1,7 @@
-import React from "react";
 import { createRoot } from "react-dom/client";
-import { App } from "./App";
-import "boxicons/css/boxicons.min.css";
+import { Studio } from "./App";
 import "./index.css";
 
-createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-);
+// No StrictMode: the studio is a class component that owns a long-lived WebGL context + RAF loop in
+// its lifecycle; StrictMode's dev double-mount would tear down and rebuild the renderer needlessly.
+createRoot(document.getElementById("root")!).render(<Studio />);
