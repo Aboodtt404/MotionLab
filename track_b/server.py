@@ -32,6 +32,12 @@ import uuid
 # Phase-1 cinematic render (Blender/Cycles) — a subprocess, not a venv import (Blender has its own python).
 BLENDER = os.environ.get("BLENDER_BIN", os.path.expanduser("~/blender/blender"))
 CINEMATIC = os.path.join(os.path.dirname(__file__), "cinematic.py")
+DECIMATE = os.path.join(os.path.dirname(__file__), "decimate.py")   # Low-Poly / Remesh pass (CPU, Blender subprocess)
+# Infinigen terrain tile: generate terrain-only (its own venv), then bake → vertex-colored GLB (Blender).
+TERRAIN_EXPORT = os.path.join(os.path.dirname(__file__), "terrain_export.py")
+INFINIGEN_PY = os.environ.get("INFINIGEN_PY", os.path.expanduser("~/infinigen_venv/bin/python"))
+INFINIGEN_DIR = os.environ.get("INFINIGEN_DIR", os.path.expanduser("~/infinigen"))
+_TERRAIN_BIOMES = {"plain", "desert", "forest", "snowy_mountain", "arctic", "mountain", "coast", "canyon", "cliff", "river"}
 # Cinematic MOTION pass (LTX-2.3 · 3DREAL) — a resident sidecar in its own venv; we proxy to it over localhost.
 LTX_SERVICE_URL = os.environ.get("LTX_SERVICE_URL", "http://127.0.0.1:8771")
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -117,6 +123,49 @@ def _run_job(jid: str, kind: str, body: dict):
                  result={"animated_mp4_b64": resp["mp4_b64"], "seconds": resp.get("seconds"),
                          "variant": resp.get("variant")})
             return
+        if kind == "terrain":                            # Infinigen terrain TILE: gen terrain-only (CPU ~5min) → bake → GLB
+            biome = body.get("biome", "plain")
+            if biome not in _TERRAIN_BIOMES:
+                biome = "plain"
+            with tempfile.TemporaryDirectory() as d:
+                _set(jid, stage="generating terrain")    # Infinigen runs in its OWN venv; CPU-bound, no GPU lock here
+                gen = subprocess.run(
+                    [INFINIGEN_PY, "-m", "infinigen_examples.generate_nature", "--seed", str(seed),
+                     "--task", "coarse", "-g", biome, "dev", "no_assets",
+                     "--output_folder", os.path.join(d, "coarse")],
+                    cwd=INFINIGEN_DIR, capture_output=True, text=True, timeout=2400)
+                blend = os.path.join(d, "coarse", "scene.blend")
+                if not os.path.exists(blend):
+                    raise RuntimeError("terrain gen failed: " + (gen.stderr[-600:] or gen.stdout[-600:]))
+                _set(jid, stage="baking tile")           # bake material → vertex colors + GLB export (GPU — serialize)
+                tile = os.path.join(d, "terrain.glb")
+                with _gpu, gpu_lock():
+                    exp = subprocess.run([BLENDER, "-b", "-P", TERRAIN_EXPORT, "--", blend, tile,
+                                          str(int(body.get("target_faces", 40000)))],
+                                         capture_output=True, text=True, timeout=900)
+                if "TERRAIN_TILE_OK" not in exp.stdout:
+                    raise RuntimeError("terrain export failed: " + (exp.stderr[-500:] or exp.stdout[-500:]))
+                glb_b64 = base64.b64encode(open(tile, "rb").read()).decode()
+                report = inspect_glb(tile)
+            _set(jid, status="done", stage="done",
+                 result={"glb_b64": glb_b64, "report": report, "biome": biome,
+                         "seconds": round(time.time() - _jobs[jid]["started"])})
+            return
+        if kind == "lowpoly":                            # Low-Poly / Remesh: decimate a GLB to a face budget (CPU, no GPU)
+            _set(jid, stage="decimating")
+            with tempfile.TemporaryDirectory() as d:
+                gin, gout = os.path.join(d, "in.glb"), os.path.join(d, "out.glb")
+                open(gin, "wb").write(base64.b64decode(body["glb_b64"]))
+                cmd = [BLENDER, "-b", "-P", DECIMATE, "--", gin, gout, str(int(body.get("target_faces", 5000)))]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                if "DECIMATE_OK" not in r.stdout:
+                    raise RuntimeError("decimate failed: " + (r.stderr[-400:] or r.stdout[-400:]))
+                glb_b64 = base64.b64encode(open(gout, "rb").read()).decode()
+                report = inspect_glb(gout)
+            _set(jid, status="done", stage="done",
+                 result={"glb_b64": glb_b64, "report": report,
+                         "seconds": round(time.time() - _jobs[jid]["started"])})
+            return
         with _gpu, gpu_lock():                           # serialize GPU access across all jobs (+ cross-process)
             concept_b64 = None
             if kind == "text2mesh":
@@ -128,6 +177,7 @@ def _run_job(jid: str, kind: str, body: dict):
                 img = text_to_image(body["prompt"], **kw)
                 buf = io.BytesIO(); img.save(buf, "PNG")
                 concept_b64 = base64.b64encode(buf.getvalue()).decode()
+                _set(jid, concept_png_b64=concept_b64)   # surface to pollers NOW (before the long TRELLIS stage)
             else:                                        # uploaded reference image
                 from PIL import Image
                 img = Image.open(io.BytesIO(base64.b64decode(body["image_b64"])))
@@ -193,7 +243,8 @@ class Handler(BaseHTTPRequestHandler):
                     _jobs[jid]["cancel"] = True
             return self._json(200 if ok else 404, {"ok": ok, "cancelling": jid})
         kind = {"/image2mesh": "image2mesh", "/text2mesh": "text2mesh",
-                "/render": "render", "/animate": "animate"}.get(route)
+                "/render": "render", "/animate": "animate", "/lowpoly": "lowpoly",
+                "/terrain": "terrain"}.get(route)
         if kind is None:
             return self._json(404, {"error": "not found"})
         try:
@@ -217,6 +268,11 @@ class Handler(BaseHTTPRequestHandler):
             base = snap["started"] or snap["created"]
             resp = {"status": snap["status"], "stage": snap["stage"],
                     "elapsed": round(time.time() - base)}
+            # push the FLUX concept image ONCE, the moment it's ready, so the UI previews it mid-generation
+            # (not re-sent every poll — ~1.4 MB; the final `done` result carries it again anyway).
+            if snap["status"] in ("queued", "running") and snap.get("concept_png_b64") and not snap.get("concept_sent"):
+                resp["concept_png_b64"] = snap["concept_png_b64"]
+                _set(jid, concept_sent=True)
             if snap["status"] == "done":
                 resp.update(snap["result"])
             elif snap["status"] == "error":

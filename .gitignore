@@ -53,3 +53,7 @@ Thumbs.db
 
 # Local-only study / research (not part of the project)
 docs/research/
+
+# Local backups + handoff artifacts (not source)
+frontend-refactor-*/
+*-handoff.zip

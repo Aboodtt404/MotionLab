@@ -40,16 +40,17 @@ _pipe = None
 
 
 def _pipeline():
-    """Load FLUX.1-dev once, kept resident with SEQUENTIAL CPU-offload. dev's transformer is ~24 GB, and
-    co-hosting with vLLM (~63 GB) + resident TRELLIS (~22 GB) leaves only ~10 GB — model-level offload
-    (whole 24 GB transformer on GPU) OOMs. Sequential offload streams submodules (~4–6 GB peak) so it
-    fits; the cost is slower generation, which is the right trade for the higher-fidelity concept."""
+    """Load FLUX.1-dev once, kept resident with MODEL-level CPU-offload. dev's transformer is ~24 GB; with
+    vLLM gone (2026-06-29) the card is ~95 GB free, so model-level offload fits easily and is FAR faster than
+    the old sequential offload (which streamed submodules on/off the GPU every step — ~84 s/concept). Model
+    offload keeps the active model (transformer ~24 GB) on the GPU across the denoise loop, then moves it back
+    to CPU when idle so resident TRELLIS + the hero 1536_cascade run keep the card. ~10–15 s/concept."""
     global _pipe
     if _pipe is None:
         import torch
         from diffusers import FluxPipeline
         _pipe = FluxPipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
-        _pipe.enable_sequential_cpu_offload()   # submodule-granular → low VRAM peak, co-fits with TRELLIS+vLLM
+        _pipe.enable_model_cpu_offload()   # whole-model granular: fast denoise, frees the GPU between stages
         _pipe.set_progress_bar_config(disable=True)
     return _pipe
 
