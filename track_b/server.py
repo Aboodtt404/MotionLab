@@ -190,8 +190,14 @@ def _run_job(jid: str, kind: str, body: dict):
                 with cancel_hook(_pipeline(), scancel):  # abort within ~1 sampler step if the job is cancelled
                     if body.get("multiview"):            # hi-fi: hero → MV-Adapter 6 views → multi-view TRELLIS
                         from .backbone import generate_multiview
+                        def _on_views(vs):               # downscale → base64 PNGs for a UI collage preview
+                            enc = []
+                            for v in vs:
+                                t = v.copy(); t.thumbnail((256, 256))
+                                b = io.BytesIO(); t.save(b, "PNG"); enc.append(base64.b64encode(b.getvalue()).decode())
+                            _set(jid, mv_views_b64=enc)
                         generate_multiview(img, out, text=body.get("prompt", ""), seed=seed,
-                                           pipeline_type=ptype, on_stage=lambda s: _set(jid, stage=s))
+                                           pipeline_type=ptype, on_stage=lambda s: _set(jid, stage=s), on_views=_on_views)
                     else:
                         generate(img, out, seed=seed, pipeline_type=ptype)
                 glb_b64 = base64.b64encode(open(out, "rb").read()).decode()
@@ -270,9 +276,13 @@ class Handler(BaseHTTPRequestHandler):
                     "elapsed": round(time.time() - base)}
             # push the FLUX concept image ONCE, the moment it's ready, so the UI previews it mid-generation
             # (not re-sent every poll — ~1.4 MB; the final `done` result carries it again anyway).
-            if snap["status"] in ("queued", "running") and snap.get("concept_png_b64") and not snap.get("concept_sent"):
-                resp["concept_png_b64"] = snap["concept_png_b64"]
-                _set(jid, concept_sent=True)
+            if snap["status"] in ("queued", "running"):
+                if snap.get("concept_png_b64") and not snap.get("concept_sent"):
+                    resp["concept_png_b64"] = snap["concept_png_b64"]
+                    _set(jid, concept_sent=True)
+                if snap.get("mv_views_b64") and not snap.get("mv_views_sent"):   # the multi-view collage, once
+                    resp["mv_views_b64"] = snap["mv_views_b64"]
+                    _set(jid, mv_views_sent=True)
             if snap["status"] == "done":
                 resp.update(snap["result"])
             elif snap["status"] == "error":

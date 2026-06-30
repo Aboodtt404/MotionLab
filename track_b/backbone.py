@@ -64,14 +64,19 @@ def generate(image, out_glb: str, *, seed: int = 42, pipeline_type: str = "512",
 
 
 def _export_glb(mesh, out_glb: str, texture_size: int, decimation: int) -> str:
-    """Shared mesh → GLB-with-PBR export (used by both single- and multi-view paths)."""
+    """Shared mesh → GLB-with-PBR export (used by both single- and multi-view paths).
+
+    remesh=False (the o_voxel default): the optional CuMesh remesh pass we used to run could HANG
+    indefinitely at the hero tier (1536_cascade), where the mesh approaches the 16M-face cap — and a
+    hung native call holds the GPU lock, blocking the whole service. Skipping it keeps the raw
+    marching-cubes topology (perfectly usable; /lowpoly handles topology cleanup on demand) and makes
+    generation reliable + faster. The decimation_target pass still runs."""
     import o_voxel
     mesh.simplify(16777216)   # nvdiffrast index limit
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs, coords=mesh.coords,
         attr_layout=mesh.layout, voxel_size=mesh.voxel_size, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=decimation, texture_size=texture_size, remesh=True, remesh_band=1,
-        remesh_project=0, verbose=False)
+        decimation_target=decimation, texture_size=texture_size, remesh=False, verbose=False)
     os.makedirs(os.path.dirname(out_glb) or ".", exist_ok=True)
     glb.export(out_glb, extension_webp=True)
     return out_glb
@@ -98,15 +103,18 @@ def generate_multi(images, out_glb: str, *, seed: int = 42, pipeline_type: str =
 def generate_multiview(ref_image, out_glb: str, *, text: str = "", seed: int = 42,
                        pipeline_type: str = "1024_cascade", num_views: int = 6,
                        texture_size: int | None = None, decimation: int = 1_000_000,
-                       mode: str = "stochastic", on_stage=None) -> str:
+                       mode: str = "stochastic", on_stage=None, on_views=None) -> str:
     """Full multi-view path: ONE hero image (FLUX concept or upload) → N consistent views via MV-Adapter
     → multi-view TRELLIS reconstruction → GLB. The biggest quality lever for asymmetric/detailed assets
     (the unseen sides get real geometry instead of a guess). ~16s views + a multi-view gen on top of the
-    normal mesh time. `on_stage(name)` is an optional progress callback."""
+    normal mesh time. `on_stage(name)` is an optional progress callback; `on_views(list[PIL.Image])` gets
+    the generated views (for a UI preview)."""
     from .mvadapter_views import multiview
     if on_stage:
         on_stage("multiview")
     views = multiview(ref_image, text=text or "a detailed, high quality sculpture", num_views=num_views, seed=seed)
+    if on_views:
+        on_views(views)
     if on_stage:
         on_stage("generating")
     return generate_multi(views, out_glb, seed=seed, pipeline_type=pipeline_type,

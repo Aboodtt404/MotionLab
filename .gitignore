@@ -57,3 +57,6 @@ docs/research/
 # Local backups + handoff artifacts (not source)
 frontend-refactor-*/
 *-handoff.zip
+
+# Pre-baked terrain tiles (generated GLB/PNG, not source)
+track_b/terrain_presets/

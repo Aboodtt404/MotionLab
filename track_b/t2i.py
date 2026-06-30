@@ -40,17 +40,17 @@ _pipe = None
 
 
 def _pipeline():
-    """Load FLUX.1-dev once, kept resident with MODEL-level CPU-offload. dev's transformer is ~24 GB; with
-    vLLM gone (2026-06-29) the card is ~95 GB free, so model-level offload fits easily and is FAR faster than
-    the old sequential offload (which streamed submodules on/off the GPU every step — ~84 s/concept). Model
-    offload keeps the active model (transformer ~24 GB) on the GPU across the denoise loop, then moves it back
-    to CPU when idle so resident TRELLIS + the hero 1536_cascade run keep the card. ~10–15 s/concept."""
+    """Load FLUX.1-dev once, FULLY GPU-RESIDENT (no CPU offload). dev is ~24 GB; with vLLM gone the card
+    is ~95 GB free, so FLUX (24) + resident TRELLIS (~16) + MV-Adapter SDXL (~7) + a 1536_cascade run all
+    fit. Resident is fastest AND avoids the offload hooks that move modules on/off the GPU between stages —
+    that hook churn (FLUX offload -> MV-Adapter SDXL load) was the suspected trigger for a native CUDA crash
+    in the text2mesh + multi-view path. Keep FLUX simply parked on the GPU."""
     global _pipe
     if _pipe is None:
         import torch
         from diffusers import FluxPipeline
         _pipe = FluxPipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
-        _pipe.enable_model_cpu_offload()   # whole-model granular: fast denoise, frees the GPU between stages
+        _pipe = _pipe.to("cuda")           # fully resident — no offload hooks (fast + avoids cross-pipeline CUDA churn)
         _pipe.set_progress_bar_config(disable=True)
     return _pipe
 
