@@ -19,6 +19,34 @@ export function parseGlbScene(b64: string): Promise<THREE.Object3D> {
     new GLTFLoader().parse(b64ToBytes(b64).buffer as ArrayBuffer, "", (g) => res(g.scene), rej));
 }
 
+/** Render a base64 GLB to a small framed PNG data-URL — the Library thumbnail. Uses a throwaway
+ * offscreen WebGL context (disposed after), so it never touches the main viewport. Transparent bg,
+ * neutral 3-point-ish lighting, a 3/4 hero angle. */
+export async function renderThumbnail(glbB64: string, size = 256): Promise<string> {
+  const obj = await parseGlbScene(glbB64);
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+  renderer.setPixelRatio(1);
+  renderer.setSize(size, size);
+  const scene = new THREE.Scene();
+  scene.add(new THREE.HemisphereLight(0xbcd0ff, 0x202028, 1.05));
+  const key = new THREE.DirectionalLight(0xffffff, 1.3); key.position.set(3, 5, 4); scene.add(key);
+  const rim = new THREE.DirectionalLight(0xffffff, 0.5); rim.position.set(-4, 2, -3); scene.add(rim);
+  const box = new THREE.Box3().setFromObject(obj);
+  const sz = box.getSize(new THREE.Vector3());
+  const ctr = box.getCenter(new THREE.Vector3());
+  obj.position.sub(ctr);                                   // center at origin
+  scene.add(obj);
+  const maxDim = Math.max(sz.x, sz.y, sz.z) || 1;
+  const cam = new THREE.PerspectiveCamera(33, 1, 0.01, 100);
+  const d = maxDim * 1.9;
+  cam.position.set(d * 0.62, d * 0.5, d * 0.82); cam.lookAt(0, 0, 0);
+  renderer.render(scene, cam);
+  const url = renderer.domElement.toDataURL("image/png");
+  renderer.dispose();
+  (renderer as any).forceContextLoss && (renderer as any).forceContextLoss();
+  return url;
+}
+
 /** base64 GLB → USDZ archive bytes (PBR survives), fully client-side. */
 export async function glbToUsdz(b64: string): Promise<Uint8Array> {
   const scene = await parseGlbScene(b64);

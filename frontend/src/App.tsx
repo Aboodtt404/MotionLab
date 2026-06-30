@@ -6,7 +6,8 @@ import * as THREE from "three";
 import { css } from "./css";
 import { IconDefs } from "./icons";
 import * as api from "./api";
-import { parseGlbScene, glbToUsdz, exportGlb, exportUsdz, downloadB64, downloadBytes, bytesToB64, fileToB64 } from "./gltf";
+import { parseGlbScene, glbToUsdz, exportGlb, exportUsdz, downloadB64, downloadBytes, bytesToB64, fileToB64, renderThumbnail } from "./gltf";
+import { loadState, saveState } from "./persist";
 
 const Icon = ({ k, size = 17 }: { k: string; size?: number }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" style={{ display: "block" }}>
@@ -58,17 +59,14 @@ export class Studio extends React.Component<{}, any> {
       renderBeauty: null as string | null, motionMp4: null as string | null,   // real Cycles/LTX outputs
     },
     librarySearch: "",
-    library: [
-      { id: "a1", name: "Hero Boulder", geo: "rock", faces: "48k", size: "4.2 MB", status: "ready" },
-      { id: "a2", name: "Pine Tree", geo: "tree", faces: "72k", size: "6.1 MB", status: "ready" },
-      { id: "a3", name: "Stone Arch", geo: "arch", faces: "120k", size: "9.8 MB", status: "ready" },
-      { id: "a4", name: "Wood Crate", geo: "box", faces: "12k", size: "1.1 MB", status: "ready" },
-      { id: "a5", name: "Mushroom Cap", geo: "mushroom", faces: "24k", size: "2.0 MB", status: "ready" },
-    ],
+    library: [] as any[],   // starts empty; populated by real generations + restored from IndexedDB on mount
     // ASSEMBLE
     asm: {
       leftTab: "library", gizmoMode: "move", selectedId: null,
-      ground: "forest",
+      selectedIds: [] as string[],               // multi-select (selectedId = the primary, drives gizmo/inspector)
+      snap: false,                               // persistent snap toggle (Shift also forces snap)
+      ground: "forest",                          // biome key (colored base) OR "tile" when a real terrain GLB is the ground
+      groundGlbId: null as string | null, groundGlb: null as string | null,
       objects: [] as any[],
     },
   };
@@ -102,14 +100,25 @@ export class Studio extends React.Component<{}, any> {
   _renderTurntable: string | null = null;   // last Cycles turntable mp4 (feeds LTX animate)
   _renderBeauty: string | null = null;       // last Cycles beauty still (animate first frame)
   _fileInput: HTMLInputElement | null = null;
+  _saveT: any = null;                        // debounce timer for persistence
+  _hoverOid: any = null;                     // object currently under the cursor (hover highlight)
 
   componentDidMount() {
     this._waitThree();
     this._onKey = (e: KeyboardEvent) => this._handleKey(e);
     window.addEventListener("keydown", this._onKey);
+    // restore the persisted library + assembly scene (IndexedDB)
+    loadState().then((st) => {
+      if (!st) return;
+      this.setState((s: any) => ({
+        library: st.library,
+        asm: { ...s.asm, objects: st.scene.objects, ground: st.scene.ground || s.asm.ground, groundGlbId: st.scene.groundGlbId || null, groundGlb: st.scene.groundGlb || null },
+      }));
+    });
   }
   componentWillUnmount() {
     Object.values(this._timers).flat().forEach((t: any) => { clearTimeout(t); clearInterval(t); });
+    clearTimeout(this._saveT);
     window.removeEventListener("keydown", this._onKey);
     if (this._raf) cancelAnimationFrame(this._raf);
     if (this._ro) this._ro.disconnect();
@@ -124,7 +133,19 @@ export class Studio extends React.Component<{}, any> {
       this._three = null;
     }
   }
-  componentDidUpdate() { this._syncViewport(); }
+  componentDidUpdate(_prevProps: any, prevState: any) {
+    this._syncViewport();
+    // persist when the library or the scene changed (debounced — these arrays are replaced immutably,
+    // so a cheap ref check suffices; coalesces rapid gizmo-drag updates into one write).
+    if (prevState.library !== this.state.library
+      || prevState.asm.objects !== this.state.asm.objects
+      || prevState.asm.ground !== this.state.asm.ground
+      || prevState.asm.groundGlbId !== this.state.asm.groundGlbId) {
+      clearTimeout(this._saveT);
+      const a = this.state.asm;
+      this._saveT = setTimeout(() => saveState(this.state.library, { objects: a.objects, ground: a.ground, groundGlbId: a.groundGlbId, groundGlb: a.groundGlb }), 500);
+    }
+  }
 
   // ---------- toast ----------
   toast(msg: string) {
@@ -145,8 +166,17 @@ export class Studio extends React.Component<{}, any> {
     if (k === "w") this._setGizmo("move");
     else if (k === "e") this._setGizmo("rotate");
     else if (k === "r") this._setGizmo("scale");
-    else if (k === "delete" || k === "backspace") { if (this.state.asm.selectedId) this.deleteSel(); }
-    else if (k === "d" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); if (this.state.asm.selectedId) this.dupSel(); }
+    else if (k === "f") { const sel = this.state.asm.objects.find((o: any) => o.id === this.state.asm.selectedId); this.frameObject(sel || null); }
+    else if (k === "delete" || k === "backspace") { if (this._selIds().length) this.deleteSel(); }
+    else if (k === "d" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); if (this._selIds().length) this.dupSel(); }
+    else if (k === "arrowup" || k === "arrowdown" || k === "arrowleft" || k === "arrowright") {
+      const ids = this._selIds(); if (!ids.length) return; e.preventDefault();
+      const step = e.shiftKey ? 1 : 0.25;
+      const dx = k === "arrowright" ? step : k === "arrowleft" ? -step : 0;
+      const dz = k === "arrowdown" ? step : k === "arrowup" ? -step : 0;
+      this._pushUndo();
+      this.setState((s: any) => ({ asm: { ...s.asm, objects: s.asm.objects.map((o: any) => ids.includes(o.id) ? { ...o, pos: [+(o.pos[0] + dx).toFixed(2), +this._groundHeightAt(o.pos[0] + dx, o.pos[2] + dz).toFixed(2), +(o.pos[2] + dz).toFixed(2)] } : o) } }));
+    }
   }
 
   // ================= JOB ENGINE =================
@@ -196,13 +226,21 @@ export class Studio extends React.Component<{}, any> {
     const labels = stages.map((s) => s.label);
     const t0 = Date.now();
     const tick = setInterval(() => this.setState((s: any) => (s.job && s.job.key === key) ? ({ job: { ...s.job, elapsed: (Date.now() - t0) / 1000 } }) : {}), 100);
-    this._timers[key] = [tick];
+    // stall guard: nothing should run past 10 min (terrain ~6 min is the longest legit job). If it does,
+    // the backend likely hung — abandon + signal cancel + surface a clear error instead of spinning forever.
+    const stall = setTimeout(() => {
+      if (this.state.job && this.state.job.key === key && this.state.job.status === "running") {
+        this._cancelFlag = true; this._clearTimers(key);
+        this.setState((s: any) => (s.job && s.job.key === key) ? ({ job: { ...s.job, status: "error", errorStage: (s.job.stages[s.job.idx] && s.job.stages[s.job.idx].label) || "", errorMsg: "Generation stalled — no result after 10 min. The job was signalled to cancel; if this recurs, the Track B service may need a restart." } }) : {});
+      }
+    }, 600000);
+    this._timers[key] = [tick, stall];
     this.setState({ job: { key, title, hint, stages, idx: 0, status: "running", elapsed: 0, concept: !!concept, conceptShown: false, retry } });
-    const onProgress: api.Progress = (stage, _elapsed, conceptB64) => {
+    const onProgress: api.Progress = (stage, _elapsed, conceptB64, mvViews) => {
       this.setState((s: any) => {
         if (!(s.job && s.job.key === key)) return {};
         const idx = Math.max(s.job.idx, this._resolveStage(stage, labels));
-        return { job: { ...s.job, idx, conceptImg: conceptB64 || s.job.conceptImg, conceptShown: s.job.conceptShown || (s.job.concept && idx >= 1) } };
+        return { job: { ...s.job, idx, conceptImg: conceptB64 || s.job.conceptImg, mvViews: (mvViews && mvViews.length ? mvViews : s.job.mvViews), conceptShown: s.job.conceptShown || (s.job.concept && idx >= 1) } };
       });
     };
     runner(onProgress, () => this._cancelFlag)
@@ -289,13 +327,14 @@ export class Studio extends React.Component<{}, any> {
     this.setState((s: any) => ({
       cre: {
         ...s.cre,
-        result: { name, geo, glb: res.glb_b64, glbId, faces: this._fmtFaces(rep.faces), verts: this._fmtFaces(rep.verts),
+        result: { name, geo, glb: res.glb_b64, glbId, thumb: null, faces: this._fmtFaces(rep.faces), verts: this._fmtFaces(rep.verts),
                   watertight: rep.watertight !== false, pbr: rep.pbr || [], size: (rep.size_mb || 0) + " MB", time: (res.seconds || 0) + "s", concept: res.concept_png_b64 || null },
         lowpolyTarget: 24000, renderTarget: name, renderBeauty: null, motionMp4: null,
       },
       command: "",
     }));
     this.toast("Asset generated · " + this._fmtFaces(rep.faces) + " faces");
+    renderThumbnail(res.glb_b64).then((thumb) => this.setState((s: any) => (s.cre.result && s.cre.result.glbId === glbId) ? { cre: { ...s.cre, result: { ...s.cre.result, thumb } } } : {})).catch(() => {});
   }
   runLowpoly() {
     const t = this.state.cre.lowpolyTarget;
@@ -318,13 +357,15 @@ export class Studio extends React.Component<{}, any> {
       (onP, sc) => api.terrain(beBiome, 40000, onP, sc),
       (res) => {
         const glbId = "g" + (this._uid++);
+        const id = "t" + (this._uid++);
         const name = this._cap(biome) + " Tile";
         const rep = res.report || {};
         this.setState((s: any) => ({
-          library: [{ id: "t" + (this._uid++), name, geo: "terrain", glb: res.glb_b64, glbId, faces: this._fmtFaces(rep.faces), size: (rep.size_mb || 0) + " MB", status: "ready" }, ...s.library],
-          asm: { ...s.asm, ground: biome === "snowy" ? "snowy" : biome },
+          library: [{ id, name, geo: "terrain", glb: res.glb_b64, glbId, thumb: null, faces: this._fmtFaces(rep.faces), size: (rep.size_mb || 0) + " MB", status: "ready" }, ...s.library],
+          asm: { ...s.asm, ground: "tile", groundGlbId: glbId, groundGlb: res.glb_b64 },   // auto-apply as the scene ground
         }));
         this.toast(name + " added to Library");
+        renderThumbnail(res.glb_b64).then((thumb) => this.setState((s: any) => ({ library: s.library.map((x: any) => x.id === id ? { ...x, thumb } : x) }))).catch(() => {});
       }, () => this.generateTerrain(biome));
   }
   doRender(kind: string) {
@@ -356,17 +397,35 @@ export class Studio extends React.Component<{}, any> {
   }
 
   // ================= ASSEMBLE =================
-  addObject(libItem: any, atRandom: boolean) {
+  addObject(libItem: any, atRandom: boolean, at?: number[] | null) {
     this._pushUndo();
     const id = "o" + (this._uid++);
+    const pos = at
+      ? [+at[0].toFixed(2), +at[1].toFixed(2), +at[2].toFixed(2)]                       // dropped at a specific ground point
+      : [atRandom ? (Math.random() * 4 - 2) : 0, 0, atRandom ? (Math.random() * 4 - 2) : 0];
     const obj = {
       id, name: libItem.name, geo: libItem.geo, faces: libItem.faces,
       glb: libItem.glb || null, glbId: libItem.glbId || null,   // real mesh, if this asset has one
-      pos: [atRandom ? (Math.random() * 4 - 2) : 0, 0, atRandom ? (Math.random() * 4 - 2) : 0],
-      rot: [0, Math.random() * 360, 0], scale: [1, 1, 1], hidden: false,
+      pos, rot: [0, Math.random() * 360, 0], scale: [1, 1, 1], hidden: false,
     };
     this.setState((s: any) => ({ asm: { ...s.asm, objects: [...s.asm.objects, obj], selectedId: id } }));
     this.toast(libItem.name + " dropped to ground");
+  }
+  // Drop a Library asset onto the canvas at the cursor's ground/terrain point.
+  _dropAsset(e: any) {
+    e.preventDefault();
+    if (this.state.workspace !== "assemble" || !this._dragItem) return;
+    const it = this._dragItem; this._dragItem = null;
+    const cv = this._three && this._three.renderer.domElement;
+    let at: number[] | null = null;
+    if (cv) {
+      const r = cv.getBoundingClientRect();
+      this._mouse.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+      this._mouse.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+      const g = this._groundPoint();
+      if (g) at = [g.x, g.y, g.z];
+    }
+    this.addObject(it, !at, at);
   }
   // Assemble "Finish": export / render / animate the composed scene (the live modelGroup).
   async _sceneAction(kind: string) {
@@ -390,16 +449,47 @@ export class Studio extends React.Component<{}, any> {
         () => this._sceneAction("Animate"));
     }
   }
-  selectObj(id: any) { this.setState((s: any) => ({ asm: { ...s.asm, selectedId: id } })); }
+  selectObj(id: any) { this.setState((s: any) => ({ asm: { ...s.asm, selectedId: id, selectedIds: id ? [id] : [] } })); }
+  toggleSelect(id: any) {
+    this.setState((s: any) => {
+      const cur: string[] = s.asm.selectedIds && s.asm.selectedIds.length ? s.asm.selectedIds : (s.asm.selectedId ? [s.asm.selectedId] : []);
+      const has = cur.includes(id);
+      const ids = has ? cur.filter((x) => x !== id) : [...cur, id];
+      return { asm: { ...s.asm, selectedIds: ids, selectedId: has ? (ids[ids.length - 1] || null) : id } };
+    });
+  }
+  _selIds(): string[] { const a = this.state.asm; return a.selectedIds && a.selectedIds.length ? a.selectedIds : (a.selectedId ? [a.selectedId] : []); }
+  _isSelected(id: any) { const a = this.state.asm; return (a.selectedIds && a.selectedIds.includes(id)) || a.selectedId === id; }
+  // hover highlight (assemble): tint the object under the cursor, imperatively (no React re-render per move)
+  _updateHover(cv: any) {
+    if (!this._three || this.state.workspace !== "assemble") { if (this._hoverOid) { this._applyHover(this._hoverOid, false); this._hoverOid = null; } return; }
+    this._raycaster.setFromCamera(this._mouse, this._three.camera);
+    const hits = this._raycaster.intersectObjects(this._three.modelGroup.children, true);
+    const hit = hits.find((h: any) => h.object.userData.oid || (h.object.parent && h.object.parent.userData.oid));
+    const oid = hit ? (hit.object.userData.oid || hit.object.parent.userData.oid) : null;
+    if (oid !== this._hoverOid) {
+      if (this._hoverOid) this._applyHover(this._hoverOid, false);
+      this._hoverOid = oid;
+      if (oid) this._applyHover(oid, true);
+      if (cv) cv.style.cursor = oid ? "pointer" : "grab";
+    }
+  }
+  _applyHover(oid: any, on: boolean) {
+    const node = this._objNode(oid); if (!node) return;
+    const sel = this._isSelected(oid);
+    const hex = on ? (sel ? 0x2a3050 : 0x1a1d2e) : (sel ? 0x222a44 : 0x000000);
+    node.traverse((c: any) => { const ms = c.material ? (Array.isArray(c.material) ? c.material : [c.material]) : []; ms.forEach((m: any) => { if (m && m.emissive) m.emissive.setHex(hex); }); });
+  }
   _setGizmo(m: string) { this.setState((s: any) => ({ asm: { ...s.asm, gizmoMode: m } })); }
-  deleteSel() { this._pushUndo(); this.setState((s: any) => ({ asm: { ...s.asm, objects: s.asm.objects.filter((o: any) => o.id !== s.asm.selectedId), selectedId: null } })); this.toast("Deleted"); }
+  deleteSel() { const ids = this._selIds(); if (!ids.length) return; this._pushUndo(); this.setState((s: any) => ({ asm: { ...s.asm, objects: s.asm.objects.filter((o: any) => !ids.includes(o.id)), selectedId: null, selectedIds: [] } })); this.toast(ids.length > 1 ? ids.length + " deleted" : "Deleted"); }
   dupSel() {
-    const o = this.state.asm.objects.find((x: any) => x.id === this.state.asm.selectedId); if (!o) return;
+    const ids = this._selIds(); if (!ids.length) return;
     this._pushUndo();
-    const id = "o" + (this._uid++);
-    const copy = { ...o, id, name: o.name + " copy", pos: [o.pos[0] + 1.2, o.pos[1], o.pos[2] + 1.2] };
-    this.setState((s: any) => ({ asm: { ...s.asm, objects: [...s.asm.objects, copy], selectedId: id } }));
-    this.toast("Duplicated");
+    const sel = this.state.asm.objects.filter((o: any) => ids.includes(o.id));
+    const copies = sel.map((o: any) => ({ ...JSON.parse(JSON.stringify(o)), id: "o" + (this._uid++), name: o.name + " copy", pos: [o.pos[0] + 1.2, o.pos[1], o.pos[2] + 1.2] }));
+    const newIds = copies.map((c: any) => c.id);
+    this.setState((s: any) => ({ asm: { ...s.asm, objects: [...s.asm.objects, ...copies], selectedId: newIds[newIds.length - 1], selectedIds: newIds } }));
+    this.toast(copies.length > 1 ? copies.length + " duplicated" : "Duplicated");
   }
   updateObj(id: any, patch: any) { this.setState((s: any) => ({ asm: { ...s.asm, objects: s.asm.objects.map((o: any) => o.id === id ? { ...o, ...patch } : o) } })); }
   toggleHide(id: any) { this._pushUndo(); this.setState((s: any) => ({ asm: { ...s.asm, objects: s.asm.objects.map((o: any) => o.id === id ? { ...o, hidden: !o.hidden } : o) } })); }
@@ -425,6 +515,7 @@ export class Studio extends React.Component<{}, any> {
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.setSize(el.clientWidth, el.clientHeight);
+    renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;   // contact shadows
     el.appendChild(renderer.domElement);
     const scene = new THREE.Scene();
     scene.fog = new THREE.FogExp2(0x06070a, 0.018);
@@ -432,6 +523,9 @@ export class Studio extends React.Component<{}, any> {
     this._cam = { theta: 0.7, phi: 1.05, r: 16, target: new THREE.Vector3(0, 1.5, 0) };
     scene.add(new THREE.HemisphereLight(0x9fb4ff, 0x0a0a12, 0.55));
     const key = new THREE.DirectionalLight(0xffffff, 1.1); key.position.set(6, 12, 8); scene.add(key);
+    key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -0.0005;
+    key.shadow.camera.near = 1; key.shadow.camera.far = 60;
+    key.shadow.camera.left = -25; key.shadow.camera.right = 25; key.shadow.camera.top = 25; key.shadow.camera.bottom = -25;
     const rim = new THREE.PointLight(0xffffff, 0.8, 60); rim.position.set(-8, 6, -6); scene.add(rim);
     this._rim = rim;
     const grid = new THREE.GridHelper(40, 40, 0x2a2f44, 0x161a28);
@@ -451,6 +545,11 @@ export class Studio extends React.Component<{}, any> {
       this._raf = requestAnimationFrame(loop);
       if (this.state.turntable && !this._dragging && this.state.workspace !== "assemble") this._cam.theta += 0.0032;
       this._updateCamera();
+      // gizmo: constant on-screen size — scale by distance to camera so it's grabbable at any zoom
+      if (this._gizmoGroup && this._gizmoGroup.children.length) {
+        const d = camera.position.distanceTo(this._gizmoGroup.position);
+        this._gizmoGroup.scale.setScalar(Math.max(0.05, d * 0.062));
+      }
       const moodCols = [[0x9fb4ff, 0.8], [0xffb070, 0.9], [0x5060a0, 0.6]];
       const mc = moodCols[this.state.lighting] || moodCols[0];
       this._rim.color.setHex(mc[0]); this._rim.intensity = mc[1];
@@ -485,7 +584,7 @@ export class Studio extends React.Component<{}, any> {
   }
   _bindPointer(el: any) {
     const cv = this._three.renderer.domElement;
-    let last: any = null, dragObj: any = null, dragStart: any = null, orbiting = false, gizmoDrag: any = null;
+    let last: any = null, dragObj: any = null, dragStart: any = null, orbiting = false, panning = false, gizmoDrag: any = null;
     const setMouse = (e: any) => { const r = cv.getBoundingClientRect(); this._mouse.x = ((e.clientX - r.left) / r.width) * 2 - 1; this._mouse.y = -((e.clientY - r.top) / r.height) * 2 + 1; };
     cv.style.cursor = "grab";
     cv.addEventListener("mousedown", (e: any) => { if (e.button === 1) e.preventDefault(); });
@@ -507,7 +606,9 @@ export class Studio extends React.Component<{}, any> {
             const ai = ({ x: 0, y: 1, z: 2 } as any)[axisName];
             const axisVec = new THREE.Vector3(ai === 0 ? 1 : 0, ai === 1 ? 1 : 0, ai === 2 ? 1 : 0);
             const anchor = new THREE.Vector3(sel.pos[0], Math.max(0.8, sel.pos[1] + 0.8), sel.pos[2]);
-            gizmoDrag = { mode: this.state.asm.gizmoMode, ai, axisVec, anchor, id: sel.id, startObj: JSON.parse(JSON.stringify(sel)), downX: e.clientX, downY: e.clientY, scStart: this._closestAxisParam(anchor, axisVec) };
+            const byId0: any = {}; this.state.asm.objects.forEach((o: any) => { byId0[o.id] = o; });
+            const gGroup = this._selIds().map((id) => ({ id, pos: [...byId0[id].pos] }));   // translate all selected
+            gizmoDrag = { mode: this.state.asm.gizmoMode, ai, axisVec, anchor, id: sel.id, startObj: JSON.parse(JSON.stringify(sel)), group: gGroup, downX: e.clientX, downY: e.clientY, scStart: this._closestAxisParam(anchor, axisVec) };
             this._dragging = true; cv.style.cursor = "grabbing";
             return;
           }
@@ -516,38 +617,53 @@ export class Studio extends React.Component<{}, any> {
         const hit = hits.find((h: any) => h.object.userData.oid || (h.object.parent && h.object.parent.userData.oid));
         if (hit) {
           const oid = hit.object.userData.oid || hit.object.parent.userData.oid;
-          this._pushUndo();
-          let target = this.state.asm.objects.find((o: any) => o.id === oid);
-          if (e.altKey && target) {
+          if (e.shiftKey) { this.toggleSelect(oid); return; }   // shift-click toggles selection (no drag)
+          let group: any[];
+          if (e.altKey) {
+            this._pushUndo();
+            const src = this.state.asm.objects.find((o: any) => o.id === oid);
             const nid = "o" + (this._uid++);
-            target = { ...JSON.parse(JSON.stringify(target)), id: nid, name: target.name + " copy" };
-            this.setState((p: any) => ({ asm: { ...p.asm, objects: [...p.asm.objects, target], selectedId: nid } }));
+            const dup = { ...JSON.parse(JSON.stringify(src)), id: nid, name: src.name + " copy" };
+            this.setState((p: any) => ({ asm: { ...p.asm, objects: [...p.asm.objects, dup], selectedId: nid, selectedIds: [nid] } }));
             this.toast("Alt-duplicated");
-          } else { this.selectObj(oid); }
-          dragObj = target;
-          dragStart = { mode: this.state.asm.gizmoMode, obj: JSON.parse(JSON.stringify(target)), x: e.clientX, y: e.clientY, ground: this._groundPoint() };
+            group = [{ id: nid, pos: [...src.pos] }]; dragObj = dup;
+          } else {
+            const inMulti = this._isSelected(oid) && this._selIds().length > 1;   // click inside a multi-selection → drag the group
+            if (!inMulti) this.selectObj(oid);
+            this._pushUndo();
+            const ids = inMulti ? this._selIds() : [oid];
+            const byId: any = {}; this.state.asm.objects.forEach((o: any) => { byId[o.id] = o; });
+            group = ids.map((id) => ({ id, pos: [...byId[id].pos] })); dragObj = byId[oid];
+          }
+          dragStart = { mode: this.state.asm.gizmoMode, obj: JSON.parse(JSON.stringify(dragObj)), x: e.clientX, y: e.clientY, ground: this._groundPoint(), group };
           this._dragging = true; cv.style.cursor = "grabbing";
         } else { this.selectObj(null); }
         return;
       }
-      if (isMiddle || (!isAssemble && e.button === 0)) {
+      const wantPan = (isMiddle && e.shiftKey) || e.button === 2;   // ⇧+middle-drag OR right-drag = pan
+      if (wantPan) {
+        panning = true; this._dragging = true; last = { x: e.clientX, y: e.clientY };
+        cv.style.cursor = "move"; e.preventDefault();
+      } else if (isMiddle || (!isAssemble && e.button === 0)) {
         orbiting = true; this._dragging = true; last = { x: e.clientX, y: e.clientY };
         cv.style.cursor = "grabbing";
       }
     });
     cv.addEventListener("pointermove", (e: any) => {
       setMouse(e);
-      if (!this._dragging) return;
+      if (!this._dragging) { this._updateHover(cv); return; }
       if (gizmoDrag) {
         this._raycaster.setFromCamera(this._mouse, this._three.camera);
-        const g = gizmoDrag; const snap = e.shiftKey; const AX = ["X", "Y", "Z"][g.ai];
+        const g = gizmoDrag; const snap = e.shiftKey || this.state.asm.snap; const AX = ["X", "Y", "Z"][g.ai];
         if (g.mode === "move") {
-          let v = g.startObj.pos[g.ai] + (this._closestAxisParam(g.anchor, g.axisVec) - g.scStart);
-          if (snap) v = Math.round(v / 0.5) * 0.5;
-          const np = [...g.startObj.pos]; np[g.ai] = +v.toFixed(2);
-          if (g.ai === 1) np[1] = Math.max(0, np[1]);
-          this.updateObj(g.id, { pos: np });
-          this._dragReadout(e, AX + " " + np[g.ai].toFixed(2));
+          let d = this._closestAxisParam(g.anchor, g.axisVec) - g.scStart;
+          if (snap) d = Math.round(d / 0.5) * 0.5;
+          for (const gs of (g.group && g.group.length ? g.group : [{ id: g.id, pos: g.startObj.pos }])) {   // translate the whole selection
+            const np = [...gs.pos]; np[g.ai] = +(gs.pos[g.ai] + d).toFixed(2);
+            if (g.ai === 1) np[1] = Math.max(0, np[1]);
+            this.updateObj(gs.id, { pos: np });
+          }
+          this._dragReadout(e, AX + " Δ" + d.toFixed(2));
         } else if (g.mode === "rotate") {
           let ang = g.startObj.rot[g.ai] + ((e.clientX - g.downX) + (g.downY - e.clientY)) * 0.6;
           if (snap) ang = Math.round(ang / 15) * 15;
@@ -564,15 +680,17 @@ export class Studio extends React.Component<{}, any> {
         return;
       }
       if (dragObj && dragStart) {
-        const snap = e.shiftKey;
+        const snap = e.shiftKey || this.state.asm.snap;
         if (dragStart.mode === "move") {
           const g = this._groundPoint();
           if (g && dragStart.ground) {
-            let nx = dragStart.obj.pos[0] + (g.x - dragStart.ground.x);
-            let nz = dragStart.obj.pos[2] + (g.z - dragStart.ground.z);
-            if (snap) { nx = Math.round(nx / 0.5) * 0.5; nz = Math.round(nz / 0.5) * 0.5; }
-            this.updateObj(dragObj.id, { pos: [+nx.toFixed(2), 0, +nz.toFixed(2)] });
-            this._dragReadout(e, "X " + nx.toFixed(1) + "  Z " + nz.toFixed(1));
+            let dx = g.x - dragStart.ground.x, dz = g.z - dragStart.ground.z;
+            if (snap) { dx = Math.round(dx / 0.5) * 0.5; dz = Math.round(dz / 0.5) * 0.5; }   // snap the delta → preserves group spacing
+            for (const gs of (dragStart.group && dragStart.group.length ? dragStart.group : [{ id: dragObj.id, pos: dragStart.obj.pos }])) {
+              const nx = gs.pos[0] + dx, nz = gs.pos[2] + dz;
+              this.updateObj(gs.id, { pos: [+nx.toFixed(2), +this._groundHeightAt(nx, nz).toFixed(2), +nz.toFixed(2)] });
+            }
+            this._dragReadout(e, "Δ " + dx.toFixed(1) + ", " + dz.toFixed(1));
           }
         } else if (dragStart.mode === "rotate") {
           let ry = dragStart.obj.rot[1] + (e.clientX - dragStart.x) * 0.7;
@@ -588,15 +706,27 @@ export class Studio extends React.Component<{}, any> {
         }
         return;
       }
+      if (panning && last) {
+        // pan = slide the camera target across its own screen plane (right/up basis), scaled by distance
+        const cam = this._three.camera;
+        const fwd = new THREE.Vector3(); cam.getWorldDirection(fwd);
+        const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0)).normalize();
+        const up = new THREE.Vector3().crossVectors(right, fwd).normalize();
+        const k = this._cam.r * 0.0016;
+        this._cam.target.addScaledVector(right, -(e.clientX - last.x) * k).addScaledVector(up, (e.clientY - last.y) * k);
+        last = { x: e.clientX, y: e.clientY };
+        return;
+      }
       if (orbiting && last) {
         this._cam.theta += (e.clientX - last.x) * 0.006;
         this._cam.phi -= (e.clientY - last.y) * 0.006;
         last = { x: e.clientX, y: e.clientY };
       }
     });
-    const end = (_e: any) => { this._dragging = false; dragObj = null; dragStart = null; last = null; orbiting = false; gizmoDrag = null; cv.style.cursor = "grab"; if (this.state.dragLabel) this.setState({ dragLabel: null }); };
+    const end = (_e: any) => { this._dragging = false; dragObj = null; dragStart = null; last = null; orbiting = false; panning = false; gizmoDrag = null; cv.style.cursor = "grab"; if (this.state.dragLabel) this.setState({ dragLabel: null }); };
     cv.addEventListener("pointerup", end);
     cv.addEventListener("pointercancel", end);
+    cv.addEventListener("contextmenu", (e: any) => e.preventDefault());   // allow right-drag to pan without the menu
     cv.addEventListener("wheel", (e: any) => { e.preventDefault(); this._cam.r = Math.max(5, Math.min(40, this._cam.r + e.deltaY * 0.01)); }, { passive: false });
     cv.addEventListener("dblclick", (e: any) => {
       setMouse(e);
@@ -612,9 +742,20 @@ export class Studio extends React.Component<{}, any> {
   _dragReadout(e: any, text: string) { this.setState({ dragLabel: { text, x: e.clientX + 14, y: e.clientY + 14 } }); }
   _groundPoint() {
     this._raycaster.setFromCamera(this._mouse, this._three.camera);
+    // prefer the real ground mesh (terrain tile / base) so drops land on the surface; else the y=0 plane
+    const ground = this._three.modelGroup.children.find((c: any) => c.userData.isGround);
+    if (ground) { const hits = this._raycaster.intersectObject(ground, true); if (hits.length) return hits[0].point; }
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
     const pt = new THREE.Vector3();
     return this._raycaster.ray.intersectPlane(plane, pt) ? pt : null;
+  }
+  // Surface height at an XZ position (raycast straight down onto the ground mesh) — keeps objects on the terrain.
+  _groundHeightAt(x: number, z: number) {
+    const ground = this._three && this._three.modelGroup.children.find((c: any) => c.userData.isGround);
+    if (!ground) return 0;
+    this._raycaster.set(new THREE.Vector3(x, 100, z), new THREE.Vector3(0, -1, 0));
+    const hits = this._raycaster.intersectObject(ground, true);
+    return hits.length ? hits[0].point.y : 0;
   }
   _disposeChildren(group: any) {
     while (group.children.length) {
@@ -640,6 +781,7 @@ export class Studio extends React.Component<{}, any> {
     } else if (geo === "terrain") {
       const m = new THREE.Mesh(new THREE.BoxGeometry(6, 0.4, 6), this._mat(geo)); m.position.y = 0.2; g.add(m);
     } else { g.add(new THREE.Mesh(new THREE.IcosahedronGeometry(1.4, 1), this._mat("rock"))); }
+    g.traverse((c: any) => { if (c.isMesh) c.castShadow = true; });
     return g;
   }
   _mat(geo: string) {
@@ -678,6 +820,7 @@ export class Studio extends React.Component<{}, any> {
       const node = tmpl.clone(true);
       if (this.state.viewMode === "solid") node.traverse((c: any) => { if (c.isMesh && c.material) c.material = Array.isArray(c.material) ? c.material.map((m: any) => m.clone()) : c.material.clone(); });
       else this._applyViewToGlb(node);
+      node.traverse((c: any) => { if (c.isMesh) c.castShadow = true; });
       if (oid) { node.userData.oid = oid; node.traverse((c: any) => { c.userData.oid = oid; }); }
       group.add(node);
     };
@@ -690,6 +833,24 @@ export class Studio extends React.Component<{}, any> {
     }).catch((e) => console.error("GLB load failed", e));
   }
   _objNode(id: any) { return this._three ? this._three.modelGroup.children.find((n: any) => n.userData.oid === id) : null; }
+  // terrain tile used as the scene ground: normalize to a large footprint, base at y=0.
+  _groundModel(scene: any) {
+    const obj = scene;
+    const size = new THREE.Box3().setFromObject(obj).getSize(new THREE.Vector3());
+    const footprint = Math.max(size.x, size.z) || 1;
+    obj.scale.setScalar(24 / footprint);
+    const bb = new THREE.Box3().setFromObject(obj);
+    const ctr = bb.getCenter(new THREE.Vector3());
+    obj.position.set(-ctr.x, -bb.min.y, -ctr.z);   // center XZ, sit base on y=0
+    const wrap = new THREE.Group(); wrap.add(obj); return wrap;
+  }
+  _addGroundGlb(group: any, b64: string, id: string) {
+    const key = "ground:" + id;
+    const place = (tmpl: any) => { const node = tmpl.clone(true); node.userData.isGround = true; node.traverse((c: any) => { c.userData.isGround = true; if (c.isMesh) c.receiveShadow = true; }); group.add(node); };
+    if (this._glbCache[key]) { place(this._glbCache[key]); return; }
+    const sigAt = this._sig;
+    parseGlbScene(b64).then((scene) => { const tmpl = this._groundModel(scene); this._glbCache[key] = tmpl; if (this._three && this._sig === sigAt) place(tmpl); }).catch((e) => console.error("ground GLB load failed", e));
+  }
 
   _buildRoboticsModel() {
     const g = new THREE.Group();
@@ -708,7 +869,7 @@ export class Studio extends React.Component<{}, any> {
   _syncViewport() {
     if (!this._three) return;
     const s = this.state;
-    const sig = [s.workspace, s.viewMode, JSON.stringify(s.rob.spec.L), s.rob.spec.shape, s.rob.spec.W, s.rob.spec.H, s.cre.result ? (s.cre.result.glbId || s.cre.result.faces) : "n", s.asm.objects.map((o: any) => o.id + o.geo + (o.glbId || "") + o.hidden).join(","), s.asm.ground].join("|");
+    const sig = [s.workspace, s.viewMode, JSON.stringify(s.rob.spec.L), s.rob.spec.shape, s.rob.spec.W, s.rob.spec.H, s.cre.result ? (s.cre.result.glbId || s.cre.result.faces) : "n", s.asm.objects.map((o: any) => o.id + o.geo + (o.glbId || "") + o.hidden).join(","), s.asm.ground, s.asm.groundGlbId || ""].join("|");
     if (sig === this._sig) { this._syncTransforms(); this._syncGizmo(); return; }
     this._sig = sig;
     const mg = this._three.modelGroup;
@@ -729,9 +890,13 @@ export class Studio extends React.Component<{}, any> {
       }
     } else {
       this._cam.target.set(0, 1.2, 0);
-      const tileCol = ({ forest: 0x4a5c3a, desert: 0xb89a5e, snowy: 0xcfd8e8, arctic: 0xbcd0d8, plain: 0x6f7a55, none: 0x1a1d28 } as any)[s.asm.ground] || 0x4a5c3a;
-      const tile = new THREE.Mesh(new THREE.BoxGeometry(20, 0.3, 20), new THREE.MeshStandardMaterial({ color: tileCol, roughness: 0.95, metalness: 0 }));
-      tile.position.y = -0.15; mg.add(tile);
+      if (s.asm.groundGlb) {
+        this._addGroundGlb(mg, s.asm.groundGlb, s.asm.groundGlbId);   // real terrain tile as the ground
+      } else {
+        const tileCol = ({ forest: 0x4a5c3a, desert: 0xb89a5e, snowy: 0xcfd8e8, arctic: 0xbcd0d8, plain: 0x6f7a55, none: 0x1a1d28 } as any)[s.asm.ground] || 0x4a5c3a;
+        const tile = new THREE.Mesh(new THREE.BoxGeometry(20, 0.3, 20), new THREE.MeshStandardMaterial({ color: tileCol, roughness: 0.95, metalness: 0 }));
+        tile.position.y = -0.15; tile.userData.isGround = true; tile.receiveShadow = true; mg.add(tile);
+      }
       s.asm.objects.forEach((o: any) => {
         if (o.hidden) return;
         if (o.glb) { this._addGlbToGroup(mg, o.glb, o.glbId || o.id, o.id); return; }   // real asset
@@ -754,8 +919,8 @@ export class Studio extends React.Component<{}, any> {
         node.rotation.set(o.rot[0] * Math.PI / 180, o.rot[1] * Math.PI / 180, o.rot[2] * Math.PI / 180);
         node.scale.set(o.scale[0], o.scale[1], o.scale[2]);
         node.visible = !o.hidden;
-        const sel = o.id === this.state.asm.selectedId;
-        node.traverse((c: any) => { if (c.material && c.material.emissive) { c.material.emissive.setHex(sel ? 0x222a44 : 0x000000); } });
+        const sel = this._isSelected(o.id);
+        node.traverse((c: any) => { const ms = c.material ? (Array.isArray(c.material) ? c.material : [c.material]) : []; ms.forEach((m: any) => { if (m && m.emissive) m.emissive.setHex(sel ? 0x222a44 : 0x000000); }); });
       }
     });
   }
@@ -849,8 +1014,8 @@ export class Studio extends React.Component<{}, any> {
     let leftTabs: any[] = [];
     if (isRob) leftTabs = [{ label: "Input", style: tab(true), onClick: () => {} }];
     else if (isCre) {
-      const cd = [["generate", "Generate"], ["library", "Library"]];
-      leftTabs = cd.map(([k, l]) => ({ label: l, style: tab(s.cre.panel === k || (k === "generate" && (s.cre.panel === "terrain" || s.cre.panel === "render"))), onClick: () => this.setState((p: any) => ({ cre: { ...p.cre, panel: k } })) }));
+      const cd = [["generate", "Generate"], ["terrain", "Terrain"], ["library", "Library"]];
+      leftTabs = cd.map(([k, l]) => ({ label: l, style: tab(s.cre.panel === k || (k === "generate" && s.cre.panel === "render")), onClick: () => this.setState((p: any) => ({ cre: { ...p.cre, panel: k } })) }));
     } else {
       const ad = [["library", "Library"], ["outliner", "Outliner"]];
       leftTabs = ad.map(([k, l]) => ({ label: l, style: tab(s.asm.leftTab === k), onClick: () => this.setState((p: any) => ({ asm: { ...p.asm, leftTab: k } })) }));
@@ -871,6 +1036,7 @@ export class Studio extends React.Component<{}, any> {
 
     // ---- CREATE left ----
     const creLeftInput = isCre && s.cre.panel === "generate";
+    const creTerrainMode = isCre && s.cre.panel === "terrain";
     const creInputs = [["text", "Text"], ["image", "Image"]].map(([k, l]) => ({ label: l, style: pill(s.cre.inputMode === k), onClick: () => this.setState((p: any) => ({ cre: { ...p.cre, inputMode: k } })) }));
     const creImageMode = isCre && s.cre.inputMode === "image";
     const tierDefs = [["Preview", "~30s"], ["Standard", "~1 min"], ["High", "~1.5 min"], ["Max detail", "~2–2.5 min"]];
@@ -887,6 +1053,7 @@ export class Studio extends React.Component<{}, any> {
     const q = s.librarySearch.toLowerCase();
     const libraryItems = s.library.filter((it: any) => !q || it.name.toLowerCase().includes(q)).map((it: any) => ({
       name: it.name, meta: it.faces + " · " + it.size, bg: "linear-gradient(135deg," + this.GEOCOLOR[it.geo] + "66,#0d0f16)", thumbKey: "thumb-" + it.geo, geoColor: this.GEOCOLOR[it.geo] || "#9aa0ac",
+      thumb: it.thumb || null,
       busy: it.status === "busy", canAdd: isAsm,
       onAdd: () => this.addObject(it, true),
       onDragStart: (e: any) => { this._dragItem = it; try { e.dataTransfer.setData("text/plain", it.id); } catch (x) {} },
@@ -901,9 +1068,9 @@ export class Studio extends React.Component<{}, any> {
       onDragStart: (e: any) => { this._dragRow = o.id; try { e.dataTransfer.effectAllowed = "move"; } catch (x) {} },
       onDragOver: (e: any) => { e.preventDefault(); },
       onDrop: (e: any) => { e.preventDefault(); if (this._dragRow) this.reorderObjects(this._dragRow, o.id); this._dragRow = null; },
-      rowStyle: "display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:8px;cursor:pointer;border:1px solid " + (o.id === s.asm.selectedId ? "rgba(" + accentRgb + ",.45)" : "transparent") + ";background:" + (o.id === s.asm.selectedId ? "transparent" : "transparent") + ";",
+      rowStyle: "display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:8px;cursor:pointer;border:1px solid " + (this._isSelected(o.id) ? "rgba(" + accentRgb + ",.45)" : "transparent") + ";background:" + (this._isSelected(o.id) ? "rgba(" + accentRgb + ",.08)" : "transparent") + ";",
       eyeKey: o.hidden ? "i-eye-off" : "i-eye",
-      onSelect: () => this.selectObj(o.id), onHide: (e: any) => { e.stopPropagation(); this.toggleHide(o.id); }, onDelete: (e: any) => { e.stopPropagation(); this.setState((p: any) => ({ asm: { ...p.asm, objects: p.asm.objects.filter((x: any) => x.id !== o.id), selectedId: p.asm.selectedId === o.id ? null : p.asm.selectedId } })); },
+      onSelect: (e: any) => { if (e && e.shiftKey) this.toggleSelect(o.id); else this.selectObj(o.id); }, onHide: (e: any) => { e.stopPropagation(); this.toggleHide(o.id); }, onDelete: (e: any) => { e.stopPropagation(); this.setState((p: any) => ({ asm: { ...p.asm, objects: p.asm.objects.filter((x: any) => x.id !== o.id), selectedId: p.asm.selectedId === o.id ? null : p.asm.selectedId, selectedIds: (p.asm.selectedIds || []).filter((id: string) => id !== o.id) } })); },
     }));
 
     // ---- canvas hint ----
@@ -920,10 +1087,12 @@ export class Studio extends React.Component<{}, any> {
       dot: "width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;flex-shrink:0;" + (i < job.idx ? "background:rgba(80,220,140,.2);color:#5fe39a;" : i === job.idx ? "background:rgba(" + accentRgb + ",.2);color:" + accent + ";animation:ml-pulse 1.2s infinite;border:1px solid " + accent + ";" : "background:rgba(255,255,255,.06);color:var(--txt3);"),
     })) : [];
     const jobConcept = !!(job && job.concept && job.conceptShown && job.status === "running");
+    const jobMvViews = (job && job.mvViews && job.mvViews.length) ? job.mvViews : null;   // 6 MV-Adapter views (collage)
     const jobConceptBg = (job && job.conceptImg)
       ? ("center/cover no-repeat url(data:image/png;base64," + job.conceptImg + ")")   // the real FLUX concept
       : ("linear-gradient(135deg,rgba(" + accentRgb + ",.5),#1a1020 60%,#0d0a12)");      // placeholder while it's still rendering
     const jobConceptReady = !!(job && job.conceptImg);
+    const jobConceptLabel = jobMvViews ? ("Multi-view · " + jobMvViews.length + " angles") : (jobConceptReady ? "Concept image · FLUX" : "Rendering concept…");
 
     // ================= ROBOTICS inspector =================
     const showRobInspector = isRob && !job;
@@ -1016,21 +1185,33 @@ export class Studio extends React.Component<{}, any> {
     }
     const onRenameSel = (e: any) => this.updateObj(asmSel.id, { name: e.target.value });
     const onResetTransform = () => this.updateObj(asmSel.id, { pos: [0, 0, 0], rot: [0, 0, 0], scale: [1, 1, 1] });
+    const groundStyle = (active: boolean) => "padding:8px;border-radius:9px;cursor:pointer;text-align:center;border:1px solid " + (active ? "rgba(" + accentRgb + ",.45)" : "var(--bd)") + ";background:" + (active ? "transparent" : "rgba(255,255,255,.02)") + ";color:var(--txt);";
     const groundDefs = [["forest", "Forest", "#4a6b3a"], ["desert", "Desert", "#c9a96a"], ["snowy", "Snowy", "#cdd8ea"], ["none", "None", "#1a1d28"]];
-    const asmGrounds = groundDefs.map(([k, l, c]) => ({ label: l, swatch: "linear-gradient(135deg," + c + ",#0d0f16)", style: "padding:8px;border-radius:9px;cursor:pointer;text-align:center;border:1px solid " + (s.asm.ground === k ? "rgba(" + accentRgb + ",.45)" : "var(--bd)") + ";background:" + (s.asm.ground === k ? "transparent" : "rgba(255,255,255,.02)") + ";color:var(--txt);", onClick: () => this.setState((p: any) => ({ asm: { ...p.asm, ground: k } })) }));
+    // biome bases (colored ground) — selecting one clears any terrain-tile ground
+    const biomeGrounds = groundDefs.map(([k, l, c]) => ({ label: l, swatch: "linear-gradient(135deg," + c + ",#0d0f16)", style: groundStyle(s.asm.ground === k && !s.asm.groundGlb), onClick: () => this.setState((p: any) => ({ asm: { ...p.asm, ground: k, groundGlb: null, groundGlbId: null } })) }));
+    // generated terrain tiles — render the real GLB as the ground
+    const tileGrounds = s.library.filter((it: any) => it.geo === "terrain").map((it: any) => ({
+      label: it.name.replace(/ Tile$/, ""),
+      swatch: it.thumb ? ("center/cover no-repeat url(data:image/png;base64," + it.thumb + ")") : "linear-gradient(135deg,#6f7a55,#0d0f16)",
+      style: groundStyle(s.asm.groundGlbId === it.glbId),
+      onClick: () => this.setState((p: any) => ({ asm: { ...p.asm, ground: "tile", groundGlbId: it.glbId, groundGlb: it.glb } })),
+    }));
+    const asmGrounds = [...biomeGrounds, ...tileGrounds];
     const lightingMoods = this.MOODS.map((m, i) => ({ label: m, style: pill(s.lighting === i).replace("flex:1;", "flex:1;") + "padding:7px;font-size:11.5px;", onClick: () => this.setState({ lighting: i }) }));
 
     // ---- gizmo bar ----
     const showGizmoBar = isAsm && !job;
     const gizmoDefs = [["move", "i-move", "Move", "W"], ["rotate", "i-rotate", "Rotate", "E"], ["scale", "i-scale", "Scale", "R"]];
     const gizmoModes = gizmoDefs.map(([k, iconKey, title, key]) => ({ iconKey, title, key, style: "display:flex;flex-direction:column;align-items:center;gap:1px;width:38px;height:42px;justify-content:center;border:none;border-radius:9px;cursor:pointer;background:" + (s.asm.gizmoMode === k ? "transparent;color:" + accent : "transparent;color:var(--txt2)") + ";", onClick: () => this._setGizmo(k) }));
+    const onToggleSnap = () => this.setState((p: any) => ({ asm: { ...p.asm, snap: !p.asm.snap } }));
+    const snapStyle = "display:flex;flex-direction:column;align-items:center;gap:1px;width:38px;height:42px;justify-content:center;border:none;border-radius:9px;cursor:pointer;background:" + (s.asm.snap ? "transparent;color:" + accent : "transparent;color:var(--txt2)") + ";";
 
     // ================= INSPECTOR title =================
     let inspectorTitle = "Inspector", inspectorMeta = "";
     if (job) { inspectorTitle = "Job"; inspectorMeta = job.key; }
     else if (isRob) { inspectorTitle = rr ? "Verification" : "Spec editor"; inspectorMeta = sp.shape; }
     else if (isCre) { inspectorTitle = s.cre.panel === "terrain" ? "Terrain" : s.cre.panel === "render" ? "Finish" : (cr ? "Asset" : "Generate"); }
-    else { inspectorTitle = asmSel ? "Object" : "Scene"; inspectorMeta = s.asm.objects.length + " objs"; }
+    else { const nsel = this._selIds().length; inspectorTitle = asmSel ? (nsel > 1 ? nsel + " objects" : "Object") : "Scene"; inspectorMeta = nsel > 1 ? nsel + " selected" : s.asm.objects.length + " objs"; }
 
     // ================= COMMAND BAR =================
     let commandIcon = "✦", commandPlaceholder = "", primaryActionLabel = "Generate", primaryAction = () => {};
@@ -1091,7 +1272,7 @@ export class Studio extends React.Component<{}, any> {
     const shortcutsOpen = s.shortcutsOpen;
     const onToggleShortcuts = () => this.setState((p: any) => ({ shortcutsOpen: !p.shortcutsOpen }));
     const onCloseShortcuts = () => this.setState({ shortcutsOpen: false });
-    const shortcutList = [["W / E / R", "Move · Rotate · Scale"], ["Middle-drag", "Orbit camera"], ["Scroll", "Zoom"], ["Shift + drag", "Snap (grid / 15°)"], ["Alt + drag", "Duplicate & move"], ["Double-click", "Focus object"], ["Ctrl/⌘ + D", "Duplicate"], ["Del", "Delete"], ["Ctrl/⌘ + Z", "Undo"], ["Ctrl/⌘ + Shift + Z", "Redo"], ["?", "Toggle this panel"]].map(([k, v]) => ({ k, v }));
+    const shortcutList = [["W / E / R", "Move · Rotate · Scale"], ["Middle-drag", "Orbit camera"], ["⇧ Middle / Right-drag", "Pan camera"], ["Scroll", "Zoom"], ["F", "Frame selection"], ["Shift + drag", "Snap (grid / 15°)"], ["Alt + drag", "Duplicate & move"], ["Double-click", "Focus object"], ["Ctrl/⌘ + D", "Duplicate"], ["Del", "Delete"], ["Ctrl/⌘ + Z", "Undo"], ["Ctrl/⌘ + Shift + Z", "Redo"], ["?", "Toggle this panel"]].map(([k, v]) => ({ k, v }));
     const facesNum = cr ? (parseFloat(cr.faces) * (String(cr.faces).includes("k") ? 1000 : 1)) : 1;
     const lowpolyPct = cr ? (Math.max(4, Math.min(100, Math.round(s.cre.lowpolyTarget / facesNum * 100))) + "%") : "0%";
     const lowpolyAfter = (s.cre.lowpolyTarget / 1000) + "k";
@@ -1102,13 +1283,15 @@ export class Studio extends React.Component<{}, any> {
       isRob, isCre, isAsm,
       robInputs, robImageMode, onScaleAnchor, rob: s.rob, assemblyToggleStyle, onToggleAssembly,
       assemblyKnobTrack: knobTrack(s.rob.assembly), assemblyKnob: knob(s.rob.assembly), robLibrary,
-      creLeftInput, creInputs, creImageMode, creTiers,
-      showLibrary, libraryItems, librarySearch: s.librarySearch, onLibrarySearch: (e: any) => this.setState({ librarySearch: e.target.value }),
+      creLeftInput, creTerrainMode, creInputs, creImageMode, creTiers,
+      showLibrary, libraryItems, libraryEmpty: showLibrary && libraryItems.length === 0, librarySearch: s.librarySearch, onLibrarySearch: (e: any) => this.setState({ librarySearch: e.target.value }),
       showOutliner, asmEmpty, outlinerRows,
       showCanvasHint, canvasHintTitle, canvasHintBody,
+      onCanvasDragOver: (e: any) => { if (isAsm) e.preventDefault(); },
+      onCanvasDrop: (e: any) => this._dropAsset(e),
       job, jobRunning, jobError, jobTitle: job ? job.title : "", jobHint: job ? job.hint : "",
       jobElapsed: job ? job.elapsed.toFixed(1) : "0", jobStageCount: job ? ("stage " + Math.min(job.idx + 1, job.stages.length) + "/" + job.stages.length) : "",
-      jobStages, jobConcept, jobConceptBg, jobConceptReady, jobErrorMsg: (job && job.errorMsg) || "The generator returned an error. The interpreter or mesher failed on this attempt.", jobErrorStage: job ? (job.errorStage || "") : "",
+      jobStages, jobConcept, jobConceptBg, jobConceptReady, jobMvViews, jobConceptLabel, jobErrorMsg: (job && job.errorMsg) || "The generator returned an error. The interpreter or mesher failed on this attempt.", jobErrorStage: job ? (job.errorStage || "") : "",
       onCancelJob: () => this.cancelJob(), onRetryJob: () => this.retryJob(),
       showRobInspector, robSpecMode, robResult, robShapes, robDims, robFeatures, onAddFeature, robWarning,
       onSpecName, onSpecTol, onSpecMinWall, robFab, robFabricate,
@@ -1116,7 +1299,7 @@ export class Studio extends React.Component<{}, any> {
       onRobReset: () => this.setState((p: any) => ({ rob: { ...p.rob, result: null } })),
       showCreInspector, creIdle, creResult, cre: s.cre, creReport, creMaps, creLowpolyLabel, onLowpoly,
       onRunLowpoly: () => this.runLowpoly(),
-      onAddToLibrary: () => { const r = this.state.cre.result; if (!r) return; this.setState((p: any) => ({ library: [{ id: "a" + (this._uid++), name: r.name, geo: r.geo, glb: r.glb, glbId: r.glbId, faces: r.faces, size: r.size || "—", status: "ready" }, ...p.library] })); this.toast("Added to Library"); },
+      onAddToLibrary: () => { const r = this.state.cre.result; if (!r) return; this.setState((p: any) => ({ library: [{ id: "a" + (this._uid++), name: r.name, geo: r.geo, glb: r.glb, glbId: r.glbId, thumb: r.thumb || null, faces: r.faces, size: r.size || "—", status: "ready" }, ...p.library] })); this.toast("Added to Library"); },
       onExportGlb: () => { const r = s.cre.result; if (r && r.glb) { downloadB64(r.glb, (r.name || "asset") + ".glb", "model/gltf-binary"); this.toast("GLB downloaded"); } else this.toast("Nothing to export"); },
       onExportUsdz: async () => { const r = s.cre.result; if (!(r && r.glb)) { this.toast("Nothing to export"); return; } this.toast("Building USDZ…"); try { const u = await glbToUsdz(r.glb); downloadBytes(u, (r.name || "asset") + ".usdz", "model/vnd.usdz+zip"); this.toast("USDZ downloaded"); } catch (e) { this.toast("USDZ failed"); } },
       onOpenRender: () => this.setState((p: any) => ({ cre: { ...p.cre, panel: "render" } })),
@@ -1131,7 +1314,7 @@ export class Studio extends React.Component<{}, any> {
       onDupSel: () => this.dupSel(), onDeleteSel: () => this.deleteSel(),
       onLowpolySel: () => { const o = asmSel; if (!o || !o.glb) { this.toast("This object has no mesh to decimate"); return; } this._startAsyncJob("asmlowpoly", "Low-Poly object", "Decimating the selected object to ~8k faces.", [{ label: "Queued" }, { label: "Decimating mesh" }], false, (onP, sc) => api.lowpoly(o.glb, 8000, onP, sc), (res) => { const glbId = "g" + (this._uid++); this.updateObj(o.id, { glb: res.glb_b64, glbId, faces: this._fmtFaces(res.report ? res.report.faces : 8000) }); this.toast("Object decimated"); }, () => {}); },
       onExportSel: async () => { const o = asmSel; if (o && o.glb) { downloadB64(o.glb, (o.name || "object") + ".glb", "model/gltf-binary"); this.toast("Object exported"); return; } const node = this._objNode(o && o.id); if (node) { try { const b = await exportGlb(node); downloadBytes(b, (o.name || "object") + ".glb", "model/gltf-binary"); this.toast("Object exported"); } catch (e) { this.toast("Export failed"); } } else this.toast("Nothing to export"); },
-      asmGrounds, lightingMoods, showGizmoBar, gizmoModes,
+      asmGrounds, lightingMoods, showGizmoBar, gizmoModes, onToggleSnap, snapStyle, snapActive: s.asm.snap,
       inspectorTitle, inspectorMeta,
       commandIcon, commandPlaceholder, commandValue: s.command, onCommandInput: (e: any) => this.setState({ command: e.target.value }),
       onCommandKey: (e: any) => { if (e.key === "Enter") primaryAction(); },
@@ -1150,7 +1333,7 @@ export class Studio extends React.Component<{}, any> {
     return (
       <div id="ml-root" style={css(`--accent: ${v.accent}; --accent-rgb: ${v.accentRgb}; --panel: rgba(17,19,26,.72); --panel-solid: #12141B; --bd: rgba(255,255,255,.09); --txt: #EAECEF; --txt2: rgba(234,236,239,.56); --txt3: rgba(234,236,239,.34); position: fixed; inset: 0; overflow: hidden; font-family: Hanken Grotesk, system-ui, sans-serif; color: var(--txt); background: radial-gradient(120% 90% at 50% 0%, #0E1018 0%, #06070A 70%); -webkit-font-smoothing: antialiased;`)}>
         <IconDefs />
-        <div id="ml-viewport" style={css("position: absolute; inset: 0; z-index: 0;")} />
+        <div id="ml-viewport" onDragOver={v.onCanvasDragOver} onDrop={v.onCanvasDrop} style={css("position: absolute; inset: 0; z-index: 0;")} />
         <div style={css("position: absolute; inset: 0; z-index: 1; pointer-events: none; background: radial-gradient(130% 120% at 50% 38%, transparent 52%, rgba(0,0,0,.55) 100%);")} />
 
         {/* empty / hint overlay */}
@@ -1281,17 +1464,31 @@ export class Studio extends React.Component<{}, any> {
               </>
             )}
 
+            {/* CREATE terrain mode — biome picker is in the right Inspector */}
+            {v.creTerrainMode && (
+              <>
+                <div style={css("font-size: 10.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--txt3); margin-bottom: 9px;")}>Terrain tile</div>
+                <div style={css("font-size: 12px; color: var(--txt2); line-height: 1.55;")}>Generate a placeable, vertex-colored ground tile with <strong style={css("color:var(--txt);")}>Infinigen</strong> — real heightfield + erosion. Pick a biome on the right →</div>
+                <div style={css("margin-top: 10px; padding: 9px 11px; border-radius: 9px; background: rgba(255,180,60,.08); border: 1px solid rgba(255,180,60,.25); font-size: 11px; color: #FFD79A; line-height: 1.45;")}>Heavier job · ~5–6 min. It lands in your Library and is set as the scene ground.</div>
+              </>
+            )}
+
             {/* CREATE/ASSEMBLE library */}
             {v.showLibrary && (
               <>
                 <div style={css("display: flex; align-items: center; gap: 8px; margin-bottom: 11px;")}>
                   <input type="text" placeholder="Search library…" value={v.librarySearch} onChange={v.onLibrarySearch} style={css("flex: 1; padding: 7px 10px; background: rgba(0,0,0,.3); border: 1px solid var(--bd); border-radius: 8px; color: var(--txt); font-size: 12px; font-family: Hanken Grotesk,sans-serif;")} />
                 </div>
+                {v.libraryEmpty && (
+                  <div style={css("padding: 22px 8px; text-align: center; color: var(--txt3); font-size: 12px; line-height: 1.5;")}>No assets yet.<br />Generate one in Create — it lands here.</div>
+                )}
                 <div style={css("display: grid; gap: 9px;")}>
                   {v.libraryItems.map((it: any, i: number) => (
                     <div key={i} draggable onDragStart={it.onDragStart} style={css("display: flex; gap: 11px; padding: 9px; border-radius: 11px; border: 1px solid var(--bd); background: rgba(255,255,255,.02); cursor: grab; align-items: center;")}>
                       <div style={css("width: 48px; height: 48px; border-radius: 8px; background: " + it.bg + "; flex-shrink: 0; position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; color: " + it.geoColor + ";")}>
-                        <svg width="30" height="30" viewBox="0 0 24 24" style={css("display:block; opacity:.92;")}><use href={"#" + it.thumbKey} /></svg>
+                        {it.thumb
+                          ? <img src={it.thumb} alt={it.name} style={css("width: 100%; height: 100%; object-fit: cover; display: block;")} />
+                          : <svg width="30" height="30" viewBox="0 0 24 24" style={css("display:block; opacity:.92;")}><use href={"#" + it.thumbKey} /></svg>}
                         {it.busy && (
                           <div style={css("position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;")}><div style={css("width: 16px; height: 16px; border: 2px solid rgba(255,255,255,.25); border-top-color: var(--accent); border-radius: 50%; animation: ml-spin .8s linear infinite;")} /></div>
                         )}
@@ -1356,8 +1553,16 @@ export class Studio extends React.Component<{}, any> {
                     </div>
                     {v.jobConcept && (
                       <div style={css("margin-top: 14px; border-radius: 11px; overflow: hidden; border: 1px solid var(--bd); position: relative; animation: ml-rise .4s ease;")}>
-                        <div style={css("aspect-ratio: 16/10; background: " + v.jobConceptBg + ";" + (v.jobConceptReady ? "" : "animation: ml-pulse 1.4s infinite;"))} />
-                        <div style={css("position: absolute; bottom: 0; left: 0; right: 0; padding: 7px 10px; background: linear-gradient(transparent, rgba(0,0,0,.7)); font-size: 10.5px; color: rgba(255,255,255,.85);")}>{v.jobConceptReady ? "Concept image · FLUX" : "Rendering concept…"}</div>
+                        {v.jobMvViews ? (
+                          <div style={css("aspect-ratio: 16/10; display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; background: #0d0a12;")}>
+                            {v.jobMvViews.map((mv: string, i: number) => (
+                              <img key={i} src={"data:image/png;base64," + mv} alt={"view " + (i + 1)} style={css("width: 100%; height: 100%; object-fit: cover; display: block; animation: ml-rise .3s ease;")} />
+                            ))}
+                          </div>
+                        ) : (
+                          <div style={css("aspect-ratio: 16/10; background: " + v.jobConceptBg + ";" + (v.jobConceptReady ? "" : "animation: ml-pulse 1.4s infinite;"))} />
+                        )}
+                        <div style={css("position: absolute; bottom: 0; left: 0; right: 0; padding: 7px 10px; background: linear-gradient(transparent, rgba(0,0,0,.7)); font-size: 10.5px; color: rgba(255,255,255,.85);")}>{v.jobConceptLabel}</div>
                       </div>
                     )}
                     <div style={css("margin-top: 16px; display: grid; gap: 9px;")}>
@@ -1730,7 +1935,9 @@ export class Studio extends React.Component<{}, any> {
             {v.gizmoModes.map((gm: any, i: number) => (
               <button key={i} onClick={gm.onClick} title={gm.title} style={css(gm.style)}><Icon k={gm.iconKey} size={18} /><span style={css("font-size: 9px; opacity: .6; font-family: 'JetBrains Mono', monospace;")}>{gm.key}</span></button>
             ))}
-            <div style={css("margin-left: 3px; padding-left: 8px; border-left: 1px solid var(--bd); font-size: 9px; line-height: 1.2; color: var(--txt3); font-family: 'JetBrains Mono', monospace; white-space: nowrap;")}>MMB<br />orbit</div>
+            <span style={css("width: 1px; height: 24px; background: var(--bd); margin: 0 2px;")} />
+            <button onClick={v.onToggleSnap} title="Snap to grid / 15° (Shift also forces snap)" style={css(v.snapStyle)}><Icon k="i-snap" size={18} /><span style={css("font-size: 9px; opacity: .6; font-family: 'JetBrains Mono', monospace;")}>{v.snapActive ? "snap" : "free"}</span></button>
+            <div style={css("margin-left: 3px; padding-left: 8px; border-left: 1px solid var(--bd); font-size: 9px; line-height: 1.2; color: var(--txt3); font-family: 'JetBrains Mono', monospace; white-space: nowrap;")}>MMB orbit<br />⇧·RMB pan</div>
           </div>
         )}
 

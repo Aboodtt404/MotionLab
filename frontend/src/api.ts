@@ -21,7 +21,7 @@ export interface MeshResult {
 export interface RenderResult { beauty_png_b64: string | null; turntable_mp4_b64?: string; seconds?: number; }
 export interface AnimateResult { animated_mp4_b64: string | null; seconds?: number; variant?: string; }
 
-export type Progress = (stage: string, elapsed: number, conceptB64?: string) => void;
+export type Progress = (stage: string, elapsed: number, conceptB64?: string, mvViews?: string[]) => void;
 export type ShouldCancel = () => boolean;
 
 async function submit(route: string, body: any): Promise<string> {
@@ -51,7 +51,7 @@ async function poll(jobId: string, onProgress?: Progress, shouldCancel?: ShouldC
       continue;   // network blip → the job keeps running server-side
     }
     if (shouldCancel?.()) { cancelJob(jobId); throw new Error("cancelled"); }
-    if (j.status === "running" || j.status === "queued") { onProgress?.(j.stage, j.elapsed || 0, j.concept_png_b64); continue; }
+    if (j.status === "running" || j.status === "queued") { onProgress?.(j.stage, j.elapsed || 0, j.concept_png_b64, j.mv_views_b64); continue; }
     if (j.status === "error") throw new Error(j.error || "generation failed");
     if (j.status === "cancelled") throw new Error("cancelled");
     if (j.status === "done") return j;
