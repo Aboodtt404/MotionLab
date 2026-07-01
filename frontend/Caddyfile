@@ -11,6 +11,11 @@
 	handle_path /api/trackb/* {
 		reverse_proxy 127.0.0.1:8770
 	}
+	# pre-baked Infinigen terrain tiles, served as static files (instant presets; no GPU/Track B needed)
+	handle_path /presets/* {
+		root * /home/abdelrahman/MotionLab/track_b/terrain_presets
+		file_server
+	}
 	handle {
 		root * /home/abdelrahman/MotionLab/frontend/dist
 		try_files {path} /index.html

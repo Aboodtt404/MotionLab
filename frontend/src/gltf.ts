@@ -66,6 +66,14 @@ export async function exportUsdz(obj: THREE.Object3D): Promise<Uint8Array> {
   return out instanceof Uint8Array ? out : new Uint8Array(out as ArrayBuffer);
 }
 
+/** Fetch a pre-baked terrain preset GLB (served statically at /presets/<biome>.glb) → base64,
+ * so it flows through the same groundGlb path as a freshly-generated tile. No GPU/Track B needed. */
+export async function fetchPresetGlb(biome: string): Promise<string> {
+  const res = await fetch(`/presets/${biome}.glb`);
+  if (!res.ok) throw new Error(`preset ${biome} not available (${res.status})`);
+  return bytesToB64(new Uint8Array(await res.arrayBuffer()));
+}
+
 export function bytesToB64(bytes: Uint8Array): string {
   let bin = "";
   const chunk = 0x8000;

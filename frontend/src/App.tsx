@@ -3,10 +3,14 @@
  * viewport uses the npm `three` package instead of the prototype's CDN r128 global (window.THREE). */
 import React from "react";
 import * as THREE from "three";
+import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { css } from "./css";
 import { IconDefs } from "./icons";
 import * as api from "./api";
-import { parseGlbScene, glbToUsdz, exportGlb, exportUsdz, downloadB64, downloadBytes, bytesToB64, fileToB64, renderThumbnail } from "./gltf";
+import { parseGlbScene, glbToUsdz, exportGlb, exportUsdz, downloadB64, downloadBytes, bytesToB64, fileToB64, renderThumbnail, fetchPresetGlb } from "./gltf";
+
+// Pre-baked Infinigen terrain tiles served statically at /presets/<biome>.{glb,png} — instant, no generation.
+const TERRAIN_PRESETS: [string, string][] = [["plain", "Plain"], ["desert", "Desert"], ["forest", "Forest"]];
 import { loadState, saveState } from "./persist";
 
 const Icon = ({ k, size = 17 }: { k: string; size?: number }) => (
@@ -273,6 +277,13 @@ export class Studio extends React.Component<{}, any> {
   }
   _fmtFaces(n: number) { return n >= 1000 ? Math.round(n / 1000) + "k" : String(n || 0); }
   _cap(b: string) { return b.charAt(0).toUpperCase() + b.slice(1); }
+  // Apply a pre-baked terrain tile as the scene ground (fetched static, instant). goAssemble jumps to view it.
+  _useTerrainPreset(biome: string, label: string, goAssemble: boolean) {
+    this.toast("Loading " + label + " tile…");
+    fetchPresetGlb(biome)
+      .then((b64) => { this.setState((p: any) => ({ asm: { ...p.asm, ground: "tile", groundGlbId: "preset-" + biome, groundGlb: b64 }, ...(goAssemble ? { workspace: "assemble" } : {}) })); this.toast(label + " terrain set as ground"); })
+      .catch(() => this.toast(label + " preset unavailable"));
+  }
 
   // ================= ROBOTICS =================
   generateRobotics() {
@@ -528,6 +539,12 @@ export class Studio extends React.Component<{}, any> {
     key.shadow.camera.left = -25; key.shadow.camera.right = 25; key.shadow.camera.top = 25; key.shadow.camera.bottom = -25;
     const rim = new THREE.PointLight(0xffffff, 0.8, 60); rim.position.set(-8, 6, -6); scene.add(rim);
     this._rim = rim;
+    // image-based lighting (procedural studio env, no external HDR) → PBR/metallic surfaces (car paint,
+    // metals) get real reflections instead of rendering flat/blotchy. ACES tone-mapping for HDR→display.
+    renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.0;
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    pmrem.dispose();
     const grid = new THREE.GridHelper(40, 40, 0x2a2f44, 0x161a28);
     (grid.material as any).transparent = true; (grid.material as any).opacity = 0.5; scene.add(grid);
     this._grid = grid;
@@ -818,7 +835,13 @@ export class Studio extends React.Component<{}, any> {
   _addGlbToGroup(group: any, b64: string, id: string, oid: any) {
     const place = (tmpl: any) => {
       const node = tmpl.clone(true);
-      if (this.state.viewMode === "solid") node.traverse((c: any) => { if (c.isMesh && c.material) c.material = Array.isArray(c.material) ? c.material.map((m: any) => m.clone()) : c.material.clone(); });
+      if (this.state.viewMode === "solid") node.traverse((c: any) => {
+        if (!(c.isMesh && c.material)) return;
+        // TRELLIS meshes have a sliver-heavy surface; mirror-sharp reflections craze on it. Soften them:
+        // raise a roughness floor, cap metalness, dial env reflections — keeps PBR, kills the crazing.
+        const tame = (m: any) => { const x = m.clone(); if (x.roughness !== undefined) x.roughness = Math.max(x.roughness, 0.55); if (x.metalness !== undefined) x.metalness = Math.min(x.metalness, 0.5); x.envMapIntensity = 0.6; return x; };
+        c.material = Array.isArray(c.material) ? c.material.map(tame) : tame(c.material);
+      });
       else this._applyViewToGlb(node);
       node.traverse((c: any) => { if (c.isMesh) c.castShadow = true; });
       if (oid) { node.userData.oid = oid; node.traverse((c: any) => { c.userData.oid = oid; }); }
@@ -1196,7 +1219,10 @@ export class Studio extends React.Component<{}, any> {
       style: groundStyle(s.asm.groundGlbId === it.glbId),
       onClick: () => this.setState((p: any) => ({ asm: { ...p.asm, ground: "tile", groundGlbId: it.glbId, groundGlb: it.glb } })),
     }));
-    const asmGrounds = [...biomeGrounds, ...tileGrounds];
+    // pre-baked terrain presets (instant, static) — shown first, with photo thumbnails
+    const presetGrounds = TERRAIN_PRESETS.map(([b, l]) => ({ label: l, swatch: "center/cover no-repeat url(/presets/" + b + ".png)", style: groundStyle(s.asm.groundGlbId === "preset-" + b), onClick: () => this._useTerrainPreset(b, l, false) }));
+    const asmGrounds = [...presetGrounds, ...biomeGrounds, ...tileGrounds];
+    const terrainPresets = TERRAIN_PRESETS.map(([b, l]) => ({ label: l, thumb: "/presets/" + b + ".png", onClick: () => this._useTerrainPreset(b, l, true) }));
     const lightingMoods = this.MOODS.map((m, i) => ({ label: m, style: pill(s.lighting === i).replace("flex:1;", "flex:1;") + "padding:7px;font-size:11.5px;", onClick: () => this.setState({ lighting: i }) }));
 
     // ---- gizmo bar ----
@@ -1303,7 +1329,7 @@ export class Studio extends React.Component<{}, any> {
       onExportGlb: () => { const r = s.cre.result; if (r && r.glb) { downloadB64(r.glb, (r.name || "asset") + ".glb", "model/gltf-binary"); this.toast("GLB downloaded"); } else this.toast("Nothing to export"); },
       onExportUsdz: async () => { const r = s.cre.result; if (!(r && r.glb)) { this.toast("Nothing to export"); return; } this.toast("Building USDZ…"); try { const u = await glbToUsdz(r.glb); downloadBytes(u, (r.name || "asset") + ".usdz", "model/vnd.usdz+zip"); this.toast("USDZ downloaded"); } catch (e) { this.toast("USDZ failed"); } },
       onOpenRender: () => this.setState((p: any) => ({ cre: { ...p.cre, panel: "render" } })),
-      showTerrain, biomes, showRenderGallery, renderTarget, renderTabs, renderStill, renderMotion, renderStillBg,
+      showTerrain, biomes, terrainPresets, showRenderGallery, renderTarget, renderTabs, renderStill, renderMotion, renderStillBg,
       renderBeauty: s.cre.renderBeauty, motionMp4: s.cre.motionMp4,
       creImageB64: s.cre.imageB64, creImageName: s.cre.imageName, onPickImage, onImageChosen, onImageDrop, setFileInput,
       onDownloadStill: () => { if (s.cre.renderBeauty) { downloadB64(s.cre.renderBeauty, (renderTarget || "beauty") + ".png", "image/png"); this.toast("PNG downloaded"); } else this.toast("Render a still first"); },
@@ -1484,7 +1510,7 @@ export class Studio extends React.Component<{}, any> {
                 )}
                 <div style={css("display: grid; gap: 9px;")}>
                   {v.libraryItems.map((it: any, i: number) => (
-                    <div key={i} draggable onDragStart={it.onDragStart} style={css("display: flex; gap: 11px; padding: 9px; border-radius: 11px; border: 1px solid var(--bd); background: rgba(255,255,255,.02); cursor: grab; align-items: center;")}>
+                    <div key={i} draggable onDragStart={it.onDragStart} title={it.name} style={css("display: flex; gap: 11px; padding: 9px; border-radius: 11px; border: 1px solid var(--bd); background: rgba(255,255,255,.02); cursor: grab; align-items: center;")}>
                       <div style={css("width: 48px; height: 48px; border-radius: 8px; background: " + it.bg + "; flex-shrink: 0; position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; color: " + it.geoColor + ";")}>
                         {it.thumb
                           ? <img src={it.thumb} alt={it.name} style={css("width: 100%; height: 100%; object-fit: cover; display: block;")} />
@@ -1494,8 +1520,7 @@ export class Studio extends React.Component<{}, any> {
                         )}
                       </div>
                       <div style={css("flex: 1; min-width: 0;")}>
-                        <div style={css("font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;")}>{it.name}</div>
-                        <div style={css("font-size: 10.5px; color: var(--txt2); font-family: 'JetBrains Mono', monospace; margin-top: 2px;")}>{it.meta}</div>
+                        <div style={css("font-size: 11px; color: var(--txt2); font-family: 'JetBrains Mono', monospace;")}>{it.meta}</div>
                       </div>
                       {it.canAdd && (
                         <button onClick={it.onAdd} title="Add to scene" style={css("width: 28px; height: 28px; border-radius: 8px; border: 1px solid var(--bd); background: transparent; color: var(--accent); font-size: 16px; cursor: pointer; flex-shrink: 0;")}>＋</button>
@@ -1791,7 +1816,16 @@ export class Studio extends React.Component<{}, any> {
             {/* CREATE terrain panel */}
             {v.showTerrain && (
               <div style={css("padding: 14px 15px;")}>
-                <div style={css("font-size: 12.5px; color: var(--txt2); line-height: 1.5; margin-bottom: 12px;")}>Pick a biome to generate a placeable, vertex-colored ground tile. This is heavier — <strong style={css("color:var(--txt);")}>~5–6 min</strong>.</div>
+                <div style={css("font-size: 10.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--txt3); margin-bottom: 8px;")}>Instant presets · pre-baked</div>
+                <div style={css("display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 16px;")}>
+                  {v.terrainPresets.map((p: any, i: number) => (
+                    <button key={i} onClick={p.onClick} title={"Use " + p.label + " as the scene ground"} style={css("padding: 0; border-radius: 10px; overflow: hidden; cursor: pointer; border: 1px solid var(--bd); background: #0d0f16; color: var(--txt);")}>
+                      <div style={css("aspect-ratio: 1; background: center/cover no-repeat url(" + p.thumb + ");")} />
+                      <div style={css("padding: 5px 0; font-size: 11px; font-weight: 600;")}>{p.label}</div>
+                    </button>
+                  ))}
+                </div>
+                <div style={css("font-size: 10.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--txt3); margin-bottom: 8px;")}>Generate new · ~5–6 min</div>
                 <div style={css("display: grid; grid-template-columns: 1fr 1fr; gap: 8px;")}>
                   {v.biomes.map((bm: any, i: number) => (
                     <button key={i} onClick={bm.onClick} style={css(bm.style)}>
