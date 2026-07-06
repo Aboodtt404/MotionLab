@@ -67,7 +67,9 @@ EVAL_HARD = [
                    {"type": "pocket", "length": 50, "width": 30, "depth": 4}], tolerance=0.1),
 ]
 
-SETS = {"golden": GOLDEN, "hard": EVAL_HARD}
+from .bench_specs import EVAL_BENCH  # the benchmark's parametric-CAD slice (fable_run §C)
+
+SETS = {"golden": GOLDEN, "hard": EVAL_HARD, "bench": EVAL_BENCH}
 
 
 def _first_valid_attempt(history: list[dict]) -> int | None:

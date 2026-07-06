@@ -60,3 +60,8 @@ frontend-refactor-*/
 
 # Pre-baked terrain tiles (generated GLB/PNG, not source)
 track_b/terrain_presets/
+
+# Fable extraction artifacts (box-local) + scratch
+fable_run/
+skills/
+task.md

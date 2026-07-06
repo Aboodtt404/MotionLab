@@ -101,7 +101,10 @@ def _level(spec: Spec) -> str:
 
 
 def synth_sample(engine: Engine, category: str) -> Optional[dict]:
-    """One verified, captioned training sample (the 6-tuple) — or None if the gate/caption fails."""
+    """One verified, captioned training sample — schema-validated (corpus.TrainingSample,
+    the 04_schemas-derived contract) with the FULL verifier report embedded, or None if
+    the gate/caption fails."""
+    from .corpus import training_sample
     spec = gen_spec(engine, category)
     if spec is None:
         return None
@@ -109,14 +112,15 @@ def synth_sample(engine: Engine, category: str) -> Optional[dict]:
     if prompts is None:
         return None
     rep = verify(build(spec), spec)
-    return {
-        "category": category,
-        "tags": {"capabilities": sorted({spec.shape, *[f.type for f in spec.features]}), "level": _level(spec)},
-        "prompts": prompts,                       # L0–L3
-        "code": emit_code(spec),                  # golden target (builder source, convention-consistent)
-        "spec": json.loads(spec.model_dump_json()),
-        "verifier": {"passed": rep.passed, "rows": [r.name for r in rep.rows]},
-    }
+    sample = training_sample(
+        category=category,
+        tags={"capabilities": sorted({spec.shape, *[f.type for f in spec.features]}), "level": _level(spec)},
+        prompts=prompts,                          # L0–L3
+        code=emit_code(spec),                     # golden target (builder source, convention-consistent)
+        spec=spec,
+        report=rep.to_dict(),                     # full evidence, not just row names
+    )
+    return json.loads(sample.model_dump_json())
 
 
 # the bespoke taxonomy (track-a-corpus-scope §2), weighted robotics / sci-fi / tail

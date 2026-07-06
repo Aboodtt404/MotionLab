@@ -34,9 +34,40 @@ _FIXES: List[Tuple[re.Pattern, str]] = [
      "`.hole(d)` cuts along the workplane normal and needs a face workplane first: "
      "`.faces('>Z').workplane().center(x,y).hole(d)`."),
 
+    # ---- classes from the mistakes catalog (fable_run 05_mistakes), traceback-anchored ----
+    (re.compile(r"exceeded [\d.]+s|TimeoutExpired|timed? ?out", re.S),
+     "Execution TIMED OUT — usually a boolean doing too much work. Cut features SEQUENTIALLY "
+     "(one .cut() per cutter, never a fused compound cutter), keep feature loops small, and "
+     "don't call .clean() inside a loop — clean once at the end."),  # R2
+
+    (re.compile(r"\.(cut|fuse|union|intersect)\(.*(StdFail_NotDone|command not done)", re.S),
+     "A boolean (cut/fuse) failed — usually exactly-tangent or coincident faces. Extend cutters "
+     "0.5–1 mm PAST the surfaces they cut (start below, end above) so no face is exactly shared."),  # C10
+
+    (re.compile(r"Standard_DomainError|Standard_ConstructionError", re.S),
+     "A dimension is zero/degenerate — every length, radius and extrude distance must be > 0. "
+     "Check computed values (e.g. `extrude(H)` with H=0, `box(0,...)`) before the call."),
+
+    (re.compile(r"Standard_NullObject", re.S),
+     "An operation ran on an EMPTY shape — a selector matched nothing or `.val()` was taken "
+     "from an empty Workplane. Verify the selection is non-empty before chaining the feature."),
+
+    (re.compile(r"More than one wire or face is required", re.S),
+     "`.loft()` needs BOTH profiles pending on the stack: sketch the base "
+     "(`.rect(w,h)`), offset a new plane (`.workplane(offset=L)`), sketch the tip, THEN `.loft()`."),  # C14
+
+    (re.compile(r"unexpected keyword argument|takes \d+ positional|missing \d+ required", re.S),
+     "Wrong method signature. Use the documented positional forms: `.hole(d)`, "
+     "`.cboreHole(d, cboreD, cboreDepth)`, `.cskHole(d, cskD, cskAngle)`, `.fillet(r)`."),
+
+    (re.compile(r"ZeroDivisionError", re.S),
+     "A derived dimension divided by zero — guard computed values (counts, spacings, ratios) "
+     "so denominators are never 0."),
+    # ---- end catalog additions ----
+
     (re.compile(r"\.fillet\(|BRep_API.*command not done|radius.*too large", re.S),
      "Fillet/chamfer radius must be smaller than the adjacent edge/face; select the "
-     "edge set explicitly, e.g. vertical edges with `.edges('|Z').fillet(r)`."),
+     "edge set explicitly, e.g. vertical edges with `.edges('|Z').fillet(r)`."),  # C3
 
     (re.compile(r"empty|nothing selected|StopIteration|index out of range|list index", re.S),
      "A selector resolved to ZERO entities. Check the selector string — vertical "

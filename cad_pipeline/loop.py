@@ -79,7 +79,7 @@ def _feedback(res: dict, spec: Spec, repeated: bool = False, regressed: bool = F
     if res["status"] == "gate_fail":
         return "invalid geometry: " + ", ".join(res.get("failed", [])) + (" " + res.get("error", "") if res.get("error") else "")
     fails = [r for r in res["report"]["rows"] if not r["within_tol"]]
-    msg = "; ".join(_row_feedback(r, spec.tolerance) for r in fails)
+    msg = "; ".join(_row_feedback(r, spec) for r in fails)
     if regressed:
         msg = ("A PREVIOUS attempt built more of this part correctly — you rewrote it and broke "
                "working features. Make the MINIMUM change to fix only the issues below; keep "
@@ -87,20 +87,55 @@ def _feedback(res: dict, spec: Spec, repeated: bool = False, regressed: bool = F
     return msg
 
 
-def _row_feedback(r: dict, tol: float) -> str:
+def _dim_signature(exp: float, meas: float, spec: Spec) -> str:
+    """Recognize the classic ratio signatures of a dimensional miss (mistakes-catalog C6/C7/C8):
+    a delta that is exactly a frame shift (L/2, W/2 — wrong datum), a 2×/0.5× ratio
+    (radius/diameter confusion), or a 10×/25.4× ratio (unit mixup). Returns an extra hint
+    ('' when the miss has no recognizable signature). Non-leaking: names the *mistake class*,
+    not the target value."""
+    if not exp:
+        return ""
+    ratio = meas / exp
+    for k, why in ((2.0, "the value looks like a RADIUS passed where a DIAMETER belongs (or vice versa)"),
+                   (0.5, "the value looks like a RADIUS passed where a DIAMETER belongs (or vice versa)"),
+                   (10.0, "a 10× unit mixup (cm treated as mm?)"), (0.1, "a 10× unit mixup (mm treated as cm?)"),
+                   (25.4, "an inch→mm mixup"), (1 / 25.4, "a mm→inch mixup")):
+        if abs(ratio - k) <= 0.05 * k:
+            return f" — {why}"
+    # wrong datum: the miss equals half an envelope extent (measured-from-edge vs from-center)
+    delta = abs(meas - exp)
+    for dim in ("length", "width", "diameter"):
+        v = spec.envelope.get(dim)
+        if v and abs(delta - v / 2) <= max(0.5, 0.02 * v):
+            return (f" — the offset equals {dim}/2: the position was likely measured from an EDGE "
+                    f"instead of the part CENTER (origin is the part center)")
+    return ""
+
+
+def _row_feedback(r: dict, spec: Spec) -> str:
     """One verifier row → a typed, quantified, NON-leaking hint (§9 anti-leakage).
     We surface the *kind* and *magnitude* of the miss — never the target value/coords —
     so selector-binding failures (the resolve-twice IP) get actionable guidance instead
     of a misleading "feature not found"."""
+    tol = spec.tolerance
     name, cat, exp, meas = r["name"], r["category"], r["expected"], r["measured"]
     if cat == "missing_feature" or meas is None:
         return f"{name}: required feature not found in the geometry"
     if cat == "dimensional":
-        return f"{name}: measured {meas} vs expected {exp} (Δ {r['delta']}, tol ±{tol})"
+        extra = _dim_signature(exp, meas, spec) if isinstance(exp, (int, float)) and isinstance(meas, (int, float)) else ""
+        return f"{name}: measured {meas} vs expected {exp} (Δ {r['delta']}, tol ±{tol}){extra}"
     # selector-binding family — the feature exists but landed on the wrong entity/place
     if "position" in name:
+        extra = ""
+        if isinstance(meas, (int, float)):
+            for dim in ("length", "width", "diameter"):   # C6: off by exactly half an extent ⇒ wrong datum
+                v = spec.envelope.get(dim)
+                if v and abs(meas - v / 2) <= max(0.5, 0.02 * v):
+                    extra = (f" — the offset equals {dim}/2, so the position was measured from an EDGE "
+                             f"instead of the part CENTER")
+                    break
         return (f"{name}: feature is MISPLACED — {meas} mm from its intended location "
-                f"(tol ±{tol}); re-check which edge/datum the offset is measured from")
+                f"(tol ±{tol}); re-check which edge/datum the offset is measured from{extra}")
     if "binding" in name:
         return (f"{name}: selector resolved to {meas} edges/faces but the feature must land on "
                 f"exactly {exp} — wrong entity set, fix the selector not the dimension")
@@ -112,6 +147,7 @@ def _row_feedback(r: dict, tol: float) -> str:
 def run(spec: Spec, generator: Generator, max_attempts: int = 3, timeout: float = 60.0) -> dict:
     feedback: Optional[str] = None
     history: list[dict] = []
+    attempt_log: list[dict] = []  # per-attempt {attempt, code, res} — corpus.transcript_from_run consumes this
     seen_sigs: set[str] = set()   # exec-error signatures already encountered (repeat detection)
     best_pass = -1                # most verifier rows ever passed in one attempt (regression detection)
     best_report: Optional[dict] = None  # the most-complete valid report seen (for honest eval aggregation)
@@ -119,6 +155,7 @@ def run(spec: Spec, generator: Generator, max_attempts: int = 3, timeout: float 
     for attempt in range(1, max_attempts + 1):
         code = generator.generate(spec, feedback)
         res = run_code(code, spec, timeout=timeout)
+        attempt_log.append({"attempt": attempt, "code": code, "res": res})
         cat = _category(res)
 
         # motoko-repair rule 3: same error twice ⇒ the rewrite approach is wrong (stop re-guessing).
@@ -141,7 +178,7 @@ def run(spec: Spec, generator: Generator, max_attempts: int = 3, timeout: float 
                         "repeated_error": repeated, "regressed": regressed})
         if res["status"] == "ok" and res["report"]["passed"]:
             return {"passed": True, "attempt": attempt, "report": res["report"],
-                    "best_report": res["report"], "history": history}
+                    "best_report": res["report"], "history": history, "attempt_log": attempt_log}
         feedback = _feedback(res, spec, repeated=repeated, regressed=regressed)
 
     # escalated: build the kill-criterion flag from the last report (§9)
@@ -153,7 +190,8 @@ def run(spec: Spec, generator: Generator, max_attempts: int = 3, timeout: float 
                 kill = True
     return {
         "passed": False, "attempts": max_attempts, "category": "escalate",
-        "report": report, "best_report": best_report, "history": history, "last_feedback": feedback,
+        "report": report, "best_report": best_report, "history": history, "attempt_log": attempt_log,
+        "last_feedback": feedback,
         "kill_flag": kill,
         "kill_note": "post-retry dimensional error >1% — CadQuery is exact, so suspect a harness/prompt/verifier bug, not the tolerance" if kill else None,
     }
