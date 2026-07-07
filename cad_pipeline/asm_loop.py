@@ -61,6 +61,7 @@ _CATEGORY_FIX = {
     "integrity": "non-mated parts occupy the same space — derive their positions from ONE shared parameter (bigger radial radius, proper mate, smaller part); never nudge `at`",
     "structure": "the assembly tips or floats — widen the support footprint (bigger radial radius, legs that reach z=0) or move mass over the support polygon",
     "kinematic": "a joint is welded shut (remove the mate between its two sides), redundant, floating (add a joint/mate path), or its motion collides — clearance must hold over the WHOLE limits range, so enlarge the opening the moving part sweeps through or reduce limits",
+    "fit": "the joint's pin/bore clearance is not a running fit — a pin the same ⌀ as its bore is SEIZED; size the pin ⌀ = bore ⌀ − 0.2 mm (running band 0.1–0.8 mm diametral): derive one from the other, never set both independently",
     "blend": "the joint blend corrupted the solid — reduce fillet_joints (or set 0)",
 }
 
@@ -89,7 +90,7 @@ def _category(rep: dict) -> str:
     cats = {r["category"] for r in rep["rows"] if not r["within_tol"]}
     if any(not c["passed"] for c in rep.get("components", [])):
         cats.add("component")
-    for c in ("component", "validity", "disconnected", "kinematic", "integrity", "structure", "blend"):
+    for c in ("component", "validity", "disconnected", "kinematic", "fit", "integrity", "structure", "blend"):
         if c in cats:
             return c + "-fix"
     return "ok"

@@ -80,7 +80,9 @@ _CAPTION_SYS = (
     "detail. Output JSON {\"l0\":..,\"l1\":..,\"l2\":..,\"l3\":..}: l0 = one abstract phrase (no dims); "
     "l1 = a beginner's plain description (shape + features, no measurements); l2 = an intermediate "
     "description (geometry + rough sizes); l3 = an expert spec with precise RELATIVE dimensions. Describe "
-    "the SAME part; do not mention CadQuery or code."
+    "the SAME part; do not mention CadQuery or code. Feature counts are LOAD-BEARING: if the part has "
+    "NO holes/features, l1–l3 must SAY so ('a plain solid block, no holes'); otherwise l2/l3 state the "
+    "EXACT count of each feature ('exactly two through-holes') and never imply features the spec lacks."
 )
 
 
@@ -119,7 +121,7 @@ def _code_verified(spec: Spec) -> bool:
 
 def gen_spec(engine: Engine, category: str, attempts: int = 4,
              rejects: Optional[List[dict]] = None, hint: str = "",
-             must: Optional[set] = None) -> Optional[Spec]:
+             must: Optional[set] = None, max_feats: Optional[int] = None) -> Optional[Spec]:
     """Engine → a STRUCTURED spec for `category`, accepted only if it builds AND verifies to-spec.
 
     `hint` is a category-conditioned HARD requirement appended to the request ("shape MUST be
@@ -168,6 +170,12 @@ def gen_spec(engine: Engine, category: str, attempts: int = 4,
         if must and not must <= ({spec.shape} | {f.type for f in spec.features}):
             _reject("hint_miss", spec=spec, error=f"hinted capability {sorted(must)} not used")
             continue
+        if max_feats is not None and len(spec.features) > max_feats:
+            # batch-4 sparsity discipline: a "plain" category that grows features would feed the
+            # exact over-decoration bias (unexpected cylinders) this batch exists to unlearn
+            _reject("hint_miss", spec=spec,
+                    error=f"{len(spec.features)} features on a max_feats={max_feats} category")
+            continue
         try:
             rep = verify(build(spec), spec)        # the accept gate (deterministic, feature-level)
         except Exception as e:  # noqa: BLE001 — spec parses but won't build (infeasible geometry)
@@ -210,12 +218,12 @@ def _level(spec: Spec) -> str:
 
 def synth_sample(engine: Engine, category: str,
                  rejects: Optional[List[dict]] = None, hint: str = "",
-                 must: Optional[set] = None) -> Optional[dict]:
+                 must: Optional[set] = None, max_feats: Optional[int] = None) -> Optional[dict]:
     """One verified, captioned training sample — schema-validated (corpus.TrainingSample,
     the 04_schemas-derived contract) with the FULL verifier report embedded, or None if
     the gate/caption fails. Gate rejects stream into `rejects` as labeled negatives."""
     from .corpus import training_sample
-    spec = gen_spec(engine, category, rejects=rejects, hint=hint, must=must)
+    spec = gen_spec(engine, category, rejects=rejects, hint=hint, must=must, max_feats=max_feats)
     if spec is None:
         return None
     prompts = caption(engine, spec)
@@ -292,25 +300,60 @@ TAXONOMY_BATCH3 = {
 }
 
 
+# Batch-4 — feature-PRESENCE balance. The phase21 smoke's residual failure signature was
+# "unexpected cylinders": hole_pattern rode in 82% of batches 1–3, so the adapter learned
+# "parts have holes" as a prior and drills unrequested ones. This batch teaches absence:
+# plain parts (captioned as plain — see _CAPTION_SYS), exactly-one-feature parts, and a
+# var_fillet binding slice (bench C19, the other straggler). Entry: (weight, hint, must, max_feats).
+TAXONOMY_BATCH4 = {
+    "plain rectangular block or spacer (no features)":
+        (3, "features MUST be an empty list [] — a plain solid box, NO holes, NO cuts", {"box"}, 0),
+    "plain cylindrical rod, puck or disc (no features)":
+        (3, "shape MUST be 'cylinder'; features MUST be an empty list [] — NO bore, NO holes", {"cylinder"}, 0),
+    "plain turned body (profile only, no features)":
+        (2, "shape MUST be 'revolve' (profile of 4+ [r,z] points); features MUST be []", {"revolve"}, 0),
+    "plain tapered transition (no features)":
+        (2, "shape MUST be 'loft'; features MUST be an empty list []", {"loft"}, 0),
+    "plain bent tube (no features)":
+        (2, "shape MUST be 'sweep'; features MUST be an empty list []", {"sweep"}, 0),
+    "block with exactly one through-hole":
+        (2, "features MUST be exactly ONE through_hole and nothing else", {"box", "through_hole"}, 1),
+    "plate with a single pocket, no holes":
+        (2, "features MUST be exactly ONE pocket — NO holes of any kind", {"box", "pocket"}, 1),
+    "cylinder with a single center bore":
+        (2, "shape MUST be 'cylinder'; features MUST be exactly ONE through_hole", {"cylinder", "through_hole"}, 1),
+    "filleted block, no holes":
+        (2, "features MUST be exactly ONE fillet — NO holes", {"box", "fillet"}, 1),
+    "variable-radius blended bracket, no holes":
+        (3, "features MUST be exactly ONE var_fillet (edges 'all_vertical', distinct r1/r2) — NO holes",
+         {"box", "var_fillet"}, 1),
+    "var_fillet block with exactly two mounting holes":
+        (2, "features MUST be ONE var_fillet (edges 'all_vertical') + exactly TWO through_holes, "
+            "nothing else", {"box", "var_fillet", "through_hole"}, 3),
+}
+
+
 def run(engine: Engine, total: int, out_path: str, taxonomy: Optional[dict] = None) -> dict:
     """Drive the taxonomy (weighted) to `total` verified samples; stream to JSONL.
     Gate-rejected candidates stream to <out>.rejects.jsonl as verifier-labeled negatives.
-    `taxonomy` values are either weight ints (TAXONOMY) or (weight, hint, must) tuples
-    (TAXONOMY_BATCH3)."""
+    `taxonomy` values are weight ints (TAXONOMY), (weight, hint, must) tuples (TAXONOMY_BATCH3),
+    or (weight, hint, must, max_feats) tuples (TAXONOMY_BATCH4)."""
     tax = taxonomy if taxonomy is not None else TAXONOMY
-    entries = {c: (v if isinstance(v, tuple) else (v, "", None)) for c, v in tax.items()}
-    cats = [c for c, (w, _, _) in entries.items() for _ in range(w)]
+    entries = {c: ((*v, None) if isinstance(v, tuple) and len(v) == 3
+                   else v if isinstance(v, tuple) else (v, "", None, None))
+               for c, v in tax.items()}
+    cats = [c for c, (w, *_) in entries.items() for _ in range(w)]
     rej_path = (out_path[:-6] if out_path.endswith(".jsonl") else out_path) + ".rejects.jsonl"
     kept, attempted, n_rej, by_cat = 0, 0, 0, {}
     with open(out_path, "w") as fh, open(rej_path, "w") as rfh:
         i = 0
         while kept < total:
             category = cats[i % len(cats)]
-            _, hint, must = entries[category]
+            _, hint, must, max_feats = entries[category]
             i += 1
             attempted += 1
             rejects: list = []
-            s = synth_sample(engine, category, rejects=rejects, hint=hint, must=must)
+            s = synth_sample(engine, category, rejects=rejects, hint=hint, must=must, max_feats=max_feats)
             for r in rejects:
                 rfh.write(json.dumps(r) + "\n")
             if rejects:
@@ -334,10 +377,10 @@ def main() -> int:
     ap.add_argument("--out", default="/tmp/corpus.jsonl")
     ap.add_argument("--model", default="qwen3.6-27b")
     ap.add_argument("--base-url", default="http://localhost:8002/v1")
-    ap.add_argument("--taxonomy", choices=["default", "batch3"], default="default")
+    ap.add_argument("--taxonomy", choices=["default", "batch3", "batch4"], default="default")
     a = ap.parse_args()
     eng = Engine(base_url=a.base_url, model=a.model)
-    tax = TAXONOMY_BATCH3 if a.taxonomy == "batch3" else None
+    tax = {"batch3": TAXONOMY_BATCH3, "batch4": TAXONOMY_BATCH4}.get(a.taxonomy)
     print(f"Synthesis — engine={a.model} taxonomy={a.taxonomy} target={a.n} → {a.out}\n")
     summary = run(eng, a.n, a.out, taxonomy=tax)
     print("\n" + json.dumps(summary, indent=2))

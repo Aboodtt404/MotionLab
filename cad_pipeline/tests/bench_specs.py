@@ -91,3 +91,11 @@ EVAL_BENCH = [
          envelope={"length": 60, "width": 60, "height": 30},
          features=[{"type": "var_fillet", "r1": 2, "r2": 6, "edges": "all_vertical"}], tolerance=0.1),
 ]
+
+
+# Benchmark difficulty levels (02_benchmark §C column 2; weights L1=1…L4=4 per the scoring
+# spec: capability_score = 100·Σ(weight·passed)/Σ(weight), computed at pass@1 and pass@3).
+BENCH_LEVELS = {"C01": 1, "C02": 1, "C03": 1,
+                "C06": 2, "C07": 2, "C08": 2, "C09": 2, "C10": 2,
+                "C11": 3, "C12": 3, "C13": 3, "C14": 3,
+                "C17": 4, "C19": 4}

@@ -122,16 +122,23 @@ def generate_multiview(ref_image, out_glb: str, *, text: str = "", seed: int = 4
 
 
 def inspect_glb(glb_path: str) -> dict:
-    """Quick structural read of a GLB (no GPU): faces/verts, watertight, which PBR maps are present."""
+    """Quick structural read of a GLB (no GPU): faces/verts, watertight, which PBR maps are present,
+    plus the mistake-catalog quality gate (glb_gate: M/W rows with repair prescriptions)."""
     import trimesh
     s = trimesh.load(glb_path)
     g = next(iter(s.geometry.values())) if getattr(s, "geometry", None) else s
     mat = getattr(getattr(g, "visual", None), "material", None)
     pbr = [a for a in ("baseColorTexture", "metallicRoughnessTexture", "normalTexture", "emissiveTexture")
            if getattr(mat, a, None) is not None] if mat is not None else []
-    return {"faces": int(len(g.faces)), "verts": int(len(g.vertices)),
-            "watertight": bool(g.is_watertight), "pbr": pbr,
-            "size_mb": round(os.path.getsize(glb_path) / 1e6, 1)}
+    out = {"faces": int(len(g.faces)), "verts": int(len(g.vertices)),
+           "watertight": bool(g.is_watertight), "pbr": pbr,
+           "size_mb": round(os.path.getsize(glb_path) / 1e6, 1)}
+    try:
+        from .glb_gate import validate_glb
+        out["gate"] = validate_glb(glb_path)     # additive; never blocks a finished generation
+    except Exception as e:  # noqa: BLE001 — a gate bug must not take down the service
+        out["gate"] = {"passed": None, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+    return out
 
 
 def main() -> int:

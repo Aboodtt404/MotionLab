@@ -79,8 +79,15 @@ def _first_valid_attempt(history: list[dict]) -> int | None:
     return None
 
 
-def evaluate(specs: list, max_attempts: int = 3) -> dict:
+def evaluate(specs: list, max_attempts: int = 3, transcripts_out: str | None = None) -> dict:
+    """`transcripts_out`: append every episode as a schema-valid RepairTranscript JSONL —
+    eval runs double as repair-pair harvest (03_training_recipe §3c: repair pairs at ~15% of
+    the SFT mixture teach 'minimum-change correction from typed feedback', the highest-value
+    skill). Costs nothing: the loop already records attempt_log."""
     gen = VLLMGenerator()
+    gen_meta = {"model": gen.model, "base_url": gen.base_url, "rag": gen.rag,
+                "loop": "loop.run", "max_attempts": max_attempts}
+    tfh = open(transcripts_out, "a") if transcripts_out else None
     results = []
     feature_pass = Counter()   # feature name → # specs where its BEST build was within tolerance
     feature_seen = Counter()   # feature name → # specs where it was checked
@@ -89,6 +96,10 @@ def evaluate(specs: list, max_attempts: int = 3) -> dict:
 
     for spec in specs:
         out = run(spec, gen, max_attempts=max_attempts)
+        if tfh is not None and out.get("attempt_log"):
+            from ..corpus import transcript_from_run
+            tfh.write(transcript_from_run(spec, out, gen_meta).model_dump_json() + "\n")
+            tfh.flush()
         # aggregate the BEST valid build per spec, not the final attempt — else a spec that
         # reached valid-but-wrong then regressed to an exec error contributes no feature data,
         # hiding real failures (e.g. the bracket's wrong hole position).
@@ -114,10 +125,25 @@ def evaluate(specs: list, max_attempts: int = 3) -> dict:
             "final_fail_rows": [r["name"] for r in (rep["rows"] if rep else []) if not r["within_tol"]],
         })
 
+    if tfh is not None:
+        tfh.close()
     n = len(specs)
+    # capability_score (02_benchmark §scoring): 100·Σ(weight·passed)/Σ(weight), weights
+    # L1=1…L4=4, at pass@1 (passed on the first attempt) and pass@N (this run's budget).
+    # Computed over the SLICE actually run — comparable run-to-run on the same set; the
+    # /263 full-benchmark score and capability bands need all 100 tasks (8 categories).
+    from .bench_specs import BENCH_LEVELS
+    weights = [BENCH_LEVELS.get(s.object.split()[0], 2) for s in specs]
+    wtot = sum(weights)
+    w_p1 = sum(w for w, r in zip(weights, results)
+               if r["passed"] and r["attempts_used"] == 1)
+    w_pn = sum(w for w, r in zip(weights, results) if r["passed"])
     return {
         "max_attempts": max_attempts,
         "n_specs": n,
+        "capability_score": {f"pass@1": round(100 * w_p1 / wtot, 1),
+                             f"pass@{max_attempts}": round(100 * w_pn / wtot, 1),
+                             "weight_total": wtot},
         "pass_rate": round(sum(r["passed"] for r in results) / n, 3),
         "ever_valid_rate": round(sum(r["ever_valid"] for r in results) / n, 3),
         "total_exec_errors": exec_attempts,
@@ -152,10 +178,11 @@ def main() -> int:
     args = [a for a in sys.argv[1:]]
     set_name = next((a for a in args if a in SETS), "golden")
     max_attempts = next((int(a) for a in args if a.isdigit()), 3)
+    tout = next((a.split("=", 1)[1] for a in args if a.startswith("--transcripts=")), None)
     specs = SETS[set_name]
     print(f"Eval set='{set_name}' — {len(specs)} specs, max_attempts={max_attempts}, model=qwen3.6-27b (live)\n")
     preflight(specs)
-    summary = evaluate(specs, max_attempts)
+    summary = evaluate(specs, max_attempts, transcripts_out=tout)
 
     print("=" * 66)
     for r in summary["results"]:

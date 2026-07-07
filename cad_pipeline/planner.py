@@ -15,6 +15,7 @@ import re
 import urllib.request
 
 from .assembly import Assembly, AsmPatch, apply_patch, repair_connectivity, solve_layout
+from .partlib import _STANDARDS_LINE
 
 # Short + directive (reliable under structured output), now asking for FUNCTIONAL detail.
 _SYSTEM = (
@@ -86,7 +87,8 @@ _SYSTEM = (
     "Produce ONE component per part the request implies (e.g. '4 arms' ⇒ 4 arms, '4 legs' ⇒ 4 legs) and NEVER "
     "an empty list; infer reasonable sizes for anything unstated. SCALE the part count to the object — a stool "
     "is ~5 parts (seat + 4 legs), a hero ship is 8–14; don't pad simple objects or under-build complex ones. "
-    "Give every part a `role` and connect ALL of them with `mates` (never coordinates); set fuse=true."
+    "Give every part a `role` and connect ALL of them with `mates` (never coordinates); set fuse=true.\n"
+    + _STANDARDS_LINE
 )
 
 

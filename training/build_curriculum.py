@@ -13,12 +13,16 @@ turns them into train_sft.py --mode instruct pairs:
      finding), same code under several phrasings = free augmentation.
   3. spec→code pairs (the recipe's mixed-task row): prompt = the spec JSON itself — the exact
      input the live loop sends, so the adapter learns the production task too.
-  (Repair pairs are the recipe's third task at ~15% — not yet banked for parts; add when the
-   part loop's attempt_log is harvested into RepairTranscripts.)
+  4. repair pairs (recipe §3c, capped at ~15% of the mixture) from RepairTranscript JSONLs
+     (harvest with `eval_baseline <set> --transcripts=FILE`): prompt = spec JSON + the loop's
+     exact failure preamble + the typed feedback the generator actually saw; target = the first
+     LATER attempt of that episode that fully passed (the model's own verified fix), else the
+     golden emit_code (always verified). Matches loop.VLLMGenerator.generate() byte-for-byte.
 
 Run:
   cad_pipeline/.venv/bin/python training/build_curriculum.py \
       --corpus corpus_out/batch1_clean.jsonl corpus_out/batch2_w*.jsonl corpus_out/batch3_w*.jsonl \
+      --repair corpus_out/repair_transcripts*.jsonl \
       --out /workspace/.hf_home/cad_corpus/phase21_curriculum.jsonl
 """
 from __future__ import annotations
@@ -52,9 +56,47 @@ def _holdout_sigs() -> set:
     return sigs
 
 
+def _repair_pairs(paths: list) -> list:
+    """RepairTranscript JSONLs → (spec+feedback → verified code) pairs, mirroring the exact
+    user message loop.VLLMGenerator.generate() builds on a retry. Assembly transcripts
+    (spec.kind == assembly_brief) are a different task and are skipped here."""
+    from cad_pipeline.builder import emit_code
+    from cad_pipeline.spec import Spec
+    pairs = []
+    for p in paths:
+        for line in open(p):
+            t = json.loads(line)
+            if (t.get("spec") or {}).get("kind") == "assembly_brief":
+                continue
+            spec = Spec(**t["spec"])
+            spec_json = spec.model_dump_json(indent=2)
+            attempts = t.get("attempts", [])
+            for i, a in enumerate(attempts[:-1]):
+                fb = a.get("feedback_to_next")
+                if not fb:
+                    continue
+                target = next((b["code"] for b in attempts[i + 1:]
+                               if (b.get("verifier_report") or {}).get("passed") and b.get("code")),
+                              None)
+                src = "repair" if target else "repair-golden"
+                target = target or emit_code(spec)
+                prompt = (f"Build this part as CadQuery, assigning the solid to `result`:\n{spec_json}"
+                          f"\n\nThe previous attempt failed verification — fix ONLY these issues, "
+                          f"keep the rest:\n{fb}")
+                pairs.append({"prompt": prompt, "code": target, "source": src,
+                              "level": "repair", "category": "repair", "prompt_level": "repair"})
+    return pairs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", nargs="+", required=True, help="TrainingSample JSONL files/globs")
+    ap.add_argument("--repair", nargs="*", default=[], help="RepairTranscript JSONL files/globs")
+    ap.add_argument("--repair-frac", type=float, default=0.15, help="max repair share of the mixture")
+    ap.add_argument("--general", default=None,
+                    help="general-code {prompt,code} JSONL — recipe §4: keep 10–20%% general code "
+                         "in every SFT mixture to avoid catastrophic forgetting")
+    ap.add_argument("--general-frac", type=float, default=0.15, help="general-code share of the mixture")
     ap.add_argument("--out", required=True)
     ap.add_argument("--levels", default="l1,l2,l3")
     ap.add_argument("--spec-pairs", action="store_true", default=True,
@@ -94,6 +136,21 @@ def main() -> int:
                           "code": r["code"], "source": "curriculum-spec",
                           "level": r["tags"]["level"], "category": r["category"],
                           "prompt_level": "spec"})
+
+    rpaths = sorted({p for pat in a.repair for p in glob.glob(pat)})
+    repair = _repair_pairs(rpaths) if rpaths else []
+    rng.shuffle(repair)
+    cap = int(len(pairs) * a.repair_frac / (1 - a.repair_frac))   # repair ≤ repair_frac of TOTAL
+    if len(repair) > cap:
+        repair = repair[:cap]
+    pairs += repair
+
+    general = []
+    if a.general:
+        pool = [json.loads(line) for line in open(a.general)]
+        rng.shuffle(pool)
+        general = pool[:int(len(pairs) * a.general_frac / (1 - a.general_frac))]
+        pairs += general
     rng.shuffle(pairs)
 
     n_val = max(1, int(len(pairs) * a.val_frac))
@@ -111,8 +168,9 @@ def main() -> int:
         for c in r["tags"]["capabilities"]:
             caps[c] += 1
     print(json.dumps({
-        "files": paths, "samples_in": len(recs), "holdout_dropped": n_held,
-        "samples_used": len(kept), "train_pairs": len(train), "val_pairs": len(val),
+        "files": paths, "repair_files": rpaths, "samples_in": len(recs), "holdout_dropped": n_held,
+        "samples_used": len(kept), "repair_pairs": len(repair), "general_pairs": len(general),
+        "train_pairs": len(train), "val_pairs": len(val),
         "by_prompt_level": dict(Counter(p["prompt_level"] for p in pairs)),
         "capability_coverage": dict(caps.most_common()),
         "out": a.out, "val_out": val_out,

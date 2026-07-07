@@ -4,9 +4,9 @@ verifier rows (DOF accounting, pose sweep, interference, statics, frame hierarch
 Source: fable_run/out/02_benchmark.md §A (Assemblies, mates & joints, A01–A13). Transcribed
 here: A03-lite (hinge: 1 revolute DOF + swept clearance), A09 (PCB standoffs via parent
 frames), A10-lite (2R arm: rest-pose reach + DOF bookkeeping), + joint auto-placement and
-the arc-meridian continuity fixtures. Not transcribable in v1 (documented gaps): A05/A13
-(gear teeth not in the shape vocabulary), A07 (prismatic joint), A03's pin-fit rows (A6 fit
-verification), full A10 sweep (chained-joint posing — v1 poses each joint independently).
+the arc-meridian continuity fixtures, and A6 (pin/bore running-fit rows — joint_fit_a6).
+Not transcribable in v1 (documented gaps): A05/A13 (gear teeth not in the shape vocabulary),
+A07 (prismatic joint), full A10 sweep (chained-joint posing — v1 poses each joint independently).
 
 Run:  cad_pipeline/.venv/bin/python -m cad_pipeline.tests.test_kinematic
 """
@@ -176,12 +176,42 @@ def joints_patch() -> None:
     check("patch without joints leaves them untouched", len(out2.joints) == 1)
 
 
+def joint_fit_a6() -> None:
+    """Mistakes catalog A6: pin ⌀ == bore ⌀ models a seized joint. The fit row measures the
+    diametral clearance at the revolute's concentric pin/bore interface (manual §3.2 running
+    band 0.1–0.8 mm) — seized and sloppy both fail, a proper running fit passes."""
+    def hinge(bore_d: float) -> Assembly:
+        return Assembly(object="pin hinge", fuse=True, components=[
+            Component(name="bracket", role="base",
+                      part=Spec(object="bracket", shape="box",
+                                envelope={"length": 40, "width": 30, "height": 20},
+                                features=[{"type": "through_hole", "diameter": bore_d, "axis": "z"}]),
+                      at=(0, 0, 0)),
+            Component(name="pin_arm", role="arm",
+                      part=Spec(object="pin", shape="cylinder",
+                                envelope={"diameter": 6.0, "height": 40}, features=[]),
+                      at=(0, 0, -10)),
+        ], joints=[Joint(a="pin_arm", b="bracket", axis="z")])
+
+    def fit_row(bore_d: float):
+        rep = verify_assembly(hinge(bore_d))
+        return next((r for r in rep["rows"] if "joint fit" in r["name"]), None)
+
+    seized = fit_row(6.0)
+    check("seized fit (bore == pin) caught", seized is not None and not seized["within_tol"]
+          and seized["category"] == "fit" and seized["measured"] == 0.0)
+    running = fit_row(6.2)
+    check("running fit 0.2 mm passes", running is not None and running["within_tol"])
+    sloppy = fit_row(7.5)
+    check("sloppy fit 1.5 mm caught", sloppy is not None and not sloppy["within_tol"])
+
+
 def main() -> int:
     print("=" * 60)
     print("KINEMATIC — benchmark §A on the DOF/sweep/hierarchy rows")
     print("=" * 60)
     for fn in (hinge_golden, hinge_smash, hinge_welded, joint_autoplacement,
-               pcb_standoffs, arm_2r, arc_meridians, joints_patch):
+               pcb_standoffs, arm_2r, arc_meridians, joints_patch, joint_fit_a6):
         print(f"\n■ {fn.__name__}")
         fn()
     print("\n" + "=" * 60)

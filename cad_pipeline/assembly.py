@@ -668,6 +668,53 @@ def _joint_axis_point(joint: Joint, ga: cq.Solid, gb: cq.Solid) -> Tuple[float, 
     return ((p1.X() + p2.X()) / 2, (p1.Y() + p2.Y()) / 2, (p1.Z() + p2.Z()) / 2)
 
 
+def _axis_cyl_faces(solid, axis_dir: Tuple[float, float, float],
+                    ang_tol: float = 0.996) -> List[Tuple[float, bool, Tuple[float, float, float]]]:
+    """Face census for a joint axis direction (manual §3.2/[BREP]): every cylindrical face of
+    `solid` PARALLEL to the joint axis → (radius, convex?, axis_location). Convex (normal points
+    AWAY from its own axis) = a pin; concave = a bore. Whether a pin/bore pair actually forms a
+    fit interface is decided later by MUTUAL concentricity — not by distance to the derived joint
+    point, which for a pin already inside a bore sits between the SURFACES, off the true axis."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Cylinder
+    from OCP.TopAbs import TopAbs_Orientation
+    from OCP.gp import gp_Pnt, gp_Vec
+    out: List[Tuple[float, bool, Tuple[float, float, float]]] = []
+    for f in solid.Faces():
+        try:
+            ad = BRepAdaptor_Surface(f.wrapped)
+            if ad.GetType() != GeomAbs_Cylinder:
+                continue
+            cyl = ad.Cylinder()
+            d = cyl.Axis().Direction()
+            if abs(d.X() * axis_dir[0] + d.Y() * axis_dir[1] + d.Z() * axis_dir[2]) < ang_tol:
+                continue
+            loc = cyl.Axis().Location()
+            cax = (loc.X(), loc.Y(), loc.Z())
+            # Face.Center() of a cylindrical face lies ON the axis (projection there is
+            # ambiguous → normalAt throws). Sample the surface at mid-parameters instead and
+            # take the D1 cross-product normal, flipped when the face is REVERSED.
+            u = 0.5 * (ad.FirstUParameter() + ad.LastUParameter())
+            v = 0.5 * (ad.FirstVParameter() + ad.LastVParameter())
+            p, du, dv = gp_Pnt(), gp_Vec(), gp_Vec()
+            ad.D1(u, v, p, du, dv)
+            n = du.Crossed(dv)
+            if f.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+                n.Reverse()
+            axd = (d.X(), d.Y(), d.Z())
+            pt = (p.X(), p.Y(), p.Z())
+            axp = sum((pt[i] - cax[i]) * axd[i] for i in range(3))
+            radial = [pt[i] - (cax[i] + axp * axd[i]) for i in range(3)]
+            rl = sum(x * x for x in radial) ** 0.5
+            if rl < 1e-9:
+                continue
+            convex = (n.X() * radial[0] + n.Y() * radial[1] + n.Z() * radial[2]) > 0
+            out.append((cyl.Radius(), convex, cax))
+        except Exception:  # noqa: BLE001 — a face the census can't read is simply not a candidate
+            continue
+    return out
+
+
 def _rotate_about(solid: cq.Solid, at: Tuple[float, float, float], axis: str, angle: float) -> cq.Solid:
     """Rigid rotation about the axis LINE through `at` along `axis` — the joint's 1 DOF."""
     if abs(angle) < 1e-12:
@@ -927,6 +974,41 @@ def verify_assembly(asm: Assembly) -> dict:
                      + ("" if sweep_ok else f" [{sweep_detail}]"),
                      "expected": "≤ 1 mm³", "measured": round(sweep_worst, 2), "within_tol": sweep_ok,
                      "category": "ok" if sweep_ok else "kinematic"})
+        # A6 — running-fit clearance at each revolute interface (mistakes catalog A6: pin ⌀ ==
+        # bore ⌀ models a SEIZED joint the DOF row can't see). Cylindrical-face census on both
+        # rigid groups at the joint axis: pin (convex) vs bore (concave) → diametral clearance
+        # must be a running fit. Band from manual §3.2: 0.1–0.3 mm machined, ~0.5 FDM per side ⇒
+        # accept 0.1–0.8 mm diametral. Joints with no cylindrical pin/bore interface (abstract
+        # hinge geometry) have nothing to measure and are skipped.
+        for j in asm.joints:
+            ga, gb = gid_of.get(j.a), gid_of.get(j.b)
+            if ga is None or gb is None or ga == gb or ga not in groups or gb not in groups:
+                continue
+            jdir = _AXIS_DIR[j.axis]
+            fa = _axis_cyl_faces(groups[ga], jdir)
+            fb = _axis_cyl_faces(groups[gb], jdir)
+            best = None
+            for pins, bores in ((fa, fb), (fb, fa)):
+                for pr, p_convex, ploc in pins:
+                    if not p_convex:
+                        continue
+                    for br, b_convex, bloc in bores:
+                        if b_convex:
+                            continue
+                        # a fit interface = the two cylinders are CONCENTRIC (axes coincide)
+                        w = tuple(bloc[i] - ploc[i] for i in range(3))
+                        along = sum(a * b for a, b in zip(w, jdir))
+                        if sum((w[i] - along * jdir[i]) ** 2 for i in range(3)) ** 0.5 > 0.5:
+                            continue
+                        dia = 2.0 * (br - pr)
+                        if -0.5 < dia < 3.0 and (best is None or abs(dia - 0.3) < abs(best - 0.3)):
+                            best = dia   # the concentric pair closest to a nominal running fit
+            if best is None:
+                continue
+            fit_ok = 0.1 <= best <= 0.8
+            rows.append({"name": f"assembly · joint fit ({j.a}↔{j.b}, ⌀ clearance)",
+                         "expected": "0.1–0.8 mm", "measured": round(best, 3), "within_tol": fit_ok,
+                         "category": "ok" if fit_ok else "fit"})
     # Joint blending is informational — surface the count so a render's "smoothed joints" is
     # auditable. It FAILS only if blending corrupted the solid (no seams to blend, e.g. a single
     # part or parts that merely abut, is fine — n_blended=0 with a still-valid solid passes).
