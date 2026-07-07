@@ -332,7 +332,9 @@ def build(spec: Spec) -> cq.Workplane:
         mk = BRepFilletAPI_MakeFillet(r.val().wrapped)
         for e in r.edges(CQ_EDGE.get(vf.edges, "|Z")).vals():
             mk.Add(vf.r1, vf.r2, e.wrapped)
-        r = cq.Workplane(obj=cq.Shape(mk.Shape()))
+        # Shape.cast (NOT Shape(...)): the generic wrapper isn't a Solid, so every later cut
+        # (holes/counterbores) dies with "Cannot find a solid on the stack".
+        r = cq.Workplane(obj=cq.Shape.cast(mk.Shape()))
     # shell (box): hollow to a thin wall, optionally leaving one face open. Before pockets/holes so
     # those cut through the finished wall.
     sh = next((f for f in spec.features if f.type == "shell"), None)
@@ -523,7 +525,7 @@ def emit_code(spec: Spec) -> str:
         L.insert(0, "from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet")
         L.append(f'_mk = BRepFilletAPI_MakeFillet(result.val().wrapped)')
         L.append(f'for _e in result.edges("{CQ_EDGE.get(_vf.edges, "|Z")}").vals(): _mk.Add({_vf.r1}, {_vf.r2}, _e.wrapped)')
-        L.append("result = cq.Workplane(obj=cq.Shape(_mk.Shape()))")
+        L.append("result = cq.Workplane(obj=cq.Shape.cast(_mk.Shape()))")
     _sh = next((f for f in spec.features if f.type == "shell"), None)
     if _sh is not None and spec.shape == "box":
         if _sh.open_face == "none":

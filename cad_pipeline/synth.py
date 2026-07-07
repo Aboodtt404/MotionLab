@@ -68,7 +68,8 @@ _SPEC_SYS = (
     "instead (envelope {} or {angle}) and may add `profile_arcs` (sagitta per segment; 0=straight, "
     "negative bows OUTWARD on an upward run — domes/barrels/flares). "
     "HARD FEATURE-COMPATIBILITY RULES (violations are rejected): fillet, chamfer, draft, shell, "
-    "var_fillet and mirror go on BOX parts ONLY — never on cylinder/loft/revolve/sweep. pocket, "
+    "var_fillet and mirror go on BOX parts ONLY — never on cylinder/loft/revolve/sweep. draft "
+    "NEVER combines with fillet/chamfer/var_fillet (tapered walls have no vertical edges). pocket, "
     "counterbore, countersink and internal thread need a FLAT TOP: box or cylinder only. "
     "through_hole and hole_pattern work on any shape. A cylinder/revolve/loft/sweep part gets its "
     "character from its PROFILE (steps, tapers, arcs) and holes — not from box features."
@@ -117,8 +118,12 @@ def _code_verified(spec: Spec) -> bool:
 
 
 def gen_spec(engine: Engine, category: str, attempts: int = 4,
-             rejects: Optional[List[dict]] = None) -> Optional[Spec]:
+             rejects: Optional[List[dict]] = None, hint: str = "",
+             must: Optional[set] = None) -> Optional[Spec]:
     """Engine → a STRUCTURED spec for `category`, accepted only if it builds AND verifies to-spec.
+
+    `hint` is a category-conditioned HARD requirement appended to the request ("shape MUST be
+    'loft'...") — how batch-3 forces the starved curriculum families; the gate still decides.
 
     When `rejects` is given, every GATE-REJECTED candidate is appended to it as a verifier-labeled
     NEGATIVE (03_training_recipe: rejected examples are training data too — DPO/GRPO contrast
@@ -144,16 +149,24 @@ def gen_spec(engine: Engine, category: str, attempts: int = 4,
             "failing_rows": rows or [],
         })
 
+    user = f"category: {category}" + (f"\nHARD REQUIREMENT (non-negotiable): {hint}" if hint else "")
     for k in range(attempts):
         raw = ""
         try:
-            raw = engine._chat(_SPEC_SYS, f"category: {category}", schema=schema, temperature=0.5 + 0.15 * k)
+            raw = engine._chat(_SPEC_SYS, user, schema=schema, temperature=0.5 + 0.15 * k)
             spec = Spec(**json.loads(raw))
         except Exception as e:  # noqa: BLE001 — unparseable candidate
             _reject("parse", raw=raw, error=f"{type(e).__name__}: {str(e)[:200]}")
             continue
+        conflicts = feature_shape_conflicts(spec)
+        if conflicts:
+            _reject("shape_conflict", spec=spec, error=f"unrealizable on shape={spec.shape}: {conflicts}")
+            continue
         if not _spec_complete(spec):
             _reject("incomplete", spec=spec, error=f"missing structural inputs for shape={spec.shape}")
+            continue
+        if must and not must <= ({spec.shape} | {f.type for f in spec.features}):
+            _reject("hint_miss", spec=spec, error=f"hinted capability {sorted(must)} not used")
             continue
         try:
             rep = verify(build(spec), spec)        # the accept gate (deterministic, feature-level)
@@ -196,12 +209,13 @@ def _level(spec: Spec) -> str:
 
 
 def synth_sample(engine: Engine, category: str,
-                 rejects: Optional[List[dict]] = None) -> Optional[dict]:
+                 rejects: Optional[List[dict]] = None, hint: str = "",
+                 must: Optional[set] = None) -> Optional[dict]:
     """One verified, captioned training sample — schema-validated (corpus.TrainingSample,
     the 04_schemas-derived contract) with the FULL verifier report embedded, or None if
     the gate/caption fails. Gate rejects stream into `rejects` as labeled negatives."""
     from .corpus import training_sample
-    spec = gen_spec(engine, category, rejects=rejects)
+    spec = gen_spec(engine, category, rejects=rejects, hint=hint, must=must)
     if spec is None:
         return None
     prompts = caption(engine, spec)
@@ -239,20 +253,64 @@ TAXONOMY = {
 }
 
 
-def run(engine: Engine, total: int, out_path: str) -> dict:
+# Batch-3 curriculum taxonomy — targets the starved no-RAG failure families measured across
+# batch1+2 (170 keeps: loft 2, sweep 1, var_fillet 0, countersink 3, draft 8, chamfer 9).
+# Each entry: weight, category-conditioned HARD hint, and the capability set the sample MUST
+# actually use (checked post-parse — a hinted category that drifts back to plain box is a
+# "hint_miss" negative, not a keep). Bench curriculum: revolve/loft/sweep/shell/csk/draft/var_fillet.
+TAXONOMY_BATCH3 = {
+    "round-to-rect adapter or transition duct":
+        (4, "shape MUST be 'loft' (envelope length,width,height + width_top/height_top or diameter_top); "
+            "features ONLY through_hole/hole_pattern or none — NO fillet/chamfer/shell/pocket", {"loft"}),
+    "tapered pylon, foot or pedestal (loft)":
+        (3, "shape MUST be 'loft'; features ONLY through_hole/hole_pattern or none", {"loft"}),
+    "coolant line, hydraulic pipe or conduit":
+        (4, "shape MUST be 'sweep' (`path` of 3+ [x,y,z] waypoints with bends + envelope.diameter); "
+            "features ONLY through_hole or none — NO fillet/chamfer/shell/pocket", {"sweep"}),
+    "bent tube handle or roll bar":
+        (3, "shape MUST be 'sweep'; features ONLY through_hole or none", {"sweep"}),
+    "injection-molded housing with draft":
+        (4, "shape MUST be 'box' and features MUST include 'draft'; NO fillet/chamfer/var_fillet "
+            "(tapered walls) — combine with holes/pocket instead", {"box", "draft"}),
+    "draughted thin-wall enclosure":
+        (3, "shape MUST be 'box', features MUST include 'draft' AND 'shell'; "
+            "NO fillet/chamfer/var_fillet", {"box", "draft", "shell"}),
+    "bracket with variable-radius edge blend":
+        (4, "shape MUST be 'box' and features MUST include 'var_fillet'", {"box", "var_fillet"}),
+    "console or cowling panel with graded blend":
+        (3, "shape MUST be 'box', features MUST include 'var_fillet'", {"box", "var_fillet"}),
+    "countersunk mounting or cover plate":
+        (3, "features MUST include 'countersink' (flat-head screws)", {"countersink"}),
+    "chamfered spacer or wear plate":
+        (2, "shape MUST be 'box', features MUST include 'chamfer'", {"box", "chamfer"}),
+    "stepped turned shaft, hub or bushing":
+        (3, "shape MUST be 'revolve' (`profile` of 4+ [radius,z] points with steps); "
+            "features ONLY through_hole/hole_pattern or none", {"revolve"}),
+    "domed cap, barrel body or flared nozzle":
+        (3, "shape MUST be 'revolve' and MUST use profile_arcs (curved meridian); "
+            "features ONLY through_hole or none", {"revolve"}),
+}
+
+
+def run(engine: Engine, total: int, out_path: str, taxonomy: Optional[dict] = None) -> dict:
     """Drive the taxonomy (weighted) to `total` verified samples; stream to JSONL.
-    Gate-rejected candidates stream to <out>.rejects.jsonl as verifier-labeled negatives."""
-    cats = [c for c, w in TAXONOMY.items() for _ in range(w)]
+    Gate-rejected candidates stream to <out>.rejects.jsonl as verifier-labeled negatives.
+    `taxonomy` values are either weight ints (TAXONOMY) or (weight, hint, must) tuples
+    (TAXONOMY_BATCH3)."""
+    tax = taxonomy if taxonomy is not None else TAXONOMY
+    entries = {c: (v if isinstance(v, tuple) else (v, "", None)) for c, v in tax.items()}
+    cats = [c for c, (w, _, _) in entries.items() for _ in range(w)]
     rej_path = (out_path[:-6] if out_path.endswith(".jsonl") else out_path) + ".rejects.jsonl"
     kept, attempted, n_rej, by_cat = 0, 0, 0, {}
     with open(out_path, "w") as fh, open(rej_path, "w") as rfh:
         i = 0
         while kept < total:
             category = cats[i % len(cats)]
+            _, hint, must = entries[category]
             i += 1
             attempted += 1
             rejects: list = []
-            s = synth_sample(engine, category, rejects=rejects)
+            s = synth_sample(engine, category, rejects=rejects, hint=hint, must=must)
             for r in rejects:
                 rfh.write(json.dumps(r) + "\n")
             if rejects:
@@ -276,10 +334,12 @@ def main() -> int:
     ap.add_argument("--out", default="/tmp/corpus.jsonl")
     ap.add_argument("--model", default="qwen3.6-27b")
     ap.add_argument("--base-url", default="http://localhost:8002/v1")
+    ap.add_argument("--taxonomy", choices=["default", "batch3"], default="default")
     a = ap.parse_args()
     eng = Engine(base_url=a.base_url, model=a.model)
-    print(f"Synthesis — engine={a.model} target={a.n} → {a.out}\n")
-    summary = run(eng, a.n, a.out)
+    tax = TAXONOMY_BATCH3 if a.taxonomy == "batch3" else None
+    print(f"Synthesis — engine={a.model} taxonomy={a.taxonomy} target={a.n} → {a.out}\n")
+    summary = run(eng, a.n, a.out, taxonomy=tax)
     print("\n" + json.dumps(summary, indent=2))
     return 0
 

@@ -733,7 +733,10 @@ def verify_assembly(asm: Assembly) -> dict:
             wp = build(c.part)
             rep = verify(wp, c.part)
             comps.append({"name": c.name, "passed": rep.passed,
-                          "fails": [r.name for r in rep.rows if not r.within_tol]})
+                          # kind + magnitude per miss (the part spec is the model's own plan, so
+                          # expected values aren't leakage — they're its numbers read back)
+                          "fails": [f"{r.name} (measured {r.measured} vs spec {r.expected})"
+                                    for r in rep.rows if not r.within_tol]})
             ps = _place_world(wp.val(), c, comps_map)
             placed.append(ps); built.append((c, ps))
         except Exception as e:  # noqa: BLE001 — a part that won't build is a (caught) failure
@@ -773,9 +776,15 @@ def verify_assembly(asm: Assembly) -> dict:
         {"name": "assembly · components", "expected": len(asm.components),
          "measured": sum(1 for c in comps if c["passed"]), "within_tol": comps_ok,
          "category": "ok" if comps_ok else "component"},
+        # When a part didn't BUILD, the fused count is computed from the survivors — reporting
+        # that as "disconnected" (often with measured == expected) misdirects repair toward
+        # mates when the real fault is the broken part. Say so, and route it as `component`.
         {"name": conn_name,
-         "expected": expected_solids, "measured": solids, "within_tol": connectivity_ok,
-         "category": "ok" if connectivity_ok else "disconnected"},
+         "expected": expected_solids,
+         "measured": (solids if built_all
+                      else f"{solids} (only {len(placed)}/{len(asm.components)} parts built)"),
+         "within_tol": connectivity_ok,
+         "category": "ok" if connectivity_ok else ("component" if not built_all else "disconnected")},
         {"name": "assembly · valid (watertight)", "expected": True, "measured": valid,
          "within_tol": valid, "category": "ok" if valid else "validity"},
     ]

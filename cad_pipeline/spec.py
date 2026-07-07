@@ -277,6 +277,7 @@ FLAT_TOP = frozenset({"pocket", "counterbore", "countersink"})
 def feature_shape_conflicts(spec: "Spec") -> List[str]:
     """Feature types this spec carries that its shape cannot honestly realize."""
     out: List[str] = []
+    has_draft = any(f.type == "draft" for f in spec.features)
     for f in spec.features:
         if f.type in BOX_ONLY and spec.shape != "box":
             out.append(f.type)
@@ -285,6 +286,11 @@ def feature_shape_conflicts(spec: "Spec") -> List[str]:
         elif f.type == "thread" and getattr(f, "kind", "internal") == "internal" \
                 and spec.shape not in ("box", "cylinder"):
             out.append(f.type)
+        # draft tapers the side walls, so the |Z ("all_vertical") edge selectors that fillet/
+        # chamfer/var_fillet bind to no longer match anything → "Fillets requires that edges
+        # be selected" at build. A drafted part gets its edge character from the taper itself.
+        elif has_draft and f.type in ("fillet", "chamfer", "var_fillet"):
+            out.append(f"{f.type}+draft")
     return out
 
 
