@@ -88,6 +88,15 @@ _EXAMPLES = {
                 'stands on Z. Solid body ⇒ start AND end at radius 0; tube ⇒ keep radius>0 throughout.',
                 '_rv = cq.Workplane("XY").polyline([(r0, z0), (r1, z1)]).close().revolve(360, (0, 0, 0), (0, 1, 0))\n'
                 'result = cq.Workplane(obj=_rv.val().rotate((0, 0, 0), (1, 0, 0), 90))'),
+    "revolve_arc": ('turned body with CURVED meridian segments (dome/barrel/flare): profile_arcs[i] is the '
+                    'sagitta of segment i — replace polyline with moveTo + per-segment lineTo/sagittaArc. '
+                    'Arcs revolve to analytic spheres/tori; a NEGATIVE sagitta on an upward run bows OUTWARD.',
+                    '_wp = cq.Workplane("XY").moveTo(*_pts[0])\n'
+                    'for _i, _p in enumerate(_pts[1:]):\n'
+                    '    _s = _sag[_i] if _i < len(_sag) else 0.0\n'
+                    '    _wp = _wp.sagittaArc(tuple(_p), _s) if _s else _wp.lineTo(*_p)\n'
+                    '_rv = _wp.close().revolve(360, (0, 0, 0), (0, 1, 0))\n'
+                    'result = cq.Workplane(obj=_rv.val().rotate((0, 0, 0), (1, 0, 0), 90))'),
     "sweep":   ('round tube (sweep): a circle of diameter D swept along a 3D path of [x,y,z] points. Assemble '
                 'the path from 3D line edges; put the profile on a plane perpendicular to the FIRST segment.',
                 '_pts = [cq.Vector(*p) for p in [(x0, y0, z0), (x1, y1, z1)]]\n'
@@ -249,6 +258,8 @@ def grep(pattern: str, k: int = 8) -> List[Doc]:
 def _examples_for_spec(spec: Spec) -> List[Doc]:
     """Deterministically pull the canonical recipe(s) the spec needs — guaranteed present."""
     keys = [spec.shape]
+    if spec.shape == "revolve" and any(spec.profile_arcs or []):
+        keys.append("revolve_arc")   # curved-meridian idiom (sagittaArc), not just the polyline recipe
     # On a loft/revolve/sweep the box face-workplane hole idiom MISSES (tilted/curved top face) — the
     # holes must be cut as explicit absolute cylinders. Route those shapes to `hole_nonbox` and suppress
     # the box hole idioms, which would otherwise mislead the model. (cylinder's flat top is fine as box.)

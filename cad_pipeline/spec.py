@@ -197,6 +197,12 @@ class Spec(BaseModel):
     # (3D points), e.g. a coolant line, handle, or curved strut. vol = π·r²·(path length).
     envelope: Dict[str, float] = Field(default_factory=dict)  # box/cylinder/loft dims; revolve uses `profile`
     profile: Optional[List[Tuple[float, float]]] = None  # revolve meridian: [(radius, z), …]
+    # Curved meridian segments (continuity vocabulary): profile_arcs[i] is the SAGITTA (mm) of the
+    # segment profile[i]→profile[i+1] — 0/absent = straight line, non-zero = a circular arc bowing
+    # that far off the chord (sign: + bows toward the chord's LEFT normal walking i→i+1 in the (r,z)
+    # plane; for an upward run that's −r, so an OUTWARD barrel bulge is NEGATIVE). Arcs revolve to
+    # analytic spheres/tori, so domes/barrels/flares stay exactly verifiable.
+    profile_arcs: Optional[List[float]] = None
     path: Optional[List[Tuple[float, float, float]]] = None  # sweep path: [(x, y, z), …]
     features: List[Feature] = Field(default_factory=list)
     tolerance: float = 0.1  # ± mm on directly-specified dimensions
@@ -241,11 +247,45 @@ class Spec(BaseModel):
         return sum(sum((p[i + 1][k] - p[i][k]) ** 2 for k in range(3)) ** 0.5 for i in range(len(p) - 1))
 
     def revolve_extents(self) -> Tuple[float, float]:
-        """(diameter, height) of a revolve from its meridian: ⌀ = 2·max(radius), height = z-span."""
+        """(diameter, height) of a revolve from its meridian: ⌀ = 2·max(radius), height = z-span.
+        Arc segments (profile_arcs) can bow PAST their endpoints — include each arc's apex
+        (chord midpoint + sagitta along the left normal) so a barrel's bulge counts."""
         p = self.profile or []
         rs = [r for r, _ in p]
         zs = [z for _, z in p]
+        for i, s in enumerate(self.profile_arcs or []):
+            if not s or i + 1 >= len(p):
+                continue
+            (r1, z1), (r2, z2) = p[i], p[i + 1]
+            dr, dz = r2 - r1, z2 - z1
+            ln = math.hypot(dr, dz)
+            if ln < 1e-9:
+                continue
+            rs.append((r1 + r2) / 2 + s * (-dz / ln))   # apex = mid + s·n̂, n̂ = (−dz, dr)/|d|
+            zs.append((z1 + z2) / 2 + s * (dr / ln))
         return (2 * max(rs) if rs else 0.0, (max(zs) - min(zs)) if zs else 0.0)
+
+
+# Feature ↔ shape compatibility (mirrors the builder's guards — single source of truth).
+# BOX_ONLY features are silently SKIPPED by the builder on other shapes, which would make a
+# spec/caption lie about geometry that isn't there; FLAT_TOP features sketch on a planar +Z
+# face, which loft/revolve/sweep don't have.
+BOX_ONLY = frozenset({"fillet", "chamfer", "draft", "shell", "var_fillet", "mirror"})
+FLAT_TOP = frozenset({"pocket", "counterbore", "countersink"})
+
+
+def feature_shape_conflicts(spec: "Spec") -> List[str]:
+    """Feature types this spec carries that its shape cannot honestly realize."""
+    out: List[str] = []
+    for f in spec.features:
+        if f.type in BOX_ONLY and spec.shape != "box":
+            out.append(f.type)
+        elif f.type in FLAT_TOP and spec.shape not in ("box", "cylinder"):
+            out.append(f.type)
+        elif f.type == "thread" and getattr(f, "kind", "internal") == "internal" \
+                and spec.shape not in ("box", "cylinder"):
+            out.append(f.type)
+    return out
 
 
 def expected_holes(spec: "Spec") -> List[Tuple[float, float, float, float, str]]:

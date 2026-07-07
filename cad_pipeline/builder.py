@@ -416,7 +416,17 @@ def _revolve_solid(spec: Spec) -> cq.Workplane:
     on the Z axis like a cylinder (axial → +Z). `ruled` straight runs ⇒ analytic cylinders/cones."""
     pts = spec.profile or []
     angle = spec.envelope.get("angle", 360.0)
-    wp = cq.Workplane("XY").polyline([(r, z) for r, z in pts]).close().revolve(angle, (0, 0, 0), (0, 1, 0))
+    arcs = spec.profile_arcs or []
+    if any(arcs):
+        # mixed meridian (continuity vocabulary): straight runs revolve to cylinders/cones, sagitta
+        # arcs to spheres/tori — all analytic, so a dome/barrel/flare stays exactly verifiable.
+        wp = cq.Workplane("XY").moveTo(*pts[0])
+        for i, p in enumerate(pts[1:]):
+            s = arcs[i] if i < len(arcs) else 0.0
+            wp = wp.sagittaArc(tuple(p), s) if s else wp.lineTo(*p)
+        wp = wp.close().revolve(angle, (0, 0, 0), (0, 1, 0))
+    else:
+        wp = cq.Workplane("XY").polyline([(r, z) for r, z in pts]).close().revolve(angle, (0, 0, 0), (0, 1, 0))
     solid = wp.val().rotate((0, 0, 0), (1, 0, 0), 90)   # axial (local Y) → global Z
     return cq.Workplane(obj=solid)
 
@@ -480,7 +490,15 @@ def emit_code(spec: Spec) -> str:
     elif spec.shape == "revolve":
         ang = spec.envelope.get("angle", 360.0)
         L.append(f"_pts = {[[r, z] for r, z in (spec.profile or [])]}")
-        L.append(f'_rv = cq.Workplane("XY").polyline(_pts).close().revolve({ang}, (0, 0, 0), (0, 1, 0))')
+        if any(spec.profile_arcs or []):
+            L.append(f"_sag = {list(spec.profile_arcs or [])}  # sagitta per segment; 0 = straight")
+            L.append('_wp = cq.Workplane("XY").moveTo(*_pts[0])')
+            L.append("for _i, _p in enumerate(_pts[1:]):")
+            L.append("    _s = _sag[_i] if _i < len(_sag) else 0.0")
+            L.append("    _wp = _wp.sagittaArc(tuple(_p), _s) if _s else _wp.lineTo(*_p)")
+            L.append(f"_rv = _wp.close().revolve({ang}, (0, 0, 0), (0, 1, 0))")
+        else:
+            L.append(f'_rv = cq.Workplane("XY").polyline(_pts).close().revolve({ang}, (0, 0, 0), (0, 1, 0))')
         L.append("result = cq.Workplane(obj=_rv.val().rotate((0, 0, 0), (1, 0, 0), 90))")
         L.append(f"L = {spec.revolve_extents()[0]}")
     elif spec.shape == "sweep":
@@ -494,6 +512,8 @@ def emit_code(spec: Spec) -> str:
         L.append('result = cq.Workplane("XY").circle(D / 2).extrude(H)')
         L.append("L = W = D")
     for f in spec.features:
+        if spec.shape != "box":   # parity with build(): fillet/chamfer are box-only (no straight edges elsewhere)
+            break
         if f.type == "fillet":
             L.append(f'result = result.edges("{CQ_EDGE.get(f.edges, "|Z")}").fillet({f.radius})')
         elif f.type == "chamfer":

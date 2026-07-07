@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .builder import build, emit_code
-from .spec import Spec
+from .spec import Spec, feature_shape_conflicts
 from .verifier import verify
 
 
@@ -40,7 +40,11 @@ class Engine:
               temperature: float = 0.7, max_tokens: int = 3000) -> str:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                   "temperature": temperature, "max_tokens": max_tokens}
+                   "temperature": temperature, "max_tokens": max_tokens,
+                   # no-think: spec/caption generation is transcription, not reasoning. With thinking
+                   # ON the un-schema'd caption call rambles a reasoning preamble that eats the whole
+                   # token budget before the JSON appears → caption() returns None → 0 corpus yield.
+                   "chat_template_kwargs": {"enable_thinking": False}}
         if schema is not None:   # vLLM guided decoding ⇒ schema-valid JSON, no parse failures
             payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "out", "schema": schema}}
         req = urllib.request.Request(self.base_url + "/chat/completions", data=json.dumps(payload).encode(),
@@ -58,7 +62,16 @@ _SPEC_SYS = (
     "envelope.diameter). Features: through_hole, hole_pattern, fillet/chamfer (box only), pocket(+at for "
     "panel insets), draft (box, molding), counterbore, countersink, mirror (box), shell (box, hollow), "
     "var_fillet, thread. Prefer 2–4 features in combination. Keep dimensions manufacturable (fillet/shell/"
-    "draft small vs the part; holes clear of edges and each other)."
+    "draft small vs the part; holes clear of edges and each other). ALWAYS fill `envelope` with the "
+    "shape's dims — box: {length,width,height} · cylinder: {diameter,height} · loft: {length,width,height"
+    "[,width_top,height_top|diameter_top]} · sweep: {diameter} + `path`; revolve uses `profile` [[r,z],…] "
+    "instead (envelope {} or {angle}) and may add `profile_arcs` (sagitta per segment; 0=straight, "
+    "negative bows OUTWARD on an upward run — domes/barrels/flares). "
+    "HARD FEATURE-COMPATIBILITY RULES (violations are rejected): fillet, chamfer, draft, shell, "
+    "var_fillet and mirror go on BOX parts ONLY — never on cylinder/loft/revolve/sweep. pocket, "
+    "counterbore, countersink and internal thread need a FLAT TOP: box or cylinder only. "
+    "through_hole and hole_pattern work on any shape. A cylinder/revolve/loft/sweep part gets its "
+    "character from its PROFILE (steps, tapers, arcs) and holes — not from box features."
 )
 
 _CAPTION_SYS = (
@@ -70,24 +83,106 @@ _CAPTION_SYS = (
 )
 
 
-def gen_spec(engine: Engine, category: str, attempts: int = 4) -> Optional[Spec]:
-    """Engine → a STRUCTURED spec for `category`, accepted only if it builds AND verifies to-spec."""
+_ENV_KEYS = {"box": ("length", "width", "height"), "cylinder": ("diameter", "height"),
+             "loft": ("length", "width", "height")}
+
+
+def _spec_complete(spec: Spec) -> bool:
+    """Cheap pre-build gate: the shape's structural inputs must be present, and every feature
+    must be REALIZABLE on the shape (feature_shape_conflicts) — the builder silently skips
+    box-only features on other shapes, which would make the spec/caption describe geometry
+    that doesn't exist (the poison class the batch-1 QA caught)."""
+    if feature_shape_conflicts(spec):
+        return False
+    if spec.shape == "revolve":
+        return bool(spec.profile and len(spec.profile) >= 3)
+    if spec.shape == "sweep":
+        return "diameter" in spec.envelope and bool(spec.path and len(spec.path) >= 2)
+    return all(k in spec.envelope for k in _ENV_KEYS[spec.shape])
+
+
+def _code_verified(spec: Spec) -> bool:
+    """THE gate that matters: execute the EMITTED code (the artifact the corpus actually ships)
+    and verify the solid it produces. build(spec) alone is not enough — any builder↔emitter
+    divergence would store passing labels on crashing/wrong code (batch-1: 9/12 poisoned)."""
+    import cadquery as cq
+    ns: dict = {}
+    try:
+        exec(emit_code(spec), {"__name__": "__corpus_gate__"}, ns)   # noqa: S102 — our own emitter's output
+        res = ns["result"]
+        wp = res if isinstance(res, cq.Workplane) else cq.Workplane(obj=res)
+        return verify(wp, spec).passed
+    except Exception:  # noqa: BLE001 — emitted code that crashes is exactly what we're gating out
+        return False
+
+
+def gen_spec(engine: Engine, category: str, attempts: int = 4,
+             rejects: Optional[List[dict]] = None) -> Optional[Spec]:
+    """Engine → a STRUCTURED spec for `category`, accepted only if it builds AND verifies to-spec.
+
+    When `rejects` is given, every GATE-REJECTED candidate is appended to it as a verifier-labeled
+    NEGATIVE (03_training_recipe: rejected examples are training data too — DPO/GRPO contrast
+    pairs come free with the run instead of being discarded)."""
     schema = Spec.model_json_schema()
+    # Guided decoding only emits keys the schema REQUIRES — pydantic marks defaulted fields
+    # optional, so without this the engine can (and does) omit `envelope` entirely and every
+    # candidate dies on a KeyError in build(). Require the structural fields.
+    # profile/path are nullable but REQUIRED-present: guided decoding omits optional keys entirely,
+    # which starves revolve (profile) and sweep (path) the same way envelope was starved.
+    schema["required"] = sorted(set(schema.get("required", []))
+                                | {"object", "shape", "envelope", "features", "profile", "path"})
+
+    def _reject(stage: str, spec: Optional[Spec] = None, raw: str = "", error: str = "",
+                rows: Optional[list] = None) -> None:
+        if rejects is None:
+            return
+        rejects.append({
+            "category": category, "stage": stage,
+            "spec": json.loads(spec.model_dump_json()) if spec is not None else None,
+            "raw_head": raw[:300] if (raw and spec is None) else None,
+            "error": error or None,
+            "failing_rows": rows or [],
+        })
+
     for k in range(attempts):
+        raw = ""
         try:
             raw = engine._chat(_SPEC_SYS, f"category: {category}", schema=schema, temperature=0.5 + 0.15 * k)
             spec = Spec(**json.loads(raw))
-            rep = verify(build(spec), spec)        # the accept gate (deterministic, feature-level)
-            if rep.passed:
-                return spec
-        except Exception:  # noqa: BLE001 — invalid/ infeasible spec ⇒ try again
+        except Exception as e:  # noqa: BLE001 — unparseable candidate
+            _reject("parse", raw=raw, error=f"{type(e).__name__}: {str(e)[:200]}")
             continue
+        if not _spec_complete(spec):
+            _reject("incomplete", spec=spec, error=f"missing structural inputs for shape={spec.shape}")
+            continue
+        try:
+            rep = verify(build(spec), spec)        # the accept gate (deterministic, feature-level)
+        except Exception as e:  # noqa: BLE001 — spec parses but won't build (infeasible geometry)
+            _reject("build_error", spec=spec, error=f"{type(e).__name__}: {str(e)[:200]}")
+            continue
+        if rep.passed:
+            if _code_verified(spec):     # final authority: the training TARGET must verify
+                return spec
+            _reject("code_gate", spec=spec, error="emit_code output failed to exec/verify (builder↔emitter divergence)")
+            continue
+        _reject("verify_fail", spec=spec,
+                rows=[{"name": r.name, "expected": r.expected, "measured": r.measured,
+                       "category": r.category} for r in rep.rows if not r.within_tol])
     return None
+
+
+_CAPTION_SCHEMA = {
+    "type": "object",
+    "properties": {k: {"type": "string"} for k in ("l0", "l1", "l2", "l3")},
+    "required": ["l0", "l1", "l2", "l3"],
+}
 
 
 def caption(engine: Engine, spec: Spec) -> Optional[dict]:
     try:
-        raw = engine._chat(_CAPTION_SYS, spec.model_dump_json(), temperature=0.7, max_tokens=900)
+        # schema-constrained like gen_spec — guarantees parseable {l0..l3}, no free-form preamble
+        raw = engine._chat(_CAPTION_SYS, spec.model_dump_json(), schema=_CAPTION_SCHEMA,
+                           temperature=0.7, max_tokens=900)
         a, b = raw.find("{"), raw.rfind("}")
         d = json.loads(raw[a:b + 1])
         return {k: str(d.get(k, "")).strip() for k in ("l0", "l1", "l2", "l3")} if all(k in d for k in ("l0", "l1", "l2", "l3")) else None
@@ -100,16 +195,21 @@ def _level(spec: Spec) -> str:
     return "L1" if n <= 1 else ("L2" if n <= 3 else "L3")
 
 
-def synth_sample(engine: Engine, category: str) -> Optional[dict]:
+def synth_sample(engine: Engine, category: str,
+                 rejects: Optional[List[dict]] = None) -> Optional[dict]:
     """One verified, captioned training sample — schema-validated (corpus.TrainingSample,
     the 04_schemas-derived contract) with the FULL verifier report embedded, or None if
-    the gate/caption fails."""
+    the gate/caption fails. Gate rejects stream into `rejects` as labeled negatives."""
     from .corpus import training_sample
-    spec = gen_spec(engine, category)
+    spec = gen_spec(engine, category, rejects=rejects)
     if spec is None:
         return None
     prompts = caption(engine, spec)
     if prompts is None:
+        if rejects is not None:   # verified spec lost to captioning — recoverable, keep it labeled
+            rejects.append({"category": category, "stage": "caption_fail",
+                            "spec": json.loads(spec.model_dump_json()),
+                            "raw_head": None, "error": "caption returned None", "failing_rows": []})
         return None
     rep = verify(build(spec), spec)
     sample = training_sample(
@@ -140,16 +240,23 @@ TAXONOMY = {
 
 
 def run(engine: Engine, total: int, out_path: str) -> dict:
-    """Drive the taxonomy (weighted) to `total` verified samples; stream to JSONL."""
+    """Drive the taxonomy (weighted) to `total` verified samples; stream to JSONL.
+    Gate-rejected candidates stream to <out>.rejects.jsonl as verifier-labeled negatives."""
     cats = [c for c, w in TAXONOMY.items() for _ in range(w)]
-    kept, attempted, by_cat = 0, 0, {}
-    with open(out_path, "w") as fh:
+    rej_path = (out_path[:-6] if out_path.endswith(".jsonl") else out_path) + ".rejects.jsonl"
+    kept, attempted, n_rej, by_cat = 0, 0, 0, {}
+    with open(out_path, "w") as fh, open(rej_path, "w") as rfh:
         i = 0
         while kept < total:
             category = cats[i % len(cats)]
             i += 1
             attempted += 1
-            s = synth_sample(engine, category)
+            rejects: list = []
+            s = synth_sample(engine, category, rejects=rejects)
+            for r in rejects:
+                rfh.write(json.dumps(r) + "\n")
+            if rejects:
+                rfh.flush(); n_rej += len(rejects)
             if s is not None:
                 fh.write(json.dumps(s) + "\n"); fh.flush()
                 kept += 1
@@ -158,7 +265,9 @@ def run(engine: Engine, total: int, out_path: str) -> dict:
             if attempted > total * 6 + 30:   # safety: don't loop forever if the engine is weak
                 print(f"  (stopping: yield too low — {kept}/{attempted} attempts)", flush=True)
                 break
-    return {"kept": kept, "attempted": attempted, "yield": round(kept / max(1, attempted), 3), "by_category": by_cat, "out": out_path}
+    return {"kept": kept, "attempted": attempted, "rejects": n_rej,
+            "yield": round(kept / max(1, attempted), 3), "by_category": by_cat,
+            "out": out_path, "rejects_out": rej_path}
 
 
 def main() -> int:
