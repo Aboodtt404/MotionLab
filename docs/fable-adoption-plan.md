@@ -124,7 +124,14 @@ the export/validate toolchain wired into the router.
       Remaining 76 tasks named-blocked on their pending Phase-3/4/5 verifier. `test_benchmark.py` 11/11.)
       TODO as verifiers land: encode P (mesh cavity/DFM), M/B/W/G, more A/D; add strict per-task Fable
       criteria to the runnable oracles; wire the model-generation pass@1/pass@3 mode (Phase 6).
-- [ ] Phase 3 — verifier suite
+- [~] Phase 3 — verifier suite (IN PROGRESS)
+      - [x] 3a: mesh verifier §6.1 (`mesh_verify.py`) + min-wall raycast §2.3 — trimesh/rtree/scipy on
+            OCCT-tessellated meshes; validated EXACT (2.499 for 2.5mm wall); `test_mesh_verify` 12/12.
+            Wired M01/M02/M06/M07 → capability_score 22.05→24.33/263, M category live (16.2).
+      - [ ] 3b: anti-toy §2.1 rows (fillet hierarchy / wall thickness) + min_wall & mass_props into the
+            B-rep verify() + wire the CAD/assembly rows of the 46-mistake catalog (no new deps).
+      - [ ] 3c: external-tool verifiers — print §6.3 (PrusaSlicer CLI), game §6.4, web/GLB §6.5
+            (gltf-validator + puppeteer). DEPENDS ON a tooling-depth decision (heavier binaries).
 - [ ] Phase 4 — part library
 - [ ] Phase 5 — representation router (A+B merge)
 - [ ] Phase 6 — training SFT→DPO→GRPO
