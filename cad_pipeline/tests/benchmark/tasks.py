@@ -26,6 +26,7 @@ from ...assembly import Assembly, Component, Mate, repair_connectivity, solve_la
 from ...builder import build
 from ...glb_verify import verify_game, verify_web
 from ...mesh_verify import mesh_report
+from ...partlib_solids import involute_gear, tooth_count
 from ...spec import Spec
 from ...verifier import verify
 from ..bench_specs import EVAL_BENCH
@@ -105,6 +106,26 @@ def _w02_figure() -> "trimesh.Trimesh":       # human-scale 1.80 m Y-up, min-Y =
 
 def _g01_crate() -> "trimesh.Trimesh":        # crate ≤500 tris, pivot base center (min-Y=0)
     b = trimesh.creation.box((0.5, 0.5, 0.5)); b.apply_translation([0, 0.25, 0]); return b
+
+
+def _gear_oracle(module: float, teeth: int) -> Callable[[], dict]:
+    """P05/A05 gear tasks: involute gear from the library, checked on tip ⌀ = m(z+2) and the polar
+    tooth count (FFT) = z (fable_run §8.5 / P05)."""
+    def run() -> dict:
+        g, _ = involute_gear(module, teeth)
+        s = g.val(); bb = s.BoundingBox()
+        tip = max(bb.xlen, bb.ylen)
+        tc = tooth_count(g)
+        tip_ok = abs(tip - module * (teeth + 2)) <= 0.2
+        cnt_ok = tc == teeth
+        rows = [{"name": "gear · tip ⌀", "expected": module * (teeth + 2), "measured": round(tip, 3),
+                 "within_tol": tip_ok, "category": "ok" if tip_ok else "dimensional"},
+                {"name": "gear · tooth count (polar FFT)", "expected": teeth, "measured": tc,
+                 "within_tol": cnt_ok, "category": "ok" if cnt_ok else "missing_feature"}]
+        return {"passed": bool(s.isValid() and tip_ok and cnt_ok), "valid": bool(s.isValid()),
+                "solids": 1, "volume": None, "rows": rows,
+                "failure_categories": [] if (tip_ok and cnt_ok) else ["dimensional"]}
+    return run
 
 
 # ─────────────────────────────────────────────────────────────── A — assemblies (golden)
@@ -242,6 +263,7 @@ _PROMPTS: Dict[str, str] = {
     "W01": "export a ≤10k-tri asset as GLB ≤ 2 MB (gltf-validator clean, in-scale)",
     "W02": "human-scale figure, correct web scale: Y-up height 1.80 ±0.02 m, min-Y = 0",
     "G01": "crate prop ≤500 tris, ≤2 materials, pivot at base center",
+    "P05": "spur gear m=2, z=24 → tip ⌀ 52±0.2, 24 polar maxima (library involute gear)",
     "A01": "4-legged stool: seat ⌀140×16, height 120, legs 90° apart, splayed 10°",
     "A02": "shelf on an L-bracket, flush-mounted, fused single solid",
     "A04": "bolt + nut clamping 2 plates, coaxial holes, grip = Σ thickness",
@@ -266,6 +288,7 @@ _ORACLES: Dict[str, Callable[[], dict]] = {
     "W01": _glb_oracle(_w01_asset, lambda p: verify_web(p, max_tris=10_000, max_file_mb=2.0)),
     "W02": _glb_oracle(_w02_figure, lambda p: verify_web(p, height_range=(1.78, 1.82))),
     "G01": _glb_oracle(_g01_crate, lambda p: verify_game(p, tri_budget=500)),
+    "P05": _gear_oracle(2, 24),                       # spur gear m=2 z=24 (library involute gear)
 }
 
 # extra task-specific assertions on the golden report (Fable's per-task numeric criteria)

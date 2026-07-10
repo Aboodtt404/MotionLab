@@ -141,7 +141,11 @@ the export/validate toolchain wired into the router.
       - [~] 3e: wired M01/02/06/07 + W01/02 + G01 onto the new verifiers → **six categories live,
             capability_score 25.48/263** (C82 D30 A25 M16 W8 G3). STILL: P-category onto print/plausibility
             (per-task row selection), B-category (Blender bpy tasks), more M/W/G, strict per-task criteria.
-- [ ] Phase 4 — part library
+- [x] Phase 4 — part library (`partlib_solids.py`: SHCS/hex-nut/washer/bearing(623-608)/dowel-pin +
+      **involute gear** from the equation — root-disc+tooth-union for validity, FFT tooth count;
+      golden by construction, ISO catalog dims + datums; `test_partlib` all green). Wired P05 spur gear
+      → P category live, capability_score 25.48→26.62/263 (7 categories scoring). REMAINING: motors/
+      electronics/GT2 (D-category depth) + assembly instantiate-by-name (lands with the Phase-5 router).
 - [ ] Phase 5 — representation router (A+B merge)
 - [ ] Phase 6 — training SFT→DPO→GRPO
 - [ ] Phase 7 — skill packaging
