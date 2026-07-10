@@ -140,6 +140,14 @@ class ModelBrief(BaseModel):
             output_formats=output_formats or ["step"],
         )
 
+    def to_spec(self):
+        """Lower a brep model_brief into an internal Spec (the CAD builder's input). Feature
+        {type, params} items flatten into the typed-Spec feature shape (`{type, **params}`)."""
+        from .spec import Spec
+        feats = [{"type": f.type, **f.params} for f in self.features]
+        return Spec(object=self.name, shape=(self.shape or "box"),
+                    envelope=dict(self.envelope_mm), features=feats, tolerance=self.tolerance_mm)
+
 
 # ───────────────────────────────────────────────────────────────────────── 2. assembly_brief
 MateKind = Literal["ground", "stack", "radial", "coaxial", "flush", "mirror", "attach",

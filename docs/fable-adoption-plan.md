@@ -146,7 +146,14 @@ the export/validate toolchain wired into the router.
       golden by construction, ISO catalog dims + datums; `test_partlib` all green). Wired P05 spur gear
       → P category live, capability_score 25.48→26.62/263 (7 categories scoring). REMAINING: motors/
       electronics/GT2 (D-category depth) + assembly instantiate-by-name (lands with the Phase-5 router).
-- [ ] Phase 5 — representation router (A+B merge)
+- [~] Phase 5 — representation router / Track A+B MERGE (IN PROGRESS)
+      - [x] 5a: `engine/` package — router (§1.2 decision table), 4 builders (brep+library in-process,
+            mesh→TRELLIS :8770 HTTP, procedural→Blender bpy — mesh/procedural degrade gracefully),
+            build_part/build_asset orchestration, ModelBrief.to_spec adapter. Hybrid drone brief routes
+            frame→brep, bearing→library, canopy→mesh. `engine/tests/test_engine` 18/18.
+      - [ ] 5b: hybrid ASSEMBLY (merge B-rep+mesh+procedural into one placed scene via the mate graph +
+            §1.4 unit/axis conversion) + repair loop over routed builds + Blender geometry-nodes generators
+            (B-category depth) + wire the router into the live /plan server + corpus.
 - [ ] Phase 6 — training SFT→DPO→GRPO
 - [ ] Phase 7 — skill packaging
 - [ ] Phase 8 — tool stack + build123d
