@@ -135,9 +135,12 @@ the export/validate toolchain wired into the router.
             build-volume + the prusa-slicer oracle — validated headless, 12m1s print time). Tooling
             installed full-fidelity: pymeshlab (self-intersection §6.1) + prusa-slicer 2.7.2 (apt).
             `test_print_verify` 9/9.
-      - [ ] 3d: game §6.4 + web/GLB §6.5 (node + blender present) — gltf-validator + puppeteer smoke.
-      - [ ] 3e: wire P-category benchmark tasks onto print/plausibility (per-task row selection —
-            e.g. a lampshade legitimately fails bed-contact); fold min_wall/mass into a fabricate path.
+      - [x] 3d: web §6.5 + game §6.4 verifiers (`glb_verify.py`) — Khronos gltf-validator (node wrapper,
+            local install), trimesh GLB introspection, Blender WORKBENCH headless render smoke (the
+            §6.5 non-empty check; CYCLES lacks a denoiser on this build). `test_glb_verify` 9/9.
+      - [~] 3e: wired M01/02/06/07 + W01/02 + G01 onto the new verifiers → **six categories live,
+            capability_score 25.48/263** (C82 D30 A25 M16 W8 G3). STILL: P-category onto print/plausibility
+            (per-task row selection), B-category (Blender bpy tasks), more M/W/G, strict per-task criteria.
 - [ ] Phase 4 — part library
 - [ ] Phase 5 — representation router (A+B merge)
 - [ ] Phase 6 — training SFT→DPO→GRPO

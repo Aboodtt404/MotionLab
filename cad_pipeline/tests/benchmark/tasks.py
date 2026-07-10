@@ -16,10 +16,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+import os
+import shutil
+import tempfile
+
 import trimesh
 
 from ...assembly import Assembly, Component, Mate, repair_connectivity, solve_layout, verify_assembly
 from ...builder import build
+from ...glb_verify import verify_game, verify_web
 from ...mesh_verify import mesh_report
 from ...spec import Spec
 from ...verifier import verify
@@ -75,6 +80,31 @@ def _m01_sphere() -> "trimesh.Trimesh":       # sphere r=25, ≤2000 tris, vol �
 
 def _m02_torus() -> "trimesh.Trimesh":        # torus R=30 r=8, ≤5000 tris, vol ≈ 37899 ±5%, genus-1
     return trimesh.creation.torus(major_radius=30, minor_radius=8)
+
+
+# W/G-category GLB artifacts (meters, glTF Y-up). The oracle writes a temp GLB and gates it.
+def _glb_oracle(mesh_fn, verify_fn) -> Callable[[], dict]:
+    def run() -> dict:
+        d = tempfile.mkdtemp()
+        try:
+            p = os.path.join(d, "a.glb")
+            mesh_fn().export(p)
+            return verify_fn(p).to_dict()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    return run
+
+
+def _w01_asset() -> "trimesh.Trimesh":        # ≤10k-tri GLB ≤2 MB
+    return trimesh.creation.icosphere(subdivisions=2, radius=0.1)
+
+
+def _w02_figure() -> "trimesh.Trimesh":       # human-scale 1.80 m Y-up, min-Y = 0
+    b = trimesh.creation.box((0.4, 1.8, 0.3)); b.apply_translation([0, 0.9, 0]); return b
+
+
+def _g01_crate() -> "trimesh.Trimesh":        # crate ≤500 tris, pivot base center (min-Y=0)
+    b = trimesh.creation.box((0.5, 0.5, 0.5)); b.apply_translation([0, 0.25, 0]); return b
 
 
 # ─────────────────────────────────────────────────────────────── A — assemblies (golden)
@@ -209,6 +239,9 @@ _PROMPTS: Dict[str, str] = {
     "M02": "torus R=30 r=8, ≤5000 tris, watertight, vol ≈ 37899 ±5% (genus-1)",
     "M06": "any closed mesh with all normals outward (winding consistent, signed vol > 0)",
     "M07": "closed mesh, clean topology: every edge shared by exactly 2 faces",
+    "W01": "export a ≤10k-tri asset as GLB ≤ 2 MB (gltf-validator clean, in-scale)",
+    "W02": "human-scale figure, correct web scale: Y-up height 1.80 ±0.02 m, min-Y = 0",
+    "G01": "crate prop ≤500 tris, ≤2 materials, pivot at base center",
     "A01": "4-legged stool: seat ⌀140×16, height 120, legs 90° apart, splayed 10°",
     "A02": "shelf on an L-bracket, flush-mounted, fused single solid",
     "A04": "bolt + nut clamping 2 plates, coaxial holes, grip = Σ thickness",
@@ -230,6 +263,9 @@ _ORACLES: Dict[str, Callable[[], dict]] = {
     "M02": _mesh_oracle(_m02_torus, max_triangles=5000, expected_euler=0),
     "M06": _mesh_oracle(_m01_sphere),                 # closed mesh, all normals outward
     "M07": _mesh_oracle(_m01_sphere),                 # clean topology: every edge shared by 2 faces
+    "W01": _glb_oracle(_w01_asset, lambda p: verify_web(p, max_tris=10_000, max_file_mb=2.0)),
+    "W02": _glb_oracle(_w02_figure, lambda p: verify_web(p, height_range=(1.78, 1.82))),
+    "G01": _glb_oracle(_g01_crate, lambda p: verify_game(p, tri_budget=500)),
 }
 
 # extra task-specific assertions on the golden report (Fable's per-task numeric criteria)
