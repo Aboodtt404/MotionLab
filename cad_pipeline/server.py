@@ -224,12 +224,35 @@ def _new_job() -> str:
     return jid
 
 
+def _engine_job(body: dict) -> dict:
+    """Route a model_brief / assembly_brief through the merged engine (Track A+B): per-part
+    representation dispatch → per-rep verify → hybrid mate-graph merge → deterministic repair loop.
+    Body: {"brief": <model_brief|assembly_brief JSON>}."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root → import engine
+    from cad_pipeline.schemas import AssemblyBrief, ModelBrief
+    brief_json = body["brief"]
+    if "components" in brief_json:                       # assembly → build all parts, merge, repair
+        from engine.repair import repair_asset
+        brief = AssemblyBrief(**brief_json)
+        res = repair_asset(brief, max_rounds=int(body.get("max_rounds", 2)))
+        return {"kind": "assembly", "passed": res.passed, "rounds": res.rounds,
+                "feedback": res.feedback, "rows": res.asset.rows,
+                "reps": res.asset.reps, "placements": res.asset.placements}
+    from engine.engine import build_part                 # single part → route + build + verify
+    part = build_part(ModelBrief(**brief_json))
+    return {"kind": "part", "passed": part.passed, "representation": part.representation,
+            "report": part.report, "reason": part.reason}
+
+
 def _run_job(jid: str, route: str, body: dict):
     try:
         if route == "/generate":
             result = _gen_job(body)
         elif route == "/critique":
             result = _critique_job(body)
+        elif route == "/engine":
+            result = _engine_job(body)
         else:
             result = _assembly_job(route, body)
         with _jobs_lock:
@@ -260,7 +283,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802 — enqueue a job, return its id (poll GET /job/<id>)
         route = self.path.rstrip("/")
-        if route not in ("/generate", "/plan", "/edit", "/critique"):
+        if route not in ("/generate", "/plan", "/edit", "/critique", "/engine"):
             return self._json(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length", 0))
