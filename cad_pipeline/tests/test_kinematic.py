@@ -49,10 +49,13 @@ def _door(x: float = 85.0) -> Component:
 def hinge_golden() -> None:
     """A03-lite: hinge = 2 rigid groups sharing an axis, exactly 1 DOF, clearance holds over
     the whole motion range (gap(θ) > 0 ∀θ), bodies stay separate in the built compound."""
-    asm = Assembly(object="hinged door", components=[_post(), _door()], fuse=True,
-                   joints=[Joint(a="door", b="post", axis="z", at=(45, 10, 50), limits=(0, 90))])
+    # door edge 0.3 mm off the post face — physically HUNG, not hovering (the attachment row
+    # rightly failed the old 40 mm-away door; a hinge's sides must meet)
+    asm = Assembly(object="hinged door", components=[_post(), _door(x=45.3)], fuse=True,
+                   joints=[Joint(a="door", b="post", axis="z", at=(5.3, 10, 50), limits=(0, 90))])
     rep = verify_assembly(asm)
-    check("hinge passes end-to-end", rep["passed"])
+    check("hinge passes end-to-end", rep["passed"],
+          str([r["name"] for r in rep["rows"] if not r["within_tol"]]))
     check("2 rigid groups (not welded across the joint)",
           _row(rep, "connectivity")["expected"] == 2 and _row(rep, "connectivity")["measured"] == 2)
     check("DOF row: 1 movable / 1 joint", _row(rep, "DOF")["measured"] == 1 and _row(rep, "DOF")["within_tol"])
@@ -206,12 +209,83 @@ def joint_fit_a6() -> None:
     check("sloppy fit 1.5 mm caught", sloppy is not None and not sloppy["within_tol"])
 
 
+def car_corners() -> None:
+    """The vehicle pattern: `corners` mates (wheelbase×track rectangle, NOT a radial circle) —
+    axles welded into the chassis sides + sideways wheels (axis 'y') whose inner faces MEET the
+    axle tips, one revolute per wheel. Geometry is derived in the fixture (dy_wheel = dy_axle +
+    axle_len/2 + wheel_w/2; ≥ body_w/2 + wheel_w/2) so the whole car passes by construction,
+    including the joint-ATTACHMENT row — and name-aware corner assignment puts front_left at
+    (+x, +y) regardless of list order."""
+    wheels = ["rear_right_wheel", "front_left_wheel", "rear_left_wheel", "front_right_wheel"]  # shuffled on purpose
+    axles = ["front_left_axle", "front_right_axle", "rear_left_axle", "rear_right_axle"]
+    asm = Assembly(object="test car", fuse=True, components=[
+        Component(name="chassis", role="base",
+                  part=Spec(object="chassis", shape="box",
+                            envelope={"length": 4200, "width": 1400, "height": 60}), at=(0, 0, 30)),
+        Component(name="body", role="body",
+                  part=Spec(object="body", shape="box",
+                            envelope={"length": 4200, "width": 1400, "height": 1100}), at=(0, 0, 0)),
+        *[Component(name=a, role="support",
+                    part=Spec(object="axle", shape="cylinder",
+                              envelope={"diameter": 80, "height": 160}), at=(0, 0, 0))
+          for a in axles],
+        *[Component(name=w, role="other",
+                    part=Spec(object="wheel", shape="cylinder",
+                              envelope={"diameter": 620, "height": 240}), at=(0, 0, 0))
+          for w in wheels],
+    ], mates=[
+        Mate(kind="ground", a="chassis"),
+        Mate(kind="stack", a="body", b="chassis", overlap=3),
+        # axle centers at ±780: span 700..860 → 20 mm welded into the chassis, tip at 860
+        Mate(kind="corners", parts=axles, around="chassis", dx=1300, dy=780, axis="y", z=310),
+        # wheel centers at ±980: inner face at 860 = exactly the axle tip (attachment gap 0)
+        Mate(kind="corners", parts=wheels, around="chassis", dx=1300, dy=980, axis="y"),
+    ], joints=[Joint(a=w, b="chassis", axis="y", limits=(0, 360)) for w in wheels])
+    asm = solve_layout(asm)
+    comps = {c.name: c for c in asm.components}
+    fl = comps["front_left_wheel"]
+    rr = comps["rear_right_wheel"]
+
+    def center(c: Component):
+        b = _place_world(_bare_solid(c.part), c, comps).BoundingBox()
+        return (b.center.x, b.center.y, b.zmin)
+
+    flc, rrc = center(fl), center(rr)
+    check("front_left CENTERED at (+1300,+980) by name",
+          abs(flc[0] - 1300) < 0.5 and abs(flc[1] - 980) < 0.5, f"center={flc}")
+    check("rear_right CENTERED at (−1300,−980) by name",
+          abs(rrc[0] + 1300) < 0.5 and abs(rrc[1] + 980) < 0.5, f"center={rrc}")
+    check("wheels lie sideways (axis y)", fl.rotate == (90.0, 0.0, 0.0), f"rot={fl.rotate}")
+    check("wheels rest on the floor", abs(flc[2]) < 0.5, f"zmin={flc[2]}")
+    rep = verify_assembly(asm)
+    check("assembly passes end-to-end", rep["passed"],
+          str([r["name"] for r in rep["rows"] if not r["within_tol"]]))
+    dof = _row(rep, "DOF")
+    check("DOF 4/4, nothing floating", dof["within_tol"] and dof["measured"] == 4)
+    inter = _row(rep, "interference")
+    check("wheels clear the body (derived dy)", inter["within_tol"], f"worst={inter['measured']}")
+    sweep = _row(rep, "pose sweep")
+    check("full 360° sweep clean", sweep["within_tol"], f"worst={sweep['measured']}")
+    att = _row(rep, "joint attachment")
+    check("wheels physically MEET their axles (attachment row)", att["within_tol"],
+          f"gap={att['measured']}")
+    # the adversarial side: strip the axles → the same car passes DOF/sweep but the attachment
+    # row must catch the 60 mm air gap the eye sees instantly
+    naked = asm.model_copy(deep=True)
+    naked.components = [c for c in naked.components if "axle" not in c.name]
+    naked.mates = [m for m in naked.mates if not (m.kind == "corners" and "axle" in (m.parts or [""])[0])]
+    nrep = verify_assembly(naked)
+    natt = _row(nrep, "joint attachment")
+    check("floating wheels (no axles) CAUGHT by attachment row",
+          not natt["within_tol"], f"gap={natt['measured']}")
+
+
 def main() -> int:
     print("=" * 60)
     print("KINEMATIC — benchmark §A on the DOF/sweep/hierarchy rows")
     print("=" * 60)
     for fn in (hinge_golden, hinge_smash, hinge_welded, joint_autoplacement,
-               pcb_standoffs, arm_2r, arc_meridians, joints_patch, joint_fit_a6):
+               pcb_standoffs, arm_2r, arc_meridians, joints_patch, joint_fit_a6, car_corners):
         print(f"\n■ {fn.__name__}")
         fn()
     print("\n" + "=" * 60)

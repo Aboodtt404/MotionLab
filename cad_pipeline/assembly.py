@@ -6,8 +6,9 @@ later, separate concern (design doc §12.3).
 
 Verifier-first, as always: each component is verified in its own LOCAL frame against its
 sub-spec (reusing the part verifier), and the ASSEMBLY adds two checks the parts can't see:
-  • connectivity — the fused result must be a SINGLE solid (a floating/short arm that doesn't
-    reach the hub leaves >1 solid → caught).
+  • connectivity — every rigid group must be ONE contact-connected structure (a floating/short
+    arm that doesn't reach the hub is a separate contact component → caught). Measured on the
+    contact graph, not the fused-solid count: OCCT booleans are not a connectivity oracle.
   • validity — the fused BRep is watertight/valid.
 """
 from __future__ import annotations
@@ -52,15 +53,24 @@ class Mate(BaseModel):
     """A NAMED structural relationship between parts (the generator emits these, not coordinates — see
     docs/research/sources.md 'emit named relationships, not coordinates'). solve_layout() resolves the
     whole graph deterministically into each component's at/rotate."""
-    kind: Literal["ground", "stack", "coaxial", "radial", "flush", "mirror", "attach"]
+    kind: Literal["ground", "stack", "coaxial", "radial", "corners", "flush", "mirror", "attach",
+                  "cutout"]
     a: Optional[str] = None                 # primary part (ground/stack/coaxial/flush/mirror/attach)
+    #                                         cutout: the TOOL part (its grown volume is carved out)
     b: Optional[str] = None                 # reference part (a is placed relative to b)
-    parts: List[str] = Field(default_factory=list)   # radial: the group of parts arranged around an axis
-    around: Optional[str] = None            # radial: part whose Z axis is the circle center (None ⇒ origin)
+    #                                         cutout: the TARGET part that gets carved
+    clearance: float = 5.0                  # cutout: mm of gap the carve leaves around the tool
+    #                                         (wheel arch ≈ 40; a pocket for a snug insert ≈ 1–2)
+    parts: List[str] = Field(default_factory=list)   # radial/corners: the group of parts being arranged
+    around: Optional[str] = None            # radial/corners: reference part (None ⇒ origin)
     count: Optional[int] = None             # radial: how many (defaults to len(parts))
     radius: Optional[float] = None          # radial: circle radius mm (defaults from `around` part)
     splay_deg: float = 0.0                  # radial: outward lean of each part (° about its tangent)
-    z: Optional[float] = None               # radial: explicit z for the group (else grounded/inferred)
+    z: Optional[float] = None               # radial/corners: explicit z for the group (else grounded)
+    dx: Optional[float] = None              # corners: ± x half-offset from center (wheelbase/2)
+    dy: Optional[float] = None              # corners: ± y half-offset from center (track/2)
+    axis: Optional[Literal["x", "y", "z"]] = None   # corners/coaxial: world direction each part's own
+    #                                                 Z axis is turned to (wheels sideways: axis "y")
     side: Optional[str] = None              # flush: "+x"|"-x"|"+y"|"-y"|"+z"|"-z"
     plane: Optional[str] = None             # mirror: "YZ"|"XZ"|"XY"
     overlap: float = 1.5                    # stack/flush/attach: mm the parts overlap at the joint
@@ -186,6 +196,47 @@ def _placed_bb(bare: cq.Solid, comp: Component, comps: Optional[dict] = None):
     return _place(bare, comp).BoundingBox()
 
 
+def _contact_components(items: list, tol: float = 0.05) -> int:
+    """Number of CONTACT-connected components among (name, placed solid) pairs — union-find over
+    pairwise gaps. Touching or overlapping ⇒ attached. This is what 'connected' actually means for
+    a structure; the fused-solid count is only a proxy for it, and OCCT booleans lie both ways
+    (tangent solids never merge; a greebled-loft↔plate fuse returns EMPTY in every direction and
+    tolerance). Bbox broad-phase first so distant pairs never pay a BRepExtrema probe."""
+    parent = {n: n for n, _ in items}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    boxes = {}
+    for n, s in items:
+        try:
+            boxes[n] = s.BoundingBox()
+        except Exception:  # noqa: BLE001 — a void solid touches nothing
+            boxes[n] = None
+    pad = tol + 0.1
+    for i, (na, sa) in enumerate(items):
+        for nb, sb in items[i + 1:]:
+            if find(na) == find(nb):
+                continue
+            ba, bbx = boxes[na], boxes[nb]
+            if ba is None or bbx is None:
+                continue
+            if (ba.xmin > bbx.xmax + pad or bbx.xmin > ba.xmax + pad or
+                    ba.ymin > bbx.ymax + pad or bbx.ymin > ba.ymax + pad or
+                    ba.zmin > bbx.zmax + pad or bbx.zmin > ba.zmax + pad):
+                continue
+            try:
+                gap, _ = _solid_gap(sa, sb)
+            except Exception:  # noqa: BLE001
+                continue
+            if gap <= tol:
+                parent[find(na)] = find(nb)
+    return len({find(n) for n, _ in items})
+
+
 # --------------------------------------------------------------------- interference & statics
 def _common_volume(s1: cq.Solid, s2: cq.Solid) -> float:
     """vol(A ∩ B) in mm³ — the exact set-theory interference measure (collision ⇔ vol(A∩B) > 0).
@@ -226,6 +277,12 @@ def _mated_pairs(asm: Assembly) -> set:
             siblings.setdefault(c.parent, []).append(c.name)
     pairs: set = set()
     for m in asm.mates:
+        # corners parts sit ON their reference by design (axles overlap the chassis to weld;
+        # wheels ride adjacent to it) — sanctioned for interference. Welding is decided later:
+        # _rigid_groups skips any sanctioned pair that a JOINT claims (joint wins over weld).
+        if m.kind == "corners" and m.around:
+            for p in (m.parts or []):
+                pairs.add(frozenset((p, m.around)))
         if m.kind in ("stack", "flush", "attach", "coaxial") and m.a and m.b:
             if m.b in radial_groups:
                 for p in radial_groups[m.b]:
@@ -311,6 +368,59 @@ def solve_layout(asm: Assembly) -> Assembly:
     around an axis, splayed), stack (a on top of b), coaxial, flush, mirror, attach (bounded snap). Parts
     with no mate keep their given at/rotate. Mates are applied in dependency order so a support is placed
     before what rests on it; bounding boxes are recomputed per mate from the live placement."""
+    # A hinge whose two sides are ALSO mated is welded shut — the DOF row's over-constrained
+    # case, whose repair prescription ("remove the mate, keep the joint") is mechanically
+    # decidable. The model keeps emitting the seating mate despite the prompt rule, so drop it
+    # here: plan(), edit() and the retry loop all pass through solve_layout. Joint placement
+    # has its own closed-pose seating, so nothing is lost.
+    if asm.joints and asm.mates:
+        jointed = {frozenset((j.a, j.b)) for j in asm.joints}
+        # cutout is SUBTRACTIVE, not a weld — a jointed wheel carving its own arch out of the body
+        # is the intended pattern, so it must survive this sanitizer untouched.
+        asm.mates = [m for m in asm.mates
+                     if m.kind == "cutout" or frozenset((m.a, m.b)) not in jointed]
+        # Transitive welds too: if the joint's sides are STILL in one rigid group (lid→knuckle→pin),
+        # cut the first mate edge on the path from the MOVING side (j.a) toward j.b — the moving
+        # side must reach its reference only through the joint. Bounded: one cut per joint per pass.
+        for j in asm.joints:
+            for _ in range(len(asm.mates)):
+                gid = _rigid_groups(asm)
+                if gid.get(j.a) != gid.get(j.b) or gid.get(j.a) is None:
+                    break
+                adj: dict = {}
+                for k, m in enumerate(asm.mates):
+                    if m.kind == "cutout":                   # cutout carves, it never welds
+                        continue
+                    if m.a and m.b:
+                        adj.setdefault(m.a, []).append((m.b, k))
+                        adj.setdefault(m.b, []).append((m.a, k))
+                    elif m.kind in ("radial", "corners") and m.around:
+                        # pattern edges WELD (an axle sunk in the chassis) but placing 4 parts is
+                        # not severable per-pair — traversable, never cuttable (k=None). A pattern
+                        # pair the joint itself claims is no weld at all (_rigid_groups skips it).
+                        # Run-13 live: coaxial(wheel↔axle) + corners(axle→chassis) welded all four
+                        # "revolute" wheels solid; the old a/b-only walk was blind past the axle.
+                        for p in (m.parts or []):
+                            if frozenset((p, m.around)) in jointed:
+                                continue
+                            adj.setdefault(p, []).append((m.around, None))
+                            adj.setdefault(m.around, []).append((p, None))
+                seen, stack = {j.a}, [(j.a, [])]
+                path = None
+                while stack:
+                    node, edges = stack.pop()
+                    if node == j.b:
+                        path = edges
+                        break
+                    for nxt, k in adj.get(node, []):
+                        if nxt not in seen:
+                            seen.add(nxt)
+                            stack.append((nxt, edges + [k]))
+                cut = next((k for k in (path or []) if k is not None), None)
+                if cut is None:
+                    break   # weld comes only from pattern/parent links — nothing severable
+                asm.mates = [m for k, m in enumerate(asm.mates) if k != cut]
+
     comps = {c.name: c for c in asm.components}
     bare: dict = {}
     for c in asm.components:
@@ -345,8 +455,8 @@ def solve_layout(asm: Assembly) -> Assembly:
             for p in (m.parts or []):
                 radial_of[p] = (cx, cy, list(m.parts or []))
 
-    # order: radial → ground → coaxial → stack → flush → mirror → attach (supports before dependents)
-    order = {"radial": 0, "ground": 1, "coaxial": 2, "stack": 3, "flush": 4, "mirror": 5, "attach": 6}
+    # order: radial/corners → ground → coaxial → stack → flush → mirror → attach (supports before dependents)
+    order = {"radial": 0, "corners": 0, "ground": 1, "coaxial": 2, "stack": 3, "flush": 4, "mirror": 5, "attach": 6}
     for m in sorted(asm.mates, key=lambda m: order.get(m.kind, 9)):
         try:
             if m.kind == "radial":
@@ -386,11 +496,59 @@ def solve_layout(asm: Assembly) -> Assembly:
                     elif m.around in comps:                          # arms/spokes sit at the hub's mid-height
                         ab = bb(m.around)
                         if ab: set_at(nm, z=ab.center.z)
+            elif m.kind == "corners":
+                # N parts at the corners of a dx×dy rectangle on `around` — the vehicle/table/rover
+                # pattern radial can't express (wheelbase × track, NOT a circle). Corner assignment is
+                # NAME-AWARE (front→+x, rear/back→−x, left→+y, right→−y) with positional fallback, so
+                # 'front_left_wheel' lands where its name says regardless of list order. `axis` turns
+                # each part's own Z axis sideways (a wheel is a cylinder lying on its side: axis 'y').
+                names = [n for n in (m.parts or []) if n in comps]
+                if not names:
+                    continue
+                cx, cy = (0.0, 0.0)
+                ab = bb(m.around) if (m.around and m.around in comps) else None
+                if ab:
+                    cx, cy = ab.center.x, ab.center.y
+                dx = m.dx if m.dx is not None else ((ab.xlen * 0.5) if ab else 40.0)
+                dy = m.dy if m.dy is not None else ((ab.ylen * 0.5) if ab else 40.0)
+                signs = [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+                rot = {"x": (0.0, 90.0, 0.0), "y": (90.0, 0.0, 0.0)}.get(m.axis or "z", (0.0, 0.0, 0.0))
+                for i, nm in enumerate(names):
+                    if comps[nm].parent:      # sub-assembly member — root placement only
+                        continue
+                    sx, sy = signs[i % 4]
+                    low = nm.lower()
+                    if "front" in low: sx = 1
+                    if "rear" in low or "back" in low: sx = -1
+                    if "left" in low: sy = 1
+                    if "right" in low: sy = -1
+                    comps[nm].rotate = rot
+                    set_at(nm, x=cx + sx * dx, y=cy + sy * dy)
+                    if m.z is not None:
+                        set_at(nm, z=m.z)
+                    else:
+                        ground(nm)            # wheels/legs/posts rest on the floor by default
+                    # the corner is where the part's CENTER goes — a rotated cylinder's body hangs
+                    # to one side of its local origin (extrude 0..H), so correct by the placed-bbox
+                    # center or the wheel ends up a half-width inboard, buried in the body.
+                    pb = bb(nm)
+                    if pb:
+                        set_at(nm, x=comps[nm].at[0] + (cx + sx * dx - pb.center.x),
+                               y=comps[nm].at[1] + (cy + sy * dy - pb.center.y))
             elif m.kind == "ground" and m.a in comps:
                 ground(m.a)
             elif m.kind == "coaxial" and m.a in comps and m.b in comps:
+                ax = m.axis or "z"
+                if ax != "z" and not comps[m.a].parent:
+                    comps[m.a].rotate = {"x": (0.0, 90.0, 0.0), "y": (90.0, 0.0, 0.0)}[ax]
                 rb = bb(m.b)
-                if rb: set_at(m.a, x=rb.center.x, y=rb.center.y)
+                if rb:
+                    if ax == "z":
+                        set_at(m.a, x=rb.center.x, y=rb.center.y)
+                    elif ax == "y":
+                        set_at(m.a, x=rb.center.x, z=rb.center.z)
+                    else:
+                        set_at(m.a, y=rb.center.y, z=rb.center.z)
             elif m.kind == "stack" and m.a in comps and m.b in comps:
                 ba = bb(m.a)
                 if m.b in radial_of:                              # stacking onto a radial group (e.g. seat on legs)
@@ -434,13 +592,20 @@ def solve_layout(asm: Assembly) -> Assembly:
     # sides in one rigid group and over-constrain the hinge. Snap `a` along the closest-approach
     # direction to a 0.3 mm gap (attach-with-gap). Only parts the mates didn't already place
     # relative to `b` move; parented members ride their root.
-    mated_names = {n for m in asm.mates for n in ((m.a, m.b) if m.kind != "radial" else tuple(m.parts or []))
+    mated_names = {n for m in asm.mates if m.kind != "cutout"   # cutout doesn't PLACE its parts
+                   for n in ((m.a, m.b) if m.kind not in ("radial", "corners") else tuple(m.parts or []))
                    if n}
+    # corners/radial place parts at DELIBERATE offsets (wheelbase/track, leg circle) — that spacing
+    # IS the design (derived clearance), so a jointed corner part must never be snapped to a 0.3 mm
+    # gap against its reference; its placement is authoritative and the verifier judges it.
+    pattern_placed = {n for m in asm.mates if m.kind in ("radial", "corners") for n in (m.parts or [])}
     for j in asm.joints:
         try:
             if j.a not in comps or j.b not in comps or comps[j.a].parent:
                 continue
             if bare.get(j.a) is None or bare.get(j.b) is None:
+                continue
+            if j.a in pattern_placed:
                 continue
             if j.a not in mated_names:
                 # The moving side is (correctly) unmated, so nothing placed it — it's wherever it
@@ -616,11 +781,126 @@ def _blend_joints(fused: cq.Solid, placed: List[cq.Solid], radius: float) -> Tup
     return solid, total
 
 
+def _void(shape) -> bool:
+    try:
+        shape.BoundingBox()
+        return False
+    except Exception:  # noqa: BLE001 — void Bnd_Box raises ConstructionError/OutOfRange
+        return True
+
+
+def _lost(fused, a, b) -> bool:
+    """A fuse result that lost geometry: void, or SMALLER than its biggest operand — a union can
+    never be. OCCT's fuse doesn't only return empty compounds on failure; it can return a
+    NON-empty result containing just one operand's fragments (seen live: greebled body_shell
+    fused into a 5-solid axles+chassis compound → 4 axles, chassis AND body gone, bbox happily
+    non-void — so a void check alone ships a car with no car)."""
+    if fused is None or _void(fused):
+        return True
+    try:
+        return fused.Volume() < max(a.Volume(), b.Volume()) * 0.999
+    except Exception:  # noqa: BLE001 — unmeasurable result is not trustworthy either
+        return True
+
+
 def _fuse(placed: List[cq.Solid]) -> cq.Solid:
+    """Pairwise fuse that can NOT silently lose geometry. OCCT's fuse occasionally returns an
+    EMPTY compound instead of raising (seen: a greebled 4.2 m loft onto a plate with a 3 mm
+    overlap) — and sometimes a non-empty result missing whole operands (see _lost). Retry
+    reversed, then with a fuzzy tolerance, and as a last resort keep BOTH bodies as a
+    compound: the solid count then exposes the unfused seam honestly (connectivity row fails)
+    instead of the part vanishing from the assembly, the STL and the viewport."""
     combined = placed[0]
     for s in placed[1:]:
-        combined = combined.fuse(s)
+        try:
+            fused = combined.fuse(s)
+        except Exception:  # noqa: BLE001
+            fused = None
+        if _lost(fused, combined, s):
+            try:                                     # OCCT fuse is ORDER-SENSITIVE: the greebled-
+                fused = s.fuse(combined)             # loft-onto-plate case voids one way, fuses the other
+            except Exception:  # noqa: BLE001
+                fused = None
+        if _lost(fused, combined, s):
+            try:
+                fused = combined.fuse(s, tol=1e-3)   # fuzzy boolean — the near-tangent/dense-face fix
+            except Exception:  # noqa: BLE001
+                fused = None
+        if _lost(fused, combined, s):
+            fused = cq.Compound.makeCompound([combined, s])
+        combined = fused
     return combined
+
+
+def _cutout_cutter(comp: Component, clearance: float) -> cq.Solid:
+    """The tool's clearance-grown volume in its LOCAL frame — rebuilt as an oversized PRIMITIVE in
+    parameter space (research doc §2.3: never scale — clearance would grow with distance from the
+    scale center; never BRepOffset — fragile). cylinder/revolve → their envelope cylinder grown
+    (r+c, h+2c) — for a part that only SPINS about its own axis this IS the swept volume, so the
+    arch admits the wheel over its whole revolution by construction. box → box(+2c each side).
+    Anything else → bare-solid bbox box + c: a conservative OVER-approximation, which is the safe
+    direction for a clearance well (bigger cavity = more clearance, never less)."""
+    p, c = comp.part, clearance
+    if p.shape == "cylinder":
+        r, h = p.envelope["diameter"] / 2.0, p.envelope["height"]
+        return cq.Solid.makeCylinder(r + c, h + 2 * c, cq.Vector(0, 0, -c))   # local z 0..h grown
+    if p.shape == "revolve":
+        d, h = p.revolve_extents()
+        zs = [z for _, z in (p.profile or [(0.0, 0.0)])]
+        z0 = min(zs)
+        return cq.Solid.makeCylinder(d / 2.0 + c, h + 2 * c, cq.Vector(0, 0, z0 - c))
+    if p.shape == "box":
+        L, W, H = p.envelope["length"], p.envelope["width"], p.envelope["height"]
+        return cq.Solid.makeBox(L + 2 * c, W + 2 * c, H + 2 * c,
+                                cq.Vector(-(L / 2 + c), -(W / 2 + c), -(H / 2 + c)))
+    bare = _bare_solid(p)
+    b = bare.BoundingBox()
+    return cq.Solid.makeBox(b.xlen + 2 * c, b.ylen + 2 * c, b.zlen + 2 * c,
+                            cq.Vector(b.xmin - c, b.ymin - c, b.zmin - c))
+
+
+def _apply_cutouts(asm: Assembly, placed_by_name: dict, comps: dict) -> dict:
+    """The CUT phase — runs AFTER placement, BEFORE grouping/fusing (the SolidWorks-Cavity /
+    Onshape-in-context pattern: geometry modification is a post-placement modeling op, never a
+    placement mate — research doc §2.2). For each cutout mate, subtract the tool's clearance-grown
+    world-posed volume from the target's placed solid; the TOOL itself is untouched (it stays a
+    separate movable part). A cut that voids or removes nothing is retried with a fuzzy tolerance
+    and, failing that, the target is LEFT UNCUT and the verifier row fails honestly — never a
+    silent half-state (the fuse-loss lesson). Returns {(tool, target): info} for the rows."""
+    results: dict = {}
+    for m in asm.mates:
+        if m.kind != "cutout":
+            continue
+        if m.a not in comps or m.b not in comps or m.b not in placed_by_name:
+            continue
+        target = placed_by_name[m.b]
+        key = (m.a, m.b)
+        try:
+            cutter = _place_world(_cutout_cutter(comps[m.a], m.clearance), comps[m.a], comps)
+        except Exception as e:  # noqa: BLE001
+            results[key] = {"ok": False, "why": f"cutter build failed ({type(e).__name__})",
+                            "clearance": m.clearance}
+            continue
+        pre_vol, pre_solids = target.Volume(), len(target.Solids())
+        try:
+            cut = target.cut(cutter)
+        except Exception:  # noqa: BLE001
+            cut = None
+        if cut is None or _void(cut) or cut.Volume() >= pre_vol - 1e-6:
+            try:
+                cut = target.cut(cutter, tol=1e-3)
+            except Exception:  # noqa: BLE001
+                cut = None
+        if cut is None or _void(cut) or cut.Volume() >= pre_vol - 1e-6:
+            results[key] = {"ok": False, "why": "cut removed nothing (tool's grown volume misses "
+                                                "the target — move the tool or grow clearance)",
+                            "clearance": m.clearance}
+            continue
+        placed_by_name[m.b] = cut
+        results[key] = {"ok": True, "removed": pre_vol - cut.Volume(),
+                        "pre_solids": pre_solids, "post_solids": len(cut.Solids()),
+                        "clearance": m.clearance}
+    return results
 
 
 # --------------------------------------------------------------------- kinematics (revolute v1)
@@ -637,7 +917,16 @@ def _rigid_groups(asm: Assembly) -> dict:
     def union(a, b):
         if a in parent and b in parent:
             parent[find(a)] = find(b)
+    # corners pairs are placement-adjacency: they weld (an axle sunk into the chassis) UNLESS a
+    # joint claims that exact pair (a corner WHEEL rides its joint, not a weld). Real weld mates
+    # (stack/flush/attach/coaxial) are NEVER skipped — a mate welding a hinge shut must stay
+    # welded so the DOF row can catch the over-constraint.
+    jointed = {frozenset((j.a, j.b)) for j in asm.joints}
+    corner_pairs = {frozenset((p, m.around)) for m in asm.mates
+                    if m.kind == "corners" and m.around for p in (m.parts or [])}
     for pair in _mated_pairs(asm):
+        if pair in jointed and pair in corner_pairs:
+            continue
         a, b = sorted(pair)
         union(a, b)
     for m in asm.mates:                       # radial members weld to what gets stacked on them via
@@ -659,10 +948,21 @@ _AXIS_DIR = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
 
 
 def _joint_axis_point(joint: Joint, ga: cq.Solid, gb: cq.Solid) -> Tuple[float, float, float]:
-    """The point the hinge axis passes through: explicit `at`, else the midpoint of the closest
-    approach between the two groups (a hinge lives where the parts meet)."""
+    """The point the hinge axis passes through: explicit `at`; else the axis of the MOVING group's
+    own convex cylindrical face parallel to the joint axis (a wheel spins about its rim's axis, a
+    pin hinge about its pin — largest radius wins); else the midpoint of the closest approach
+    between the two groups (a face-contact hinge lives where the parts meet). The closest-approach
+    midpoint alone is WRONG for face contact: tangent to an axle-tip disc it lands anywhere on the
+    contact patch, and posing 180° about that off-axis line TRANSLATES the wheel by up to a disc
+    diameter — a phantom pose-sweep collision on a perfectly good joint."""
     if joint.at is not None:
         return joint.at
+    try:
+        pins = [(r, loc) for r, convex, loc in _axis_cyl_faces(ga, _AXIS_DIR[joint.axis]) if convex]
+        if pins:
+            return max(pins, key=lambda p: p[0])[1]
+    except Exception:  # noqa: BLE001 — census is best-effort; fall through to closest approach
+        pass
     m = BRepExtrema_DistShapeShape(ga.wrapped, gb.wrapped)
     p1, p2 = m.PointOnShape1(1), m.PointOnShape2(1)
     return ((p1.X() + p2.X()) / 2, (p1.Y() + p2.Y()) / 2, (p1.Z() + p2.Z()) / 2)
@@ -725,12 +1025,31 @@ def _rotate_about(solid: cq.Solid, at: Tuple[float, float, float], axis: str, an
 
 
 def _group_solids(asm: Assembly, placed_by_name: dict, gid_of: dict) -> dict:
-    """Fuse each rigid group's placed solids → {gid: solid} (a group with no buildable member
-    is absent)."""
+    """Fuse each rigid group's placed solids → {gid: solid}. A group with no buildable member is
+    absent — and so is one whose members BUILT but produced no geometry (a degenerate spec whose
+    cuts consume the whole solid yields an empty compound; its void Bnd_Box then explodes every
+    later BoundingBox() consumer: pose sweep, fit census, interference broad-phase)."""
     buckets: dict = {}
     for n, s in placed_by_name.items():
         buckets.setdefault(gid_of.get(n, n), []).append(s)
-    return {g: _fuse(ss) for g, ss in buckets.items() if ss}
+    out: dict = {}
+    for g, ss in buckets.items():
+        if not ss:
+            continue
+        # fuse SIMPLE solids first, dense ones (greebled megaparts) last: OCCT boolean
+        # robustness falls with face count, and chassis+axles must already be one body
+        # before the fragile greebled-loft fuse joins (proven order-sensitive).
+        try:
+            ss = sorted(ss, key=lambda s: len(s.Faces()))
+        except Exception:  # noqa: BLE001
+            pass
+        fused = _fuse(ss)
+        try:
+            fused.BoundingBox()          # void bbox ⇒ no geometry ⇒ treat the group as unbuilt
+            out[g] = fused
+        except Exception:  # noqa: BLE001 — Standard_ConstructionError / OutOfRange on void shapes
+            continue
+    return out
 
 
 def _pose_groups(asm: Assembly, group_solids: dict, gid_of: dict, angles: Optional[dict] = None) -> dict:
@@ -759,6 +1078,7 @@ def build_assembly(asm: Assembly) -> cq.Workplane:
             pass
     if not placed_by_name:
         raise ValueError("assembly has no buildable components")
+    _apply_cutouts(asm, placed_by_name, comps)   # cut phase: arches/pockets carved post-placement
     solids = list(placed_by_name.values())
     if asm.joints:
         gid_of = _rigid_groups(asm)
@@ -790,6 +1110,13 @@ def verify_assembly(asm: Assembly) -> dict:
             comps.append({"name": c.name, "passed": False, "fails": [f"build error: {type(e).__name__}"]})
     built_all = len(placed) == len(asm.components)
     placed_by_name = {c.name: s for c, s in built}
+    # CUT phase (mirrors build_assembly): carve each cutout, then RESYNC placed/built so every
+    # downstream row (interference, statics, groups, attachment) sees the arched geometry — the
+    # per-part verify above rightly ran on the UN-cut part (it stays independently verifiable).
+    cut_info = _apply_cutouts(asm, placed_by_name, comps_map)
+    if cut_info:
+        built = [(c, placed_by_name[c.name]) for c, _ in built]
+        placed = [s for _, s in built]
     n_blended = 0
     gid_of: dict = {}
     groups: dict = {}
@@ -811,14 +1138,33 @@ def verify_assembly(asm: Assembly) -> dict:
         solids, valid, env = m.solids, m.valid, {"dx": m.dx, "dy": m.dy, "dz": m.dz, "volume": m.volume}
     else:
         solids, valid, env = 0, False, {"dx": 0.0, "dy": 0.0, "dz": 0.0, "volume": 0.0}
+    # Connectivity is measured on the CONTACT graph (bare solids), not on the fused-solid count:
+    # OCCT's boolean is not a connectivity oracle — tangent parts never merge, and some valid pairs
+    # (greebled loft ↔ plate) fuse to EMPTY in every direction/tolerance. _fuse guards exports;
+    # attachment truth comes from real gaps.
+    contact_by_name: dict = {}
+    for c, ps in built:
+        try:
+            contact_by_name[c.name] = _place_world(_bare_solid(c.part), c, comps_map)
+        except Exception:  # noqa: BLE001 — fall back to the full (greebled) solid
+            contact_by_name[c.name] = ps
     if asm.joints:
-        expected_solids = max(1, len(groups))
+        buckets: dict = {}
+        for n in contact_by_name:
+            buckets.setdefault(gid_of.get(n, n), []).append(n)
+        expected_solids = max(1, len(buckets))
+        conn_measured = sum(_contact_components([(n, contact_by_name[n]) for n in ms])
+                            for ms in buckets.values()) if buckets else 0
+    elif asm.fuse:
+        expected_solids = 1
+        conn_measured = _contact_components(list(contact_by_name.items())) if contact_by_name else 0
     else:
-        expected_solids = 1 if asm.fuse else len(asm.components)
+        expected_solids = len(asm.components)
+        conn_measured = solids
     comps_ok = all(c["passed"] for c in comps) and built_all
-    connectivity_ok = built_all and solids == expected_solids
-    conn_name = ("assembly · connectivity (fused rigid groups)" if asm.joints
-                 else "assembly · connectivity (single solid)" if asm.fuse else "assembly · part count")
+    connectivity_ok = built_all and conn_measured == expected_solids
+    conn_name = ("assembly · connectivity (attached rigid groups)" if asm.joints
+                 else "assembly · connectivity (all parts attached)" if asm.fuse else "assembly · part count")
     rows = [
         {"name": "assembly · components", "expected": len(asm.components),
          "measured": sum(1 for c in comps if c["passed"]), "within_tol": comps_ok,
@@ -828,13 +1174,47 @@ def verify_assembly(asm: Assembly) -> dict:
         # mates when the real fault is the broken part. Say so, and route it as `component`.
         {"name": conn_name,
          "expected": expected_solids,
-         "measured": (solids if built_all
-                      else f"{solids} (only {len(placed)}/{len(asm.components)} parts built)"),
+         "measured": (conn_measured if built_all
+                      else f"{conn_measured} (only {len(placed)}/{len(asm.components)} parts built)"),
          "within_tol": connectivity_ok,
          "category": "ok" if connectivity_ok else ("component" if not built_all else "disconnected")},
         {"name": "assembly · valid (watertight)", "expected": True, "measured": valid,
          "within_tol": valid, "category": "ok" if valid else "validity"},
     ]
+    # Cutout rows — the associative part-to-part carve must be PROVEN, not assumed (research doc
+    # §2.5): material actually removed, the target not severed (an over-deep arch splits it into
+    # 2 solids that are each individually VALID — only the count catches it), and the well really
+    # admits the tool with its clearance (a real measured gap, not the construction's promise).
+    for m in asm.mates:
+        if m.kind != "cutout":
+            continue
+        info = cut_info.get((m.a, m.b))
+        if info is None:
+            continue
+        if not info["ok"]:
+            rows.append({"name": f"assembly · cutout ({m.a} carved from {m.b})",
+                         "expected": "material removed", "measured": info["why"],
+                         "within_tol": False, "category": "cutout"})
+            continue
+        rows.append({"name": f"assembly · cutout ({m.a} carved from {m.b})",
+                     "expected": "material removed",
+                     "measured": f"{info['removed'] / 1e3:.1f} cm³", "within_tol": True,
+                     "category": "ok"})
+        intact = info["post_solids"] <= info["pre_solids"]
+        rows.append({"name": f"assembly · cutout target intact ({m.b})",
+                     "expected": f"{info['pre_solids']} solid(s)", "measured": info["post_solids"],
+                     "within_tol": intact, "category": "ok" if intact else "cutout"})
+        if m.a in placed_by_name and m.b in placed_by_name:
+            try:
+                gap, _d = _solid_gap(placed_by_name[m.a], placed_by_name[m.b])
+                gap_ok = gap >= m.clearance - 0.1
+                rows.append({"name": f"assembly · cutout clearance ({m.a}↔{m.b})",
+                             "expected": f"≥ {m.clearance:g} mm", "measured": round(gap, 3),
+                             "within_tol": gap_ok, "category": "ok" if gap_ok else "cutout"})
+            except Exception:  # noqa: BLE001 — an unmeasurable gap is a failure, not a pass
+                rows.append({"name": f"assembly · cutout clearance ({m.a}↔{m.b})",
+                             "expected": f"≥ {m.clearance:g} mm", "measured": "unmeasurable",
+                             "within_tol": False, "category": "cutout"})
     # Structural-support check — catches the "connected but stacked/clumped" failure that the single-solid
     # connectivity test misses (the research's 'false convergence'). Intent-aware via component roles:
     #   • grounded   — the assembly rests on the floor (min-z ≈ 0), not floating or sunk
@@ -892,9 +1272,13 @@ def verify_assembly(asm: Assembly) -> dict:
         bare_placed: dict = {}
         for c in asm.components:
             try:
-                bare_placed[c.name] = _place_world(_bare_solid(c.part), c, comps_map)
-            except Exception:  # noqa: BLE001 — unbuildable part is already flagged above
+                s = _place_world(_bare_solid(c.part), c, comps_map)
+                s.BoundingBox()          # void ⇒ no geometry — skip (same guard as _group_solids)
+                bare_placed[c.name] = s
+            except Exception:  # noqa: BLE001 — unbuildable/empty part is already flagged above
                 pass
+        _apply_cutouts(asm, bare_placed, comps_map)   # arches exist on the bare solids too — a
+        #                                               carved wheel well is NOT interference
         names = [c.name for c in asm.components if c.name in bare_placed]
         worst_v, worst_pair = 0.0, ""
         for i in range(len(names)):
@@ -1009,6 +1393,22 @@ def verify_assembly(asm: Assembly) -> dict:
             rows.append({"name": f"assembly · joint fit ({j.a}↔{j.b}, ⌀ clearance)",
                          "expected": "0.1–0.8 mm", "measured": round(best, 3), "within_tol": fit_ok,
                          "category": "ok" if fit_ok else "fit"})
+        # Joint ATTACHMENT — a revolute joint is only physically real if its two sides MEET
+        # (pin in bore, hub on axle, faces in contact). The DOF/sweep rows are pure axis math
+        # and happily pass a wheel hovering 60 mm from the chassis with nothing bridging the
+        # gap — the eye catches it instantly, so the verifier must too.
+        for j in asm.joints:
+            ga, gb = gid_of.get(j.a), gid_of.get(j.b)
+            if ga is None or gb is None or ga == gb or ga not in groups or gb not in groups:
+                continue
+            try:
+                gap, _dir = _solid_gap(groups[ga], groups[gb])
+            except Exception:  # noqa: BLE001
+                continue
+            att_ok = gap <= 1.0
+            rows.append({"name": f"assembly · joint attachment ({j.a}↔{j.b} gap)",
+                         "expected": "≤ 1 mm", "measured": round(gap, 2), "within_tol": att_ok,
+                         "category": "ok" if att_ok else "kinematic"})
     # Joint blending is informational — surface the count so a render's "smoothed joints" is
     # auditable. It FAILS only if blending corrupted the solid (no seams to blend, e.g. a single
     # part or parts that merely abut, is fine — n_blended=0 with a still-valid solid passes).

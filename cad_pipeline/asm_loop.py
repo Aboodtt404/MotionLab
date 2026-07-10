@@ -58,11 +58,16 @@ _CATEGORY_FIX = {
     "component": "the named part fails on its own — fix ITS features/dims (see its failing rows); do not move other parts",
     "validity": "the fused result is not a valid solid — avoid exactly-tangent faces; overlapping mates should overlap 1–4 mm, cleanly",
     "disconnected": "some parts are not welded to the main body — every component needs a mate path (stack/flush/attach/radial); do NOT fix this by moving coordinates",
-    "integrity": "non-mated parts occupy the same space — derive their positions from ONE shared parameter (bigger radial radius, proper mate, smaller part); never nudge `at`",
-    "structure": "the assembly tips or floats — widen the support footprint (bigger radial radius, legs that reach z=0) or move mass over the support polygon",
-    "kinematic": "a joint is welded shut (remove the mate between its two sides), redundant, floating (add a joint/mate path), or its motion collides — clearance must hold over the WHOLE limits range, so enlarge the opening the moving part sweeps through or reduce limits",
+    "integrity": "non-mated parts occupy the same space — derive their positions from ONE shared parameter (bigger radial radius, proper mate, smaller part); never nudge `at`. If the collider is a redundant decorative shell (an 'arch'/'fender' part over a wheel that already has a cutout), REMOVE that part — the cutout IS the arch",
+    "structure": "the assembly tips or floats — widen the support footprint (bigger radial radius, legs that reach z=0) or move mass over the support polygon. A part whose min-z is BELOW 0 is sunk into the floor: raise its `at` z (a suspended chassis sits at z = wheel radius, never 0)",
+    "kinematic": "a joint is welded shut (remove the mate between its two sides), redundant, floating (add a joint/mate path), physically unattached (its two sides don't touch — add bridging geometry: a stub axle/pin/hub reaching from the fixed side to the moving part), or its motion collides — clearance must hold over the WHOLE limits range",
     "fit": "the joint's pin/bore clearance is not a running fit — a pin the same ⌀ as its bore is SEIZED; size the pin ⌀ = bore ⌀ − 0.2 mm (running band 0.1–0.8 mm diametral): derive one from the other, never set both independently",
     "blend": "the joint blend corrupted the solid — reduce fillet_joints (or set 0)",
+    "cutout": "a cutout (carve) failed — if it removed nothing, the tool's grown volume misses the "
+              "target (place the tool so it overlaps/abuts the target, or raise clearance); if the "
+              "target split into pieces, the carve went too deep (reduce clearance or shrink the "
+              "tool); if the clearance gap is short, another mate moved the tool after the carve "
+              "(the tool's placement mates and the cutout must agree)",
 }
 
 
@@ -108,7 +113,7 @@ def _resolve(asm: Assembly) -> Assembly:
 class VLLMAsmGenerator:
     """The live generator: planner.plan() for attempt 1, repair patches thereafter."""
     def __init__(self, base_url: str = "http://localhost:8002/v1",
-                 model: str = "qwen3.6-27b", timeout: float = 180.0):
+                 model: str = "qwen3.6-27b", timeout: float = 300.0):
         self.base_url, self.model, self.timeout = base_url, model, timeout
 
     def plan(self, prompt: str) -> Assembly:
@@ -131,8 +136,8 @@ def run_assembly(prompt: str, generator: AsmGenerator, max_attempts: int = 3) ->
     feedback = ""
     for attempt in range(1, max_attempts + 1):
         try:
-            if attempt == 1:
-                asm = generator.plan(prompt)
+            if asm is None:            # first attempt — or the previous plan() itself failed:
+                asm = generator.plan(prompt)   # re-plan; there is nothing to patch yet
             else:
                 asm = _resolve(apply_patch(asm, generator.repair(asm, feedback)))
             rep = verify_assembly(asm)

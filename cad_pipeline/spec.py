@@ -12,6 +12,111 @@ from typing import Annotated, Dict, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, Field
 
 
+def profile_extent(pts: List[Tuple[float, float]],
+                   arcs: Optional[List[float]] = None) -> Tuple[float, float, float, float]:
+    """(umin, umax, vmin, vmax) of a 2D polyline profile whose segment i has sagitta `arcs[i]`
+    (mm; 0/absent = straight). An arc bows PAST its chord, so include the perpendicular apex
+    (chord midpoint + sagitta along the left normal) AND every circle axis-extreme (center ± R
+    along u or v) that falls inside the arc span — a strongly-bulged arc reaches its true extreme
+    at an axis point, not the apex. Shared by revolve_extents (u=r, v=z) and profile_extrude."""
+    if not pts:
+        return 0.0, 0.0, 0.0, 0.0
+    us = [u for u, _ in pts]
+    vs = [v for _, v in pts]
+    for i, s in enumerate(arcs or []):
+        if not s or i + 1 >= len(pts):
+            continue
+        (u1, v1), (u2, v2) = pts[i], pts[i + 1]
+        du, dv = u2 - u1, v2 - v1
+        ln = math.hypot(du, dv)
+        if ln < 1e-9:
+            continue
+        nu, nv = -dv / ln, du / ln                       # left normal n̂
+        au, av = (u1 + u2) / 2 + s * nu, (v1 + v2) / 2 + s * nv   # sagitta apex
+        us.append(au)
+        vs.append(av)
+        half_c = ln / 2.0
+        R = (half_c * half_c + s * s) / (2.0 * abs(s))
+        cu, cv = au - R * (s / abs(s)) * nu, av - R * (s / abs(s)) * nv   # arc circle center
+        th1, th2 = math.atan2(v1 - cv, u1 - cu), math.atan2(v2 - cv, u2 - cu)
+        tha = math.atan2(av - cv, au - cu)
+
+        def _dist(a: float, b: float) -> float:
+            d = (a - b) % (2 * math.pi)
+            return min(d, 2 * math.pi - d)
+
+        span1, span2 = _dist(th1, tha), _dist(th2, tha)
+        for th, is_u in ((0.0, True), (math.pi, True), (math.pi / 2, False), (-math.pi / 2, False)):
+            if _dist(th, tha) <= max(span1, span2) + 1e-9:
+                if is_u:
+                    us.append(cu + R * math.cos(th))
+                else:
+                    vs.append(cv + R * math.sin(th))
+    return min(us), max(us), min(vs), max(vs)
+
+
+def _segments_intersect(a1, a2, b1, b2) -> bool:
+    """Do open segments a1a2 and b1b2 properly cross (shared endpoints don't count)?"""
+    def cross(o, p, q):
+        return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+    d1, d2 = cross(b1, b2, a1), cross(b1, b2, a2)
+    d3, d4 = cross(a1, a2, b1), cross(a1, a2, b2)
+    if ((d1 > 1e-9 and d2 < -1e-9) or (d1 < -1e-9 and d2 > 1e-9)) and \
+       ((d3 > 1e-9 and d4 < -1e-9) or (d3 < -1e-9 and d4 > 1e-9)):
+        return True
+    return False
+
+
+def profile_is_simple(pts: List[Tuple[float, float]],
+                      arcs: Optional[List[float]] = None) -> bool:
+    """Is the CLOSED profile a simple polygon (non-self-intersecting, ≥3 pts, positive area)?
+    Arcs are flattened to a fine polyline first (the representation can't guarantee simplicity —
+    it must be CHECKED; docs/research/track-a-silhouette-cutout-wheel.md §1.4). Adjacent segments
+    sharing an endpoint are skipped; any other crossing ⇒ not simple."""
+    if not pts or len(pts) < 3:
+        return False
+    poly: List[Tuple[float, float]] = []
+    ring = list(pts) + [pts[0]]
+    arcs = list(arcs or [])
+    for i in range(len(ring) - 1):
+        (u1, v1), (u2, v2) = ring[i], ring[i + 1]
+        s = arcs[i] if i < len(arcs) else 0.0
+        poly.append((u1, v1))
+        if s:                                            # tessellate the arc into ~12 chords
+            du, dv = u2 - u1, v2 - v1
+            ln = math.hypot(du, dv)
+            if ln > 1e-9:
+                nu, nv = -dv / ln, du / ln
+                au, av = (u1 + u2) / 2 + s * nu, (v1 + v2) / 2 + s * nv
+                half_c = ln / 2.0
+                R = (half_c * half_c + s * s) / (2.0 * abs(s))
+                cu, cv = au - R * (s / abs(s)) * nu, av - R * (s / abs(s)) * nv
+                th1, th2 = math.atan2(v1 - cv, u1 - cu), math.atan2(v2 - cv, u2 - cu)
+                dth = (th2 - th1 + math.pi) % (2 * math.pi) - math.pi   # shortest signed sweep
+                for k in range(1, 12):
+                    th = th1 + dth * k / 12.0
+                    poly.append((cu + R * math.cos(th), cv + R * math.sin(th)))
+    n = len(poly)
+    if n < 3:
+        return False
+    area = 0.0
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        area += x1 * y2 - x2 * y1
+    if abs(area) < 1e-6:
+        return False                                     # degenerate / zero-area
+    for i in range(n):
+        a1, a2 = poly[i], poly[(i + 1) % n]
+        for j in range(i + 1, n):
+            if j == i or (j + 1) % n == i or (i + 1) % n == j:
+                continue                                 # adjacent segments share an endpoint
+            b1, b2 = poly[j], poly[(j + 1) % n]
+            if _segments_intersect(a1, a2, b1, b2):
+                return False
+    return True
+
+
 class ThroughHole(BaseModel):
     type: Literal["through_hole"] = "through_hole"
     diameter: float
@@ -182,10 +287,14 @@ Feature = Annotated[
 
 
 class Spec(BaseModel):
+    # `kind` discriminates Spec from SketchExtrude inside a feature-program Step.operand union;
+    # defaulted + additive, so every existing Spec(...) call and the planner's schema are unaffected.
+    kind: Literal["spec"] = "spec"
     object: str = "part"
     asset_class: Literal["hard_surface"] = "hard_surface"
     fabrication: Literal["render", "fabricate"] = "render"
-    shape: Literal["box", "cylinder", "loft", "revolve", "sweep"]
+    shape: Literal["box", "cylinder", "loft", "revolve", "sweep", "profile_extrude",
+                   "loft_sections"]
     # box: length/width/height · cylinder: diameter/height
     # loft (a TAPERED bar — engineered arm/strut): tapers along its length (local X) from a base
     # profile at the −X end to a tip profile at the +X end. envelope = length (taper axis) +
@@ -204,6 +313,23 @@ class Spec(BaseModel):
     # analytic spheres/tori, so domes/barrels/flares stay exactly verifiable.
     profile_arcs: Optional[List[float]] = None
     path: Optional[List[Tuple[float, float, float]]] = None  # sweep path: [(x, y, z), …]
+    # profile_extrude (a SILHOUETTE body — car/fuselage/hull/furniture frame): the SIDE outline in
+    # the X–Z plane (hood→windshield→roof→trunk) extruded along Y, optionally INTERSECTED with a
+    # PLAN (top-view) outline in the X–Y plane. Each is a closed polyline in the SAME (points +
+    # per-segment sagitta) convention as revolve. If plan_profile is absent the body is a plain
+    # silhouette extrude of envelope["width"]; if present, the plan trims the width per-station
+    # (rounded/narrowed greenhouse & nose). The X axis is SHARED and intersected; docs/research/
+    # track-a-silhouette-cutout-wheel.md §1. Built centered on the origin, like box/loft.
+    side_profile: Optional[List[Tuple[float, float]]] = None  # (x, z) outline points
+    side_arcs: Optional[List[float]] = None                   # sagitta per side segment
+    plan_profile: Optional[List[Tuple[float, float]]] = None  # (x, y) top-view outline (optional)
+    plan_arcs: Optional[List[float]] = None                   # sagitta per plan segment
+    # loft_sections (the HERO body — true double curvature, beyond profile_extrude's prismatic
+    # flanks): N cross-section STATIONS along X, each a rounded-rect/ellipse of width×height with
+    # its own center height, smoothly lofted (NOT ruled). The loft passes through each station
+    # wire EXACTLY, so the verifier slices at the stations (exact) and tessellates only for the
+    # between-station overshoot. sections: [{x, width, height, z_center?, kind?}] sorted by x.
+    sections: Optional[List[Dict[str, Union[float, str]]]] = None
     features: List[Feature] = Field(default_factory=list)
     tolerance: float = 0.1  # ± mm on directly-specified dimensions
     # DFM gates (advisory; each off at its zero/false default so plain specs are unaffected)
@@ -239,7 +365,35 @@ class Spec(BaseModel):
         if self.shape == "revolve":
             d, h = self.revolve_extents()
             return {"diameter": d, "height": h}
+        if self.shape == "profile_extrude":
+            xl, yl, zl = self.profile_extrude_extents()
+            return {"length": xl, "width": yl, "height": zl}
+        if self.shape == "loft_sections":
+            ss = self.sections or []
+            if not ss:
+                return {"length": 0.0, "width": 0.0, "height": 0.0}
+            zs_lo = [s.get("z_center", s["height"] / 2) - s["height"] / 2 for s in ss]
+            zs_hi = [s.get("z_center", s["height"] / 2) + s["height"] / 2 for s in ss]
+            return {"length": max(s["x"] for s in ss) - min(s["x"] for s in ss),
+                    "width": max(s["width"] for s in ss),
+                    "height": max(zs_hi) - min(zs_lo)}
         return {"diameter": e["diameter"], "height": e["height"]}
+
+    def profile_extrude_extents(self) -> Tuple[float, float, float]:
+        """(x_len, y_len, z_len) of a profile_extrude. X and Z come from the side outline (arc-aware
+        via profile_extent). Y (and the X trim) come from the plan outline if present, else from
+        envelope['width']. X is the SHARED axis of the two extrudes, so it's the INTERSECTION of the
+        two X ranges — a plan narrower than the side in X shortens the body."""
+        sx0, sx1, sz0, sz1 = profile_extent(self.side_profile or [], self.side_arcs or [])
+        x0, x1, z0, z1 = sx0, sx1, sz0, sz1
+        if self.plan_profile:
+            px0, px1, py0, py1 = profile_extent(self.plan_profile, self.plan_arcs or [])
+            x0, x1 = max(x0, px0), min(x1, px1)          # shared X axis ⇒ intersect
+            y0, y1 = py0, py1
+        else:
+            w = self.envelope.get("width", 0.0)
+            y0, y1 = -w / 2.0, w / 2.0
+        return (max(0.0, x1 - x0), max(0.0, y1 - y0), max(0.0, z1 - z0))
 
     def path_length(self) -> float:
         """Total length of the sweep `path` polyline."""
@@ -248,22 +402,12 @@ class Spec(BaseModel):
 
     def revolve_extents(self) -> Tuple[float, float]:
         """(diameter, height) of a revolve from its meridian: ⌀ = 2·max(radius), height = z-span.
-        Arc segments (profile_arcs) can bow PAST their endpoints — include each arc's apex
-        (chord midpoint + sagitta along the left normal) so a barrel's bulge counts."""
-        p = self.profile or []
-        rs = [r for r, _ in p]
-        zs = [z for _, z in p]
-        for i, s in enumerate(self.profile_arcs or []):
-            if not s or i + 1 >= len(p):
-                continue
-            (r1, z1), (r2, z2) = p[i], p[i + 1]
-            dr, dz = r2 - r1, z2 - z1
-            ln = math.hypot(dr, dz)
-            if ln < 1e-9:
-                continue
-            rs.append((r1 + r2) / 2 + s * (-dz / ln))   # apex = mid + s·n̂, n̂ = (−dz, dr)/|d|
-            zs.append((z1 + z2) / 2 + s * (dr / ln))
-        return (2 * max(rs) if rs else 0.0, (max(zs) - min(zs)) if zs else 0.0)
+        Arc-aware (a bulged meridian bows past its chord) via the shared `profile_extent` — u=r,
+        v=z; the same math that gives profile_extrude its (x,z) extents."""
+        if not self.profile:
+            return 0.0, 0.0
+        rmin, rmax, zmin, zmax = profile_extent(self.profile, self.profile_arcs or [])
+        return (2 * rmax, zmax - zmin)
 
 
 # Feature ↔ shape compatibility (mirrors the builder's guards — single source of truth).
@@ -286,6 +430,12 @@ def feature_shape_conflicts(spec: "Spec") -> List[str]:
         elif f.type == "thread" and getattr(f, "kind", "internal") == "internal" \
                 and spec.shape not in ("box", "cylinder"):
             out.append(f.type)
+        # an EXTERNAL thread lives on the part's own outer diameter — an M20 thread floating on
+        # an ⌀80 axle is unrealizable (and its helical render poisons downstream booleans)
+        elif f.type == "thread" and getattr(f, "kind", "internal") == "external" \
+                and spec.shape == "cylinder" \
+                and abs(getattr(f, "diameter", 0.0) - spec.envelope.get("diameter", 0.0)) > 1.0:
+            out.append("thread⌀≠OD")
         # draft tapers the side walls, so the |Z ("all_vertical") edge selectors that fillet/
         # chamfer/var_fillet bind to no longer match anything → "Fillets requires that edges
         # be selected" at build. A drafted part gets its edge character from the taper itself.
@@ -316,3 +466,82 @@ def expected_holes(spec: "Spec") -> List[Tuple[float, float, float, float, str]]
         elif isinstance(f, HolePattern):
             out.extend((px, py, 0.0, f.diameter, "z") for px, py in f.points())
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# Feature-program part representation (the CSG + sketch-extrude hybrid).
+# docs/research/track-a-feature-program-representation.md — a Part is an ORDERED PROGRAM of steps
+# executed statefully against a running solid G (the paper's `P := G; [X]`), replacing the flat
+# "one primitive + fixed feature menu" model. Each step contributes a body (an OPERAND — reusing
+# the full Spec shape vocabulary as the operand builder, so box/cylinder are CSG primitives and
+# profile_extrude/revolve/loft_sections are sketched-profile bodies) combined into G by a boolean
+# op. A hole is a `cut` with a cylinder; a boss is a `join`; the side∩plan trick is `intersect`.
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+
+class SketchLoop(BaseModel):
+    """One closed loop of a sketch profile (in the sketch plane's local 2D coords, mm). Either a
+    full `circle` (center_u, center_v, radius) or a polyline of `pts` with per-segment modifiers.
+    Segment i runs pts[i]→pts[(i+1)%N]; it is a straight LINE by default, an ARC if `arcs[i]` (a
+    sagitta, same convention as revolve/profile_extrude), or a SPLINE through `splines[i]` (a list
+    of on-curve points ending at the segment's end). `splines` defaults to None → old line/arc
+    behaviour (backward compatible). Splines keep a NURBS curve as ONE smooth edge instead of a
+    ~24-segment polyline, which otherwise explodes the face count and hangs booleans. `outer` False
+    = a hole."""
+    kind: Literal["sketch_loop"] = "sketch_loop"
+    outer: bool = True
+    circle: Optional[Tuple[float, float, float]] = None      # (center_u, center_v, radius)
+    pts: Optional[List[Tuple[float, float]]] = None
+    arcs: Optional[List[float]] = None
+    splines: Optional[List[Optional[List[Tuple[float, float]]]]] = None  # per-segment spline pts
+
+
+class SketchExtrude(BaseModel):
+    """The GENERAL feature-program operand (docs/research/track-a-feature-program-representation.md
+    §3.1): a sketch of loops on an ARBITRARY plane, extruded a signed distance. This is what real
+    CAD is (Fusion's sketch+extrude) and what fixed-plane `profile_extrude` cannot express (arbitrary
+    plane pose). Built already in WORLD coordinates (the plane carries the pose), so its Step's
+    `at`/`rotate` are the identity. `symmetric` extrudes ±distance (distance is then the half-extent).
+    """
+    kind: Literal["sketch_extrude"] = "sketch_extrude"
+    plane: List[Tuple[float, float, float]]                  # [origin, x_dir, normal] in world mm
+    loops: List[SketchLoop]
+    distance: float
+    symmetric: bool = False
+
+
+class Step(BaseModel):
+    """One instruction in a part program: build `operand`, place it at `at`/`rotate`, then combine
+    it into the running solid G with the boolean `op`. The operand is EITHER a single-primitive
+    `Spec` (box/cylinder as CSG primitives; profile_extrude/revolve/loft_sections as sketched
+    bodies) OR a general `SketchExtrude` (arbitrary-plane sketch — the native feature-program body).
+
+    - new_body: start G (first step), or add a disjoint lump (later steps; v1 fuses it — most real
+      parts are single-body, so we keep one solid rather than a multi-body compound).
+    - join: G = G ∪ operand (a boss, rib, flange).
+    - cut: G = G − operand (a hole, slot, pocket — the CSG 'carve').
+    - intersect: G = G ∩ operand (trim to a silhouette; profile_extrude's side∩plan generalized).
+    """
+    op: Literal["new_body", "join", "cut", "intersect"] = "new_body"
+    operand: Union["Spec", SketchExtrude] = Field(discriminator="kind")
+    at: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    rotate: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+class Part(BaseModel):
+    """A part as a program of steps (feature-program representation). The executor (`build_part`)
+    folds the steps left-to-right; the verifier measures the resulting solid. A single-primitive
+    Spec transpiles to a one-step program via `spec_to_part` — full backward compatibility."""
+    object: str = "part"
+    asset_class: Literal["hard_surface"] = "hard_surface"
+    fabrication: Literal["render", "fabricate"] = "render"
+    steps: List[Step] = Field(default_factory=list)
+    tolerance: float = 0.1
+
+
+def spec_to_part(spec: "Spec") -> Part:
+    """Transpile a single-primitive Spec into a one-step program — the backward-compat bridge.
+    The operand carries the spec's own features (holes/fillets/…), which the builder still applies,
+    so `build_part(spec_to_part(spec))` is geometrically identical to `build(spec)`."""
+    return Part(object=spec.object, asset_class=spec.asset_class, fabrication=spec.fabrication,
+                tolerance=spec.tolerance,
+                steps=[Step(op="new_body", operand=spec)])

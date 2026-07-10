@@ -7,6 +7,7 @@ oracle. Mirrors the operation vocabulary the generator is allowed to use.
 """
 from __future__ import annotations
 
+import json
 import math
 import random
 
@@ -16,7 +17,7 @@ from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
 
 from .selectors import CQ_EDGE
-from .spec import Spec, expected_holes
+from .spec import Part, SketchExtrude, SketchLoop, Spec, expected_holes
 
 
 def _ensure_positive(r):
@@ -310,6 +311,10 @@ def build(spec: Spec) -> cq.Workplane:
         r = _revolve_solid(spec)
     elif spec.shape == "sweep":
         r = _sweep_solid(spec)
+    elif spec.shape == "profile_extrude":
+        r = _profile_extrude_solid(spec)
+    elif spec.shape == "loft_sections":
+        r = _loft_sections_solid(spec)
     else:
         D, H = spec.envelope["diameter"], spec.envelope["height"]
         r = cq.Workplane("XY").circle(D / 2).extrude(H)
@@ -398,6 +403,134 @@ def build(spec: Spec) -> cq.Workplane:
     return r
 
 
+def _void(s) -> bool:
+    """A solid that is empty / has no volume — an unusable boolean result."""
+    try:
+        return s is None or not s.Solids() or s.Volume() <= 1e-9
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _boolean(g, operand, op: str):
+    """Combine `operand` into the running solid `g` under a feature-program boolean `op`, robust to
+    OCCT's failure modes (empty/inside-out result, order sensitivity, near-tangent faces). Mirrors
+    assembly._fuse/_lost — kept local because builder must not import assembly (circular). A
+    join/new_body that would LOSE geometry (result smaller than the bigger operand — impossible for
+    a real union) retries reversed, then fuzzy; cut/intersect just fall back to fuzzy tol."""
+    if g is None:
+        return operand
+    def _lost(res):                                      # union can't shrink below its bigger operand
+        if _void(res):
+            return True
+        try:
+            return res.Volume() < max(g.Volume(), operand.Volume()) * 0.999
+        except Exception:  # noqa: BLE001
+            return True
+    if op in ("join", "new_body"):                       # new_body on a non-empty G ⇒ disjoint union (v1)
+        for attempt in (lambda: g.fuse(operand), lambda: operand.fuse(g),
+                        lambda: g.fuse(operand, tol=1e-3)):
+            try:
+                res = attempt()
+            except Exception:  # noqa: BLE001
+                res = None
+            if not _lost(res):
+                return res
+        return cq.Compound.makeCompound([g, operand])    # last resort: keep both, seam shows honestly
+    if op == "cut":
+        for attempt in (lambda: g.cut(operand), lambda: g.cut(operand, tol=1e-3)):
+            try:
+                res = attempt()
+                if not _void(res):
+                    return res
+            except Exception:  # noqa: BLE001
+                continue
+        return g                                          # a cut that removes nothing leaves G intact
+    if op == "intersect":
+        for attempt in (lambda: g.intersect(operand), lambda: g.intersect(operand, tol=1e-3)):
+            try:
+                res = attempt()
+                if not _void(res):
+                    return res
+            except Exception:  # noqa: BLE001
+                continue
+        raise ValueError("intersect produced an empty solid (operands don't overlap)")
+    raise ValueError(f"unknown boolean op {op!r}")
+
+
+def _loop_wire(wp: cq.Workplane, loop: SketchLoop):
+    """Trace one sketch loop onto workplane `wp`: a full circle, or a closed polyline of N points
+    whose `arcs` carry ONE sagitta per segment INCLUDING the closing segment pts[N-1]→pts[0] (so a
+    loop made entirely of arcs — a stadium/rounded shape with no straight edge — closes with an arc
+    too, unlike `_profile_wire` whose `close()` forces the last segment straight). Local 2D, mm."""
+    if loop.circle is not None:
+        cu, cv, r = loop.circle
+        return wp.moveTo(cu, cv).circle(r)
+    pts, arcs, spl = loop.pts, list(loop.arcs or []), list(loop.splines or [])
+    n = len(pts)
+
+    def _seg(r, i, target):
+        """Draw segment i (to `target`): a SPLINE through splines[i] (one smooth edge — keeps a
+        NURBS from exploding into many faces), else an ARC (sagitta arcs[i]), else a LINE."""
+        sp = spl[i] if i < len(spl) else None
+        if sp:
+            return r.spline([tuple(p) for p in sp])      # spline pts end at `target`
+        s = arcs[i] if i < len(arcs) else 0.0
+        return r.sagittaArc(target, s) if s else r.lineTo(*target)
+
+    r = wp.moveTo(*pts[0])
+    for i in range(1, n):                                # segments pts[0]→…→pts[n-1]
+        r = _seg(r, i - 1, tuple(pts[i]))
+    r = _seg(r, n - 1, tuple(pts[0]))                    # closing segment pts[n-1]→pts[0]
+    return r.close()
+
+
+def _sketch_extrude_solid(op: SketchExtrude) -> cq.Solid:
+    """Build a SketchExtrude operand: its outer loop extruded a signed distance on the operand's
+    own world plane, inner loops (holes) cut. Already in world coordinates (the plane carries the
+    pose), so the owning Step places it with the identity."""
+    o, xd, nz = op.plane
+    plane = cq.Plane(origin=tuple(o), xDir=tuple(xd), normal=tuple(nz))
+    outer = next((lp for lp in op.loops if lp.outer), op.loops[0])
+    solid = _loop_wire(cq.Workplane(plane), outer).extrude(op.distance, both=op.symmetric)
+    for lp in op.loops:
+        if lp is outer or lp.outer:
+            continue
+        try:
+            hole = _loop_wire(cq.Workplane(plane), lp).extrude(abs(op.distance) * 3, both=True)
+            solid = solid.cut(hole)
+        except Exception:  # noqa: BLE001 — a bad hole drops the hole, not the whole operand
+            continue
+    return solid.val()
+
+
+def build_part(part: Part) -> cq.Workplane:
+    """Execute a feature-program Part: fold its steps left-to-right against a running solid G,
+    building each operand (a Spec via build() — box/cylinder as CSG primitives, profile_extrude/
+    revolve/loft_sections as sketched bodies — or a SketchExtrude directly), placing it
+    at at/rotate, and combining it with the step's boolean op. Returns G as a Workplane.
+    docs/research/track-a-feature-program-representation.md §3.2."""
+    g = None
+    for i, step in enumerate(part.steps):
+        try:
+            operand = (_sketch_extrude_solid(step.operand)
+                       if isinstance(step.operand, SketchExtrude)
+                       else build(step.operand).val())
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"step {i} ({step.op}): operand build failed: {e}") from e
+        for ax, ang in zip(("x", "y", "z"), step.rotate):
+            if ang:
+                operand = operand.rotate((0, 0, 0), _DIR[ax], ang)
+        if step.at != (0.0, 0.0, 0.0):
+            operand = operand.translate(cq.Vector(*step.at))
+        if g is None and step.op != "new_body":
+            g = operand                                   # first step is implicitly the base body
+        else:
+            g = _boolean(g, operand, step.op)
+    if g is None:
+        raise ValueError("empty part program (no steps)")
+    return cq.Workplane(obj=g)
+
+
 _DIR = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
 
 
@@ -446,6 +579,85 @@ def _sweep_solid(spec: Spec) -> cq.Workplane:
     return prof.sweep(cq.Workplane(obj=path_wire), isFrenet=True)
 
 
+def _profile_wire(wp: cq.Workplane, pts, arcs):
+    """Trace a closed 2D outline on `wp`: straight `lineTo` per segment, `sagittaArc` where the
+    segment carries a non-zero sagitta (the SAME idiom as _revolve_solid). Returns the closed wp."""
+    r = wp.moveTo(*pts[0])
+    arcs = list(arcs or [])
+    for i, p in enumerate(pts[1:]):
+        s = arcs[i] if i < len(arcs) else 0.0
+        r = r.sagittaArc(tuple(p), s) if s else r.lineTo(*p)
+    return r.close()
+
+
+def _profile_extrude_solid(spec: Spec) -> cq.Workplane:
+    """A SILHOUETTE body: the side outline (X–Z) extruded along Y, optionally intersected with the
+    plan outline (X–Y) extruded along Z (docs/research/track-a-silhouette-cutout-wheel.md §1). The
+    XZ workplane normal is −Y, so `extrude(h, both=True)` sweeps ±h (symmetric/centered) — a plain
+    extrude would sweep to −Y only. Built then CENTERED on the origin like box/loft."""
+    from .spec import profile_extent, profile_is_simple
+    side = spec.side_profile or []
+    if len(side) < 3 or not profile_is_simple(side, spec.side_arcs):
+        raise ValueError("profile_extrude: side_profile must be a simple closed outline (≥3 pts)")
+    sx0, sx1, sz0, sz1 = profile_extent(side, spec.side_arcs or [])
+    if spec.plan_profile:
+        plan = spec.plan_profile
+        if len(plan) < 3 or not profile_is_simple(plan, spec.plan_arcs):
+            raise ValueError("profile_extrude: plan_profile must be a simple closed outline (≥3 pts)")
+        _, _, py0, py1 = profile_extent(plan, spec.plan_arcs or [])
+        yhalf = max(abs(py0), abs(py1)) + 10.0            # side must OVERHANG the plan so ∩ trims it
+    else:
+        yhalf = spec.envelope.get("width", 0.0) / 2.0
+    body = _profile_wire(cq.Workplane("XZ"), side, spec.side_arcs).extrude(yhalf, both=True)
+    if spec.plan_profile:
+        zpad = (sz1 - sz0) * 0.5 + 20.0                   # plan prism must span the full side height
+        plan_solid = (_profile_wire(cq.Workplane("XY"), spec.plan_profile, spec.plan_arcs)
+                      .extrude((sz1 - sz0) + 40.0)
+                      .translate(cq.Vector(0, 0, sz0 - 20.0)))
+        body = body.intersect(plan_solid)
+        if not body.val().Solids():
+            raise ValueError("profile_extrude: side ∩ plan is empty (outlines don't overlap in X)")
+    v = body.val()
+    b = v.BoundingBox()
+    return cq.Workplane(obj=v.translate(cq.Vector(-(b.xmin + b.xmax) / 2,
+                                                  -(b.ymin + b.ymax) / 2,
+                                                  -(b.zmin + b.zmax) / 2)))
+
+
+def _section_sketch(s: dict) -> "cq.Sketch":
+    """One loft station: a rounded-rect (default) or ellipse of width×height. Corner radius is
+    DERIVED (0.25·min(w,h)) so the verifier can recompute the exact section area."""
+    w, h = s["width"], s["height"]
+    if s.get("kind") == "ellipse":
+        return cq.Sketch().ellipse(w / 2, h / 2)
+    r = 0.25 * min(w, h)
+    sk = cq.Sketch().rect(w, h)
+    return sk.vertices().fillet(r) if r > 0 else sk
+
+
+def section_area(s: dict) -> float:
+    """Closed-form area of a station section (shared builder/verifier truth)."""
+    import math as _m
+    w, h = s["width"], s["height"]
+    if s.get("kind") == "ellipse":
+        return _m.pi * w * h / 4.0
+    r = 0.25 * min(w, h)
+    return w * h - (4 - _m.pi) * r * r
+
+
+def _loft_sections_solid(spec: Spec) -> cq.Workplane:
+    """HERO body: smooth (non-ruled) loft through N station sections along X — true double
+    curvature (the research's construction (b), in scope per the take-on-impossible directive;
+    verified by at-station slicing since the loft passes through each wire EXACTLY there)."""
+    ss = sorted(spec.sections or [], key=lambda s: s["x"])
+    if len(ss) < 2:
+        raise ValueError("loft_sections needs ≥ 2 sections")
+    placed = [_section_sketch(s).moved(cq.Location(cq.Vector(0, s.get("z_center", s["height"] / 2),
+                                                             s["x"])))
+              for s in ss]   # YZ plane: local x=world y, local y=world z, normal offset=world x
+    return cq.Workplane("YZ").placeSketch(*placed).loft(ruled=False)
+
+
 def _axis_extent(spec: Spec, axis: str) -> float:
     """Full part extent along an axis (so the cutter spans the whole part + margin)."""
     if spec.shape == "box":
@@ -456,14 +668,37 @@ def _axis_extent(spec: Spec, axis: str) -> float:
     if spec.shape == "revolve":
         d, h = spec.revolve_extents()
         return h if axis == "z" else d
+    if spec.shape == "profile_extrude":
+        xl, yl, zl = spec.profile_extrude_extents()
+        return {"x": xl, "y": yl, "z": zl}[axis]
+    if spec.shape == "loft_sections":
+        d = spec.envelope_dims()
+        return {"x": d["length"], "y": d["width"], "z": d["height"]}[axis]
     return spec.envelope["height"] if axis == "z" else spec.envelope["diameter"]
+
+
+def _axis_center(spec: Spec, axis: str) -> float:
+    """The part's center along `axis` in its LOCAL build frame. box/loft/profile_extrude are built
+    CENTERED (0); a cylinder rises z 0..H and a revolve spans its meridian's z-range — anchoring a
+    through-cutter at 0 on those HALF-DRILLS the hole (the corpus-flange bug: bolt circles that
+    stop mid-part yet verified, because the census checks position/⌀, not depth)."""
+    if axis == "z":
+        if spec.shape == "cylinder":
+            return spec.envelope["height"] / 2.0
+        if spec.shape == "revolve":
+            zs = [z for _, z in (spec.profile or [(0.0, 0.0)])]
+            return (min(zs) + max(zs)) / 2.0
+    return 0.0
 
 
 def _hole_cutter(px: float, py: float, pz: float, d: float, axis: str, spec: Spec) -> cq.Solid:
     """A through-cylinder along `axis` passing through (px,py,pz), spanning the part + margin.
-    Works for any axis (x/y/z), so cross-drilled 'Swiss-cheese' holes are first-class."""
+    Works for any axis (x/y/z), so cross-drilled 'Swiss-cheese' holes are first-class. The free
+    (along-axis) coordinate is forced to the part's ACTUAL center (see _axis_center)."""
     dx, dy, dz = _DIR[axis]
     half = _axis_extent(spec, axis) / 2 + 1.0
+    c = _axis_center(spec, axis)
+    px, py, pz = ((c, py, pz) if axis == "x" else (px, c, pz) if axis == "y" else (px, py, c))
     start = cq.Vector(px - dx * half, py - dy * half, pz - dz * half)
     return cq.Solid.makeCylinder(d / 2, _axis_extent(spec, axis) + 2.0, start, cq.Vector(dx, dy, dz))
 
@@ -509,6 +744,47 @@ def emit_code(spec: Spec) -> str:
         L.append("_path = cq.Wire.assembleEdges(_edges); _t0 = (_pts[1]-_pts[0]).normalized()")
         L.append(f'result = cq.Workplane(cq.Plane(origin=_pts[0].toTuple(), normal=_t0.toTuple())).circle({e["diameter"] / 2}).sweep(cq.Workplane(obj=_path), isFrenet=True)')
         L.append(f"L = {e['diameter']}")
+    elif spec.shape == "profile_extrude":
+        # SILHOUETTE body: side (X-Z) extruded ±Y (both=True), optional ∩ plan (X-Y) extruded Z, then
+        # centered — MUST match _profile_extrude_solid() exactly (corpus gates on the emitted artifact).
+        from .spec import profile_extent
+        _sx0, _sx1, _sz0, _sz1 = profile_extent(spec.side_profile or [], spec.side_arcs or [])
+        L.append(f"_side = {[list(p) for p in (spec.side_profile or [])]}")
+        L.append(f"_sarc = {list(spec.side_arcs or [])}")
+        L.append("def _wire(_wp, _pts, _arcs):")
+        L.append("    _r = _wp.moveTo(*_pts[0])")
+        L.append("    for _i, _p in enumerate(_pts[1:]):")
+        L.append("        _s = _arcs[_i] if _i < len(_arcs) else 0.0")
+        L.append("        _r = _r.sagittaArc(tuple(_p), _s) if _s else _r.lineTo(*_p)")
+        L.append("    return _r.close()")
+        if spec.plan_profile:
+            _, _, _py0, _py1 = profile_extent(spec.plan_profile, spec.plan_arcs or [])
+            _yhalf = max(abs(_py0), abs(_py1)) + 10.0
+            L.append(f"_plan = {[list(p) for p in spec.plan_profile]}")
+            L.append(f"_parc = {list(spec.plan_arcs or [])}")
+            L.append(f'_body = _wire(cq.Workplane("XZ"), _side, _sarc).extrude({_yhalf}, both=True)')
+            L.append(f'_plan_solid = _wire(cq.Workplane("XY"), _plan, _parc).extrude({(_sz1 - _sz0) + 40.0}).translate(cq.Vector(0, 0, {_sz0 - 20.0}))')
+            L.append("_body = _body.intersect(_plan_solid)")
+        else:
+            L.append(f'_body = _wire(cq.Workplane("XZ"), _side, _sarc).extrude({spec.envelope.get("width", 0.0) / 2.0}, both=True)')
+        L.append("_bb = _body.val().BoundingBox()")
+        L.append("result = cq.Workplane(obj=_body.val().translate(cq.Vector(-(_bb.xmin+_bb.xmax)/2, -(_bb.ymin+_bb.ymax)/2, -(_bb.zmin+_bb.zmax)/2)))")
+        L.append(f"L = {round(_sx1 - _sx0, 4)}")
+    elif spec.shape == "loft_sections":
+        ss = sorted(spec.sections or [], key=lambda s: s["x"])
+        L.append(f"_ss = {json.dumps(ss)}")
+        L.append("_sks = []")
+        L.append("for _s in _ss:")
+        L.append("    _w, _h = _s['width'], _s['height']")
+        L.append("    if _s.get('kind') == 'ellipse':")
+        L.append("        _sk = cq.Sketch().ellipse(_w/2, _h/2)")
+        L.append("    else:")
+        L.append("        _r = 0.25 * min(_w, _h)")
+        L.append("        _sk = cq.Sketch().rect(_w, _h)")
+        L.append("        _sk = _sk.vertices().fillet(_r) if _r > 0 else _sk")
+        L.append("    _sks.append(_sk.moved(cq.Location(cq.Vector(0, _s.get('z_center', _h/2), _s['x']))))")
+        L.append('result = cq.Workplane("YZ").placeSketch(*_sks).loft(ruled=False)')
+        L.append(f"L = {round(max(s['x'] for s in ss) - min(s['x'] for s in ss), 4) if ss else 0.0}")
     else:
         L.append(f"D, H = {e['diameter']}, {e['height']}")
         L.append('result = cq.Workplane("XY").circle(D / 2).extrude(H)')
@@ -593,6 +869,8 @@ def emit_code(spec: Spec) -> str:
         dx, dy, dz = _DIR[axis]
         ext = _axis_extent(spec, axis)
         h = round(ext / 2 + 1.0, 4)
+        c = _axis_center(spec, axis)   # anchor at the part's real center (parity with _hole_cutter)
+        px, py, pz = ((c, py, pz) if axis == "x" else (px, c, pz) if axis == "y" else (px, py, c))
         L.append(f'result = result.cut(cq.Solid.makeCylinder({d / 2}, {round(ext + 2.0, 4)}, '
                  f'cq.Vector({round(px - dx * h, 4)}, {round(py - dy * h, 4)}, {round(pz - dz * h, 4)}), '
                  f'cq.Vector({dx}, {dy}, {dz})))')
@@ -600,8 +878,9 @@ def emit_code(spec: Spec) -> str:
         if f.type == "thread" and f.kind == "internal":
             ax, ay = f.at or (0.0, 0.0)
             ext = _axis_extent(spec, "z"); h = round(ext / 2 + 1.0, 4)
+            zc = round(_axis_center(spec, "z") - h, 4)
             L.append(f'result = result.cut(cq.Solid.makeCylinder({f.diameter / 2}, {round(ext + 2.0, 4)}, '
-                     f'cq.Vector({ax}, {ay}, {-h}), cq.Vector(0.0, 0.0, 1.0)))')
+                     f'cq.Vector({ax}, {ay}, {zc}), cq.Vector(0.0, 0.0, 1.0)))')
     for f in spec.features:
         if f.type == "counterbore":
             L.append(f'result = result.faces(">Z").workplane().pushPoints([{list(f.at or (0.0, 0.0))}])'

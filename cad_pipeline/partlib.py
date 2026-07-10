@@ -88,7 +88,8 @@ _STANDARDS_LINE = (
     + f"; rotating pin in bore: bore ⌀ = pin ⌀ + {RUNNING_FIT_DIAMETRAL[0]}–{RUNNING_FIT_DIAMETRAL[1]} "
     f"(0.2 nominal — NEVER equal, that's a seized joint); printed press fit: bore = insert OD − 0.05; "
     f"heat-set M3 boss: OD ⌀{HEATSET_M3['boss_od']:g}, bore ⌀{HEATSET_M3['boss_bore']:g}; "
-    f"NEMA17 mount: {NEMA17['hole_square']:g} mm square of M3 clearance holes + ⌀{NEMA17['pilot_d']:g} pilot; "
+    f"NEMA17 mount: {{type:'hole_pattern',pattern:'grid',nx:2,ny:2,spacing:{NEMA17['hole_square']:g},"
+    f"diameter:{ISO273_CLEARANCE['M3']}}} + ⌀{NEMA17['pilot_d']:g} pilot through_hole; "
     f"608 bearing: ⌀{BEARING_608['od']:g}×{BEARING_608['width']:g}, pocket ⌀21.95 printed."
 )
 

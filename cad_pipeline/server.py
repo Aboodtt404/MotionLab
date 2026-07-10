@@ -164,9 +164,25 @@ def _critique_job(body: dict) -> dict:
 
 def _assembly_job(route: str, body: dict) -> dict:
     from .assembly import Assembly, build_assembly, verify_assembly
-    from .planner import edit, plan
-    asm = (plan(body["prompt"]) if route == "/plan"
-           else edit(Assembly(**body["assembly"]), body["instruction"]))
+    from .planner import edit
+    attempts_used = None
+    if route == "/plan":
+        # The retry LOOP, not a single shot: plan → verify → typed A1–A8 feedback → minimal patch →
+        # re-verify (asm_loop). Budget stays small (Hephaestus: few compounding iterations, rich
+        # per-iteration feedback) and it stops on pass. The BEST attempt (most passing rows) ships.
+        from .asm_loop import VLLMAsmGenerator, run_assembly
+        out = run_assembly(body["prompt"], VLLMAsmGenerator(),
+                           max_attempts=int(body.get("max_attempts", 3)))
+        def _npass(rep: dict) -> int:
+            return sum(1 for r in (rep or {}).get("rows", []) if r.get("within_tol"))
+        cands = [a for a in out.get("attempt_log", []) if a.get("assembly")]
+        if not cands:
+            raise RuntimeError(out.get("last_feedback") or "assembly planning produced nothing")
+        best = max(cands, key=lambda a: (_npass(a.get("report")), a["attempt"]))
+        asm = Assembly(**best["assembly"])
+        attempts_used = len(out.get("attempt_log", []))
+    else:
+        asm = edit(Assembly(**body["assembly"]), body["instruction"])
     refine_hist = None
     if route == "/plan" and body.get("refine"):   # render→VLM critique loop improves the blockout
         from .critique import refine_assembly
@@ -182,6 +198,8 @@ def _assembly_job(route: str, body: dict) -> dict:
     out = {"passed": rep["passed"], "assembly": asm.model_dump(), "components": len(asm.components),
            "object": asm.object, "inspection": insp, "mesh_stl_b64": _stl_b64(asm_solid),
            "step_b64": _step_b64(asm_solid)}
+    if attempts_used is not None:
+        out["attempts"] = attempts_used
     if refine_hist is not None:
         out["refine_history"] = refine_hist
         from .render import render_views
@@ -218,6 +236,7 @@ def _run_job(jid: str, route: str, body: dict):
             if jid in _jobs:
                 _jobs[jid].update(status="done", result=result)
     except Exception as e:  # noqa: BLE001
+        print(f"[job {jid}] {route} FAILED:\n{traceback.format_exc()}", flush=True)   # diagnosable from the log
         with _jobs_lock:
             if jid in _jobs:
                 _jobs[jid].update(status="error", error=f"{type(e).__name__}: {e}", trace=traceback.format_exc()[-800:])

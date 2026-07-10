@@ -360,7 +360,47 @@ def _verify_revolve(solid, spec: Spec, tol: float) -> List[Row]:
     else:
         caps_ok = seam_caps >= 1
         rows.append(Row("revolve · partial (seam caps)", "≥1", seam_caps, caps_ok, "ok" if caps_ok else "selector-binding"))
+    # holes on a revolve (a wheel's bolt circle) — the axisymmetry rows above deliberately ignore
+    # off-center Z bores, so without this a wheel could omit its whole bolt circle and still pass.
+    clear, exp_n = _holes_through(solid, spec)
+    if exp_n:
+        through_ok = clear == exp_n
+        rows.append(Row("holes · through", exp_n, clear, through_ok,
+                        "ok" if through_ok else "missing_feature"))
     return rows
+
+
+def _holes_through(solid, spec: Spec) -> tuple:
+    """(clear, expected): a thin probe cylinder along each expected hole's axis, spanning the whole
+    part, must intersect ~zero material. The face census can NOT catch a hole that stops mid-part
+    (a half-drilled bore shows the same cylindrical faces at the same position/⌀) — only material
+    ON the axis betrays it. Found live: bolt circles on cylinder flanges drilled to half depth for
+    the cutter anchoring at z=0 while the part rises 0..H, verifying green the whole time."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
+
+    from .builder import _axis_center, _axis_extent
+    holes = expected_holes(spec)
+    if not holes:
+        return 0, 0
+    shape = _to_shape(solid)
+    clear = 0
+    for px, py, pz, d, axis in holes:
+        ext = _axis_extent(spec, axis)
+        c = _axis_center(spec, axis)
+        px, py, pz = ((c, py, pz) if axis == "x" else (px, c, pz) if axis == "y" else (px, py, c))
+        ux, uy, uz = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}[axis]
+        half = ext / 2 + 2.0
+        probe = cq.Solid.makeCylinder(max(0.2, d * 0.3), ext + 4.0,
+                                      cq.Vector(px - ux * half, py - uy * half, pz - uz * half),
+                                      cq.Vector(ux, uy, uz))
+        try:
+            algo = BRepAlgoAPI_Common(shape, probe.wrapped)
+            algo.Build()
+            blocked = cq.Shape.cast(algo.Shape()).Volume() > 1.0   # mm³ on the axis = not through
+        except Exception:  # noqa: BLE001 — an unmeasurable probe is not a pass
+            blocked = True
+        clear += 0 if blocked else 1
+    return clear, len(holes)
 
 
 def _var_fillet_blends(solid):
@@ -491,6 +531,52 @@ def verify(solid, spec: Spec) -> Report:
         if any(f.type == "greeble" for f in spec.features):   # greebled turned body (Stage C)
             return _verify_greeble_rebuild(solid, spec, m, tol)
         return Report(m.valid, m.solids, m.volume, _verify_revolve(solid, spec, tol))
+    if spec.shape == "loft_sections":
+        # HERO loft: no closed-form global extents (a smooth loft overshoots between stations) —
+        # so verify where it IS exact: the loft passes through each station wire exactly, so a
+        # thin slab ∩ solid at each station must measure that section's closed-form area. Global
+        # extents are measured (geometry-exact bbox) against the station hull + a bounded
+        # overshoot window. This is the tessellate-and-measure verifier the ambition rule calls
+        # for — measured truth instead of "can't verify, don't build".
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
+
+        from .builder import section_area
+        ss = sorted(spec.sections or [], key=lambda s: s["x"])
+        d = spec.envelope_dims()
+        hull = (d["length"], d["width"], d["height"])
+        for nm, exp, meas in (("length", hull[0], m.dx), ("width", hull[1], m.dy), ("height", hull[2], m.dz)):
+            lo, hi = exp - tol, exp * 1.10 + tol          # ≥ hull (must reach the stations),
+            ok = lo <= meas <= hi                          # ≤ hull + 10% spline overshoot
+            rows.append(Row(f"envelope · {nm} (hull..+10%)", round(exp, 4), round(meas, 4), ok,
+                            "ok" if ok else "dimensional"))
+        shp = _to_shape(solid)
+        THICK = 2.0
+        for s in ss[1:-1] or ss:                           # end stations are caps — always exact
+            slab = cq.Solid.makeBox(THICK, s["width"] * 2 + 20, s["height"] * 2 + 20,
+                                    cq.Vector(s["x"] - THICK / 2, -(s["width"] + 10),
+                                              s.get("z_center", s["height"] / 2) - s["height"] - 10))
+            try:
+                algo = BRepAlgoAPI_Common(shp, slab.wrapped)
+                algo.Build()
+                vol = cq.Shape.cast(algo.Shape()).Volume()
+            except Exception:  # noqa: BLE001
+                vol = 0.0
+            exp_a = section_area(s)
+            meas_a = vol / THICK
+            ok = abs(meas_a - exp_a) <= exp_a * 0.06 + 1.0   # 6%: slab straddles a curved run
+            rows.append(Row(f"section @x={s['x']:g} · area", round(exp_a, 1), round(meas_a, 1),
+                            ok, "ok" if ok else "dimensional"))
+        return Report(m.valid, m.solids, m.volume, rows)
+    if spec.shape == "profile_extrude":
+        # SILHOUETTE body: verify the arc-aware expected extents (side gives x/z, plan∩ gives y and
+        # trims x) against the measured bbox + validity/single-solid (Report.passed). The 2D
+        # simple-polygon gate ran in the builder; here we confirm the built envelope matches.
+        xl, yl, zl = spec.profile_extrude_extents()
+        for nm, exp, meas in (("length", xl, m.dx), ("width", yl, m.dy), ("height", zl, m.dz)):
+            ok = abs(meas - exp) <= tol + 1e-9
+            rows.append(Row(f"envelope · {nm}", round(exp, 4), round(meas, 4), ok,
+                            "ok" if ok else "dimensional"))
+        return Report(m.valid, m.solids, m.volume, rows)
     if spec.shape == "sweep":
         # a constant round section swept along the path ⇒ vol = π·r²·(path length). Back-compute the
         # effective ⌀ from the measured volume (a small number that measures exactly), so a wrong-bore
@@ -613,6 +699,11 @@ def verify(solid, spec: Spec) -> Report:
             rows.append(Row("holes · ⌀ (worst)", 0.0, round(worst_dia_off, 4), dia_ok, "ok" if dia_ok else "dimensional"))
             pos_ok = worst_off <= tol + 1e-9
             rows.append(Row("holes · position (worst)", 0.0, round(worst_off, 4), pos_ok, "ok" if pos_ok else "selector-binding"))
+        # depth honesty: the census above matches faces at position/⌀ but can't see a hole that
+        # STOPS mid-part (the half-drilled flange bug) — probe the axis for leftover material.
+        clear, _n = _holes_through(solid, spec)
+        through_ok = clear == n
+        rows.append(Row("holes · through", n, clear, through_ok, "ok" if through_ok else "missing_feature"))
 
     # counterbore / countersink — recessed top-face holes (§3.3). Pop their cylinders from the pool
     # (so they aren't read as "unexpected") and check pilot ⌀ + recess ⌀ / cone included angle. ----
@@ -769,5 +860,74 @@ def verify(solid, spec: Spec) -> Report:
     leftover = [c for c in pool if c.r > 0.05]
     if leftover:
         rows.append(Row("unexpected cylinders", 0, len(leftover), False, "selector-binding"))
+
+    return Report(m.valid, m.solids, m.volume, rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# Feature-program verification (measurement-based, doc §3.4).
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+def _iou(a, b) -> float:
+    """Volume IoU of two solids: |a∩b| / |a∪b|."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
+    try:
+        algo = BRepAlgoAPI_Common(a.wrapped, b.wrapped)
+        algo.Build()
+        inter = cq.Shape.cast(algo.Shape()).Volume()
+    except Exception:  # noqa: BLE001
+        inter = 0.0
+    va, vb = a.Volume(), b.Volume()
+    union = va + vb - inter
+    return inter / union if union > 0 else 0.0
+
+
+def verify_part(part, target=None, tol: Optional[float] = None) -> Report:
+    """Measurement-based verification of a feature-program Part (doc §3.4). Builds via the SHIPPED
+    executor (`build_part` — corpus-gate-on-artifact: verify exactly what we build), then checks:
+      - watertight / single valid solid / positive volume (hard, via measure());
+      - **per-step boolean-direction assertions** (rebuilding prefixes with the same executor, so no
+        divergence): a `join` must NOT lose geometry (result ≥ prior — an OCCT fuse that dropped an
+        operand shrinks it); a `cut` must actually REMOVE material (result < prior — a no-op cut is
+        the half-drilled-hole honesty bug, a missing feature); an `intersect` must not grow. This
+        catches CADSmith's "false convergence" (plausible bbox/volume, wrong construction).
+      - optional **reconstruction oracle**: volume IoU + bbox match vs a `target` solid (§5). A high
+        IoU is the go/no-go for the representation AND the corpus-admission gate.
+    """
+    from .spec import Part as _Part
+    from .builder import build_part
+    tol = tol if tol is not None else getattr(part, "tolerance", 0.1)
+    rows: List[Row] = []
+    solid = build_part(part).val()
+    m = measure(solid)
+
+    for i, step in enumerate(part.steps):
+        prefix = build_part(_Part(steps=part.steps[:i + 1])).val()
+        v = prefix.Volume()
+        if i == 0:
+            prev = v
+            continue
+        if step.op in ("join", "new_body"):
+            ok = v >= prev * 0.999                       # a union can only grow (or stay); shrink = lost
+            rows.append(Row(f"step {i} · {step.op} adds material", f"≥{prev:.1f}", round(v, 1),
+                            ok, "ok" if ok else "boolean-loss"))
+        elif step.op == "cut":
+            ok = v < prev * 0.999                        # a real cut removes SOME material
+            rows.append(Row(f"step {i} · cut removes material", f"<{prev:.1f}", round(v, 1),
+                            ok, "ok" if ok else "boolean-noop"))
+        elif step.op == "intersect":
+            ok = v <= prev * 1.001                       # an intersection can only shrink (or stay)
+            rows.append(Row(f"step {i} · intersect does not grow", f"≤{prev:.1f}", round(v, 1),
+                            ok, "ok" if ok else "boolean-loss"))
+        prev = v
+
+    if target is not None:
+        iou = _iou(solid, target)
+        ok = iou >= 0.95
+        rows.append(Row("recon · volume IoU", 1.0, round(iou, 4), ok, "ok" if ok else "recon-fit"))
+        tb = target.BoundingBox()
+        for nm, meas, exp in (("dx", m.dx, tb.xlen), ("dy", m.dy, tb.ylen), ("dz", m.dz, tb.zlen)):
+            bok = abs(meas - exp) <= max(tol, 0.02 * exp)
+            rows.append(Row(f"recon · bbox {nm}", round(exp, 3), round(meas, 3), bok,
+                            "ok" if bok else "recon-fit"))
 
     return Report(m.valid, m.solids, m.volume, rows)
