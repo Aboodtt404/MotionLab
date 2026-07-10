@@ -2,3 +2,10 @@
 # (Benchmark parity baseline is CadQuery 2.4 / Py3.10; we build on current 2.7 — noted in track-a-design.md.)
 cadquery==2.7.0
 pydantic>=2.0
+jsonschema>=4.0                # Phase-1 schema conformance (04_schemas JSON-Schema validation)
+# Phase-3 mesh verifier (§6.1 mesh validation + §2.3 min-wall raycast): trimesh measures OCCT-
+# tessellated meshes (its boolean backend is intentionally unused). rtree = ray-engine spatial
+# index (required for mesh.ray); scipy = graph engine (connected-components / body_count).
+trimesh>=4.10
+rtree>=1.3
+scipy>=1.13
