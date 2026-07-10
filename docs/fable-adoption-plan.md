@@ -117,7 +117,13 @@ the export/validate toolchain wired into the router.
 - [x] Phase 0 — commit WIP  (97c903a; branch `fable-adoption`)
 - [x] Phase 1 — 5 schemas  (`cad_pipeline/schemas.py` + `test_schemas.py` 36/36; corpus/asm_loop migrated to
       the conformant models via a `normalize_category` emit boundary; JSON-Schema export with versioned `$id`)
-- [ ] Phase 2 — 100-task benchmark
+- [x] Phase 2 — 100-task benchmark  (`cad_pipeline/tests/benchmark/` — full 100-task registry conforming
+      to 02_benchmark §Category distribution + difficulty spread, Σweight = 263; scorer with
+      capability_score/category-floors/bands/diagnostics; oracle-preflight runner. **First honest
+      multi-category ceiling: capability_score 22.05/263 — C 82.0, D 30.4, A 25.0, 24/100 runnable.**
+      Remaining 76 tasks named-blocked on their pending Phase-3/4/5 verifier. `test_benchmark.py` 11/11.)
+      TODO as verifiers land: encode P (mesh cavity/DFM), M/B/W/G, more A/D; add strict per-task Fable
+      criteria to the runnable oracles; wire the model-generation pass@1/pass@3 mode (Phase 6).
 - [ ] Phase 3 — verifier suite
 - [ ] Phase 4 — part library
 - [ ] Phase 5 — representation router (A+B merge)
