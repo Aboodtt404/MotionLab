@@ -22,6 +22,25 @@ try:
 except Exception:  # noqa: BLE001 — the module must import even where trimesh is absent
     _HAVE_TRIMESH = False
 
+try:
+    import pymeshlab
+    _HAVE_PYMESHLAB = True
+except Exception:  # noqa: BLE001
+    _HAVE_PYMESHLAB = False
+
+
+def self_intersections(mesh) -> Optional[int]:
+    """Count self-intersecting faces (§6.1) via pymeshlab. None if pymeshlab is unavailable — an
+    honestly-uncomputed check (never a fabricated pass). Validated: clean icosphere 0, overlaps > 0."""
+    if not _HAVE_PYMESHLAB:
+        return None
+    m = _as_mesh(mesh)
+    ms = pymeshlab.MeshSet()
+    ms.add_mesh(pymeshlab.Mesh(vertex_matrix=np.asarray(m.vertices, dtype=float),
+                               face_matrix=np.asarray(m.faces, dtype=np.int32)))
+    ms.compute_selection_by_self_intersections_per_face()
+    return int(ms.current_mesh().selected_face_number())
+
 
 def tri_from_solid(solid, tol: float = 0.1):
     """Tessellate an OCCT solid / CadQuery Workplane into a trimesh.Trimesh (render.py `_mesh` format)."""
@@ -101,6 +120,9 @@ def mesh_report(mesh_or_solid, *, expected_components: int = 1, watertight_requi
     rows.append(Row("mesh · signed_volume > 0", True, vol > 0, vol > 0, "ok" if vol > 0 else "validity"))
     rows.append(Row("mesh · degenerate_faces", 0, degenerate, degenerate == 0, "ok" if degenerate == 0 else "validity"))
     rows.append(Row("mesh · duplicate_vertices", 0, dup, dup == 0, "ok" if dup == 0 else "validity"))
+    si = self_intersections(m)
+    if si is not None:                       # omit (don't fake a pass) when pymeshlab is unavailable
+        rows.append(Row("mesh · self_intersections", 0, si, si == 0, "ok" if si == 0 else "integrity"))
     rows.append(Row("mesh · isolated_components", expected_components, comps,
                     comps == expected_components, "ok" if comps == expected_components else "component"))
     if expected_euler is not None:

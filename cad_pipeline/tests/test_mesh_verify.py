@@ -77,12 +77,27 @@ def test_component_count():
     check(not row.within_tol and row.measured == 2, f"two disjoint boxes → 2 components (got {row.measured})")
 
 
+def test_self_intersection():
+    print("\n■ self-intersection (§6.1, pymeshlab) — clean passes, overlapping faces caught")
+    from cad_pipeline.mesh_verify import _HAVE_PYMESHLAB, self_intersections
+    if not _HAVE_PYMESHLAB:
+        check(True, "pymeshlab absent → self-intersection row honestly omitted (skip)")
+        return
+    clean = trimesh.creation.icosphere(subdivisions=3, radius=25)
+    check(self_intersections(clean) == 0, "clean icosphere → 0 self-intersecting faces")
+    a = trimesh.creation.box((20, 20, 20)); b = trimesh.creation.box((20, 20, 20)); b.apply_translation([8, 8, 0])
+    bad = trimesh.util.concatenate([a, b])
+    check(self_intersections(bad) > 0, "overlapping boxes → self-intersections caught")
+    rep = mesh_report(clean)
+    check(any(r.name == "mesh · self_intersections" for r in rep.rows), "self_intersections row present in report")
+
+
 def main() -> int:
     print("=" * 62)
     print("MESH VERIFY — §6.1 mesh validation + §2.3 min-wall raycast")
     print("=" * 62)
     for fn in (test_clean_solid_passes, test_min_wall_accuracy, test_min_wall_row_gates,
-               test_broken_mesh_caught, test_component_count):
+               test_broken_mesh_caught, test_component_count, test_self_intersection):
         fn()
     print("\n" + "=" * 62)
     print(f"MESH_VERIFY {PASS}/{PASS + FAIL}")
