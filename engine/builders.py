@@ -147,14 +147,18 @@ def build_procedural(brief) -> BuiltPart:
     if shutil.which("blender") is None:
         return BuiltPart(brief.name, "procedural", False, {"passed": False}, reason="blender not on PATH")
     proc = getattr(brief, "procedural", None) or {}
-    script = proc.get("script")
-    if not script or not os.path.exists(script):
+    # bundled generators (staircase/array/window/scatter) via `kind`, or an explicit `script`
+    bundled = os.path.join(os.path.dirname(__file__), "tools", "bpy_generate.py")
+    kind = proc.get("kind")
+    script = proc.get("script") if proc.get("script") and os.path.exists(proc["script"]) else (
+        bundled if kind else None)
+    if script is None:
         return BuiltPart(brief.name, "procedural", False, {"passed": False},
-                         reason="no procedural generator script on the brief")
+                         reason="no procedural generator (need brief.procedural.kind or .script)")
+    args = ([kind, json.dumps(proc.get("params", {}))] if kind else [json.dumps(proc.get("params", {}))])
     try:
         d = tempfile.mkdtemp(); glb = os.path.join(d, "p.glb")
-        subprocess.run(["blender", "--background", "--python", script, "--",
-                        json.dumps(proc.get("params", {})), glb],
+        subprocess.run(["blender", "--background", "--python", script, "--", *args, glb],
                        capture_output=True, text=True, timeout=300)
         if not os.path.exists(glb):
             return BuiltPart(brief.name, "procedural", False, {"passed": False}, reason="generator produced no GLB")

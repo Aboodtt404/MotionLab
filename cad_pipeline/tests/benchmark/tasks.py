@@ -108,6 +108,60 @@ def _g01_crate() -> "trimesh.Trimesh":        # crate ≤500 tris, pivot base ce
     b = trimesh.creation.box((0.5, 0.5, 0.5)); b.apply_translation([0, 0.25, 0]); return b
 
 
+import json
+import subprocess
+
+_BPY_GEN = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                                        "engine", "tools", "bpy_generate.py"))
+
+
+def _bpy_oracle(kind: str, params: dict, checks) -> Callable[[], dict]:
+    """B-category procedural tasks: run the Blender bpy generator → GLB → trimesh [BPY]-equivalent
+    checks. glTF is Y-up, so a Blender Z-up 'height' reads as the exported Y extent."""
+    def run() -> dict:
+        import shutil as _sh
+        if _sh.which("blender") is None:
+            return {"passed": False, "valid": False, "solids": 0, "rows": [], "failure_categories": ["validity"]}
+        d = tempfile.mkdtemp()
+        try:
+            glb = os.path.join(d, "o.glb")
+            subprocess.run(["blender", "--background", "--python", _BPY_GEN, "--",
+                            kind, json.dumps(params), glb], capture_output=True, text=True, timeout=180)
+            m = trimesh.load(glb, force="mesh")
+            rows = checks(m)
+            ok = all(r["within_tol"] for r in rows)
+            return {"passed": ok, "valid": True, "solids": 1, "rows": rows,
+                    "failure_categories": [] if ok else sorted({r["category"] for r in rows if not r["within_tol"]})}
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    return run
+
+
+def _row(name, exp, meas, ok, cat="dimensional"):
+    return {"name": name, "expected": exp, "measured": meas, "within_tol": bool(ok),
+            "category": "ok" if ok else cat}
+
+
+def _b01_checks(m):   # 5-step staircase: height (glTF Y) 0.75, depth (glTF Z) 1.5
+    e = m.extents
+    return [_row("stair · height", 0.75, round(float(e[1]), 3), abs(e[1] - 0.75) < 0.02),
+            _row("stair · depth", 1.5, round(float(e[2]), 3), abs(e[2] - 1.5) < 0.02)]
+
+
+def _b02_checks(m):   # 10 columns spaced 2.0 → x-extent 18.3
+    e = m.extents
+    return [_row("array · x-extent", 18.3, round(float(e[0]), 2), abs(e[0] - 18.3) < 0.05)]
+
+
+def _b05_checks(m):   # boolean window: volume = wall(2.4) − window(0.24) = 2.16
+    return [_row("window · volume (wall−window)", 2.16, round(float(m.volume), 3), abs(m.volume - 2.16) < 0.05, "integrity")]
+
+
+def _b06_checks(m):   # 200 seeded scatter instances → 200×12 tris
+    n = len(m.faces)
+    return [_row("scatter · instance tris (200×12)", 2400, n, abs(n - 2400) <= 24, "missing_feature")]
+
+
 def _gear_oracle(module: float, teeth: int) -> Callable[[], dict]:
     """P05/A05 gear tasks: involute gear from the library, checked on tip ⌀ = m(z+2) and the polar
     tooth count (FFT) = z (fable_run §8.5 / P05)."""
@@ -264,6 +318,10 @@ _PROMPTS: Dict[str, str] = {
     "W02": "human-scale figure, correct web scale: Y-up height 1.80 ±0.02 m, min-Y = 0",
     "G01": "crate prop ≤500 tris, ≤2 materials, pivot at base center",
     "P05": "spur gear m=2, z=24 → tip ⌀ 52±0.2, 24 polar maxima (library involute gear)",
+    "B01": "script a 5-step staircase: rise 0.15, tread 0.30, width 1.0 (bpy)",
+    "B02": "array modifier: 10 columns ⌀0.3×3 spaced 2.0 in X → x-extent 18.3 (bpy)",
+    "B05": "boolean-cut a 1×1.2 window through a 4×3×0.2 wall (bpy)",
+    "B06": "geometry-nodes scatter: exactly 200 seeded instances on a 10×10 plane (bpy)",
     "A01": "4-legged stool: seat ⌀140×16, height 120, legs 90° apart, splayed 10°",
     "A02": "shelf on an L-bracket, flush-mounted, fused single solid",
     "A04": "bolt + nut clamping 2 plates, coaxial holes, grip = Σ thickness",
@@ -289,6 +347,10 @@ _ORACLES: Dict[str, Callable[[], dict]] = {
     "W02": _glb_oracle(_w02_figure, lambda p: verify_web(p, height_range=(1.78, 1.82))),
     "G01": _glb_oracle(_g01_crate, lambda p: verify_game(p, tri_budget=500)),
     "P05": _gear_oracle(2, 24),                       # spur gear m=2 z=24 (library involute gear)
+    "B01": _bpy_oracle("staircase", {"steps": 5, "rise": 0.15, "tread": 0.30, "width": 1.0}, _b01_checks),
+    "B02": _bpy_oracle("array", {"count": 10, "spacing": 2.0}, _b02_checks),
+    "B05": _bpy_oracle("window", {"wall": [4, 0.2, 3], "window": [1, 1.2]}, _b05_checks),
+    "B06": _bpy_oracle("scatter", {"count": 200, "seed": 42}, _b06_checks),
 }
 
 # extra task-specific assertions on the golden report (Fable's per-task numeric criteria)
