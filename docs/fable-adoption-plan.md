@@ -1,0 +1,126 @@
+# Fable-5 Full Adoption Plan (Track A → the whole engine)
+
+**Decision (2026-07-10):** "fully adopt everything from `fable_run/`" = **Option B** — Fable's §1.2
+per-part representation decision table + the 8-category benchmark + the router IS the full-8-category
+merge of Track A and Track B into one spec-first, verifier-looped engine. This document is the roadmap.
+
+**Governing thesis (Fable manual §Summary):** *"nearly all quality in this domain comes from the
+verifier loop, not the first draft."* Every phase below is gated by a verifier and a test — nothing is
+"done" until it is measured green.
+
+**Source of truth:** `fable_run/out/{00_manual,02_benchmark,03_training_recipe,04_schemas,05_mistakes}.md`.
+Cross-reference every implementation against these; do not drift.
+
+---
+
+## Starting point (verified 2026-07-10)
+
+Track A is ~90% aligned on the CAD/assembly spine. Already present: spec-first pipeline, part library
+(partlib.py, 5 parts), capability_score machinery + CAD-20 bench slice, A6 fit row, repair-transcript
+reject store, GLB gate, mate-graph solver, feature-program `Part` representation (green, **uncommitted**),
+structural-richness arc (profile_extrude/loft/cutout/wheel). SFT done, GRPO built. Partial schema classes
+in corpus.py. **DPO never run. Router does not exist. 80 of 100 bench tasks unencoded. Mesh/print/game
+verifiers absent.**
+
+---
+
+## Phases (ordered by dependency; each ends committed + green)
+
+### Phase 0 — Commit the green WIP  ✅ unblocks everything
+Feature-program `Part` + mate-graph solver + structural-richness arc (~1560 lines, all tests green).
+Loss risk. **Deliverable:** clean commit; `git status` clean on cad_pipeline.
+
+### Phase 1 — The 5 schemas (04_schemas.md)  ← foundation, everything references it
+Adopt the exact snake_case, `$id`-versioned, composable schemas as Pydantic models + JSON Schema export.
+- `model_brief`: add `target_use`/`representation`/`units`/`up_axis`/`output_formats`/`budgets` — the
+  fields that let ONE schema drive CAD **or** mesh **or** print (precondition for the router).
+- `assembly_brief`: formalize `component_id`/`role`/`brief`($ref)/`count` + `fuse`/`clearance_mm`;
+  our `Mate` vocabulary already matches exactly.
+- `verifier_report`: conform Report/Row → exact shape; **`check_category` enum** (snake_case:
+  `ok/dimensional/selector_binding/missing_feature/integrity/dfm/validity/structure/disconnected/component`)
+  — rename our hyphenated `selector-binding`.
+- `failure_report`: typed `status`/`category`/`error_signature`/`traceback_head`/`failed_rows`/`feedback`.
+- `repair_transcript`: conform corpus.py's class to the exact shape.
+- **Deliverable:** `cad_pipeline/schemas.py` (or extend corpus.py) with all 5 + a `test_schemas.py` that
+  round-trips each example instance from 04_schemas.md and validates against the JSON Schema. Migrate
+  verifier/corpus/asm_loop to emit conformant rows. All existing suites stay green.
+
+### Phase 2 — The 100-task benchmark (02_benchmark.md)  ← makes the score real
+Encode all 100 tasks as machine-checkable specs+assertions with the `[BREP]/[MESH]/[GLTF]/[BPY]/[RENDER]/
+[WEB]/[CLR]/[UV]` toolkit. Order by what we can pass NOW:
+1. **A01–A13** (assembly) + **D01–D08** (drone) — checkable with the verifier we already have. A01 = the
+   stool we built. ~21 tasks, weight ~60/263. **First honest multi-category capability_score.**
+2. **C01–C20** (have) + **P01–P10** (product) — mostly B-rep.
+3. **M/B/W/G** (mesh/blender/web/game) — gated on Phase 3 verifiers + Phase 5 router.
+- Harness: pass@1 + pass@3 (feedback loop), capability_score = 100·Σ(w·passed)/263, category sub-scores,
+  bands (Weak…Expert), diagnostics (failure histogram, attempts-to-pass, pass@1↔pass@3 gap).
+- Holdout discipline: the 100 tasks + near-dups (spec cosine ≥0.9 / AST match) excluded from training.
+- **Deliverable:** `cad_pipeline/tests/benchmark/` with all 100 tasks + runner emitting the scorecard.
+
+### Phase 3 — Complete the verifier suite (§3.4, §6, all 46 mistakes)
+- CAD gaps: min-wall inward-raycast (10k samples), mass_props (volume×density), fastener_reach.
+- **Anti-toy plausibility rows (§2.1)** — fillet hierarchy (3 radius classes), wall-thickness, visible
+  fasteners, parting lines. (The "kid-drawing" ceiling lever.)
+- **Mesh validation (§6.1)** — watertight/manifold/self-intersect/degenerate/winding/normals (trimesh+pymeshlab).
+- **Print (§6.3)** — min wall, overhang, bridge, drain, slicer oracle (PrusaSlicer CLI).
+- **Game (§6.4)** — tri budget, material slots, UV, LOD IoU, pivot, naming.
+- **Web/GLB (§6.5)** — extend glb_gate to full gltf-validator + headless render smoke.
+- Wire every one of the **46 mistakes (05)** as a detection row + typed repair feedback.
+- **Deliverable:** one verifier per representation, same `verifier_report` envelope; mistake-catalog
+  coverage test asserting each of the 46 has a live row.
+
+### Phase 4 — Part library expansion (§2.4)
+Grow partlib to Fable's minimum: fasteners (M2–M6 SHCS/CS/nut/washer + heat-set), bearings (623/685/608),
+motors (2207/1404/NEMA17/N20), electronics (FC stacks/18650/USB-C/SMA), drivetrain (GT2, involute-gear
+generator mod 0.5–2), hinges/pins. Each returns solid **+ named datums/joints**; instantiated by name in
+assemblies (never remodeled). **Deliverable:** partlib families, each golden-by-construction (build→verify),
++ assembly instantiation-by-name path + tests.
+
+### Phase 5 — Representation router (§1.2)  ← the Track A+B MERGE (Option B core)
+Per-PART decision: dims/tolerances/fasteners→CadQuery-B-rep; organic/sculptural→TRELLIS; family/greebles/
+terrain→Blender geometry-nodes/bpy; library-part→instantiate. Part-tree decomposition (§1.3) with the
+stop-subdividing rule. Each rep has its own verifier (Phase 3); ONE repair loop, ONE corpus, ONE benchmark.
+**TRELLIS becomes the "organic builder" behind the router, not a standalone flow.** Hybrid assembly = merge
+B-rep + mesh + procedural at assembly time with unit/axis conversion (§1.4).
+**Deliverable:** `router` that takes a `model_brief`/`assembly_brief`, dispatches per part, and returns a
+verified hybrid asset; a drone (CAD frame + mesh canopy + procedural vents) end-to-end as the proof.
+
+### Phase 6 — Training recipe (03_training_recipe.md)  SFT→DPO→GRPO
+- **DPO stage** on the existing reject store (same-spec pass/fail pairs) — the "cheap middle step", data
+  already exists.
+- L0–L3 **4-level captions** (audit captions.py); diversity quotas per batch (≥40% multi-feature, ≤25%
+  any single feature, reject >20% round-number dims, temp ladder 0.5→0.95 + dedup).
+- Corpus rebuild through the conformant schema; provenance+license tags; benchmark holdout/dedup.
+- Re-run the full training order; score at each stage boundary against Phase-2 benchmark; regression gates.
+- **Deliverable:** DPO checkpoint + a capability_score delta table across SFT→DPO→GRPO.
+
+### Phase 7 — Skill-file packaging (§7.1) + conventions/plausibility externalization
+`skills/3d-modeling/`: SKILL.md, conventions.md (§1.4 verbatim), plausibility-rules.md (§2.1/§3.2),
+lib/ (part library), verifiers/ (runnable, §6-report), templates/ (parse + repair prompts), examples/
+(benchmark tasks with pass AND fail versions + repair diffs). **Deliverable:** the portable skill dir.
+
+### Phase 8 — Tool stack hardening (§5) + build123d evaluation
+Evaluate build123d vs CadQuery (Fable ranks build123d 1st; both OCCT). gltf-transform optimize, KTX2,
+gltf-validator, PrusaSlicer oracle, puppeteer web smoke. **Deliverable:** decision memo on build123d +
+the export/validate toolchain wired into the router.
+
+---
+
+## Sequencing & parallelism
+- **Strict order:** 0 → 1 (foundation) → then 2 & 3 & 4 can proceed in parallel → 5 (needs 3+4) →
+  6 (needs 1+2) → 7 & 8 (packaging/hardening, last).
+- Commit at every phase boundary; keep every existing test green (regression gate).
+- The capability_score against the Phase-2 benchmark is the single north-star metric; report it after
+  each phase that could move it.
+
+## Status log
+- [x] Phase 0 — commit WIP  (97c903a; branch `fable-adoption`)
+- [x] Phase 1 — 5 schemas  (`cad_pipeline/schemas.py` + `test_schemas.py` 36/36; corpus/asm_loop migrated to
+      the conformant models via a `normalize_category` emit boundary; JSON-Schema export with versioned `$id`)
+- [ ] Phase 2 — 100-task benchmark
+- [ ] Phase 3 — verifier suite
+- [ ] Phase 4 — part library
+- [ ] Phase 5 — representation router (A+B merge)
+- [ ] Phase 6 — training SFT→DPO→GRPO
+- [ ] Phase 7 — skill packaging
+- [ ] Phase 8 — tool stack + build123d

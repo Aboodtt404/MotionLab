@@ -11,11 +11,11 @@ VALIDATED AT WRITE TIME:
   • TrainingSample              — the spec-first 6-tuple synth.py emits, with the full
                                   verifier report embedded (not just row names)
 
-Deviations from the 04_schemas draft (documented per its own append-only rule; this is our /1):
-  • category strings keep the pipeline's live values (hyphenated: `selector-binding`,
-    `exec-fix`, …) — the running verifier/loop are authoritative over the doc's snake_case.
-  • row `category` is an open string, not a closed enum — the verifier grows categories
-    (e.g. assembly's `blend`) and the corpus writer must not reject them.
+The five schema models themselves now live in `schemas.py` (the canonical, conformant contract);
+this module imports them and adds the corpus-construction helpers (report lift, transcript builder,
+training-sample assembler). Live verifier/loop category strings are normalised onto Fable's exact
+snake_case enums at the emit boundary (`schemas.normalize_category` / `normalize_failure_category`),
+so every corpus line is fully conformant while the running pipeline keeps its internal values.
 
 IDs are deterministic (content-hash prefixes), so identical inputs dedupe naturally and
 re-runs are reproducible.
@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from .schemas import (Attempt, CheckRow, FailureReport, Outcome, RepairTranscript,
+                      VerifierReport, normalize_failure_category)
 from .spec import Spec
 
 # Oracle versions stamped into every report — reproducibility (schema `toolchain`).
@@ -47,33 +49,10 @@ def _hid(prefix: str, *parts: Any) -> str:
     return f"{prefix}-{h}"
 
 
-# --------------------------------------------------------------------- verifier_report
-class CheckRow(BaseModel):
-    """One verifier measurement — exactly verifier.Row.to_dict()'s shape."""
-    name: str
-    expected: Any = None
-    measured: Any = None
-    delta: Optional[float] = None
-    within_tol: bool
-    category: str          # ok | dimensional | selector-binding | missing_feature | integrity |
-    #                        dfm | validity | structure | disconnected | component | blend | ...
-
-
-class VerifierReport(BaseModel):
-    """The oracle's verdict — the ONLY authoritative pass signal in the pipeline."""
-    report_id: str
-    subject_ref: str                     # sample/brief id this report measures
-    passed: bool
-    valid: bool
-    solids: int
-    volume_mm3: Optional[float] = None
-    rows: List[CheckRow]
-    failure_categories: List[str] = Field(default_factory=list)
-    toolchain: Dict[str, str] = Field(default_factory=lambda: dict(TOOLCHAIN))
-
-
+# --------------------------------------------------------------------- verifier_report lift
 def verifier_report_from(report: dict, subject_ref: str) -> VerifierReport:
-    """Lift a pipeline report dict (verifier.Report.to_dict()) into the schema envelope."""
+    """Lift a pipeline report dict (verifier.Report.to_dict()) into the conformant schema envelope,
+    normalising every row category onto the snake_case check_category vocabulary."""
     return VerifierReport(
         report_id=_hid("vr", subject_ref, json.dumps(report, sort_keys=True, default=str)),
         subject_ref=subject_ref,
@@ -81,56 +60,14 @@ def verifier_report_from(report: dict, subject_ref: str) -> VerifierReport:
         valid=bool(report.get("valid", False)),
         solids=int(report.get("solids", 0)),
         volume_mm3=report.get("volume"),
-        rows=[CheckRow(**r) for r in report["rows"]],
+        rows=[CheckRow.from_live(r) for r in report["rows"]],
         failure_categories=list(report.get("failure_categories", [])),
+        toolchain=dict(TOOLCHAIN),
     )
 
 
-# --------------------------------------------------------------------- failure_report
+# failure_report status lift (live loop status → schema failure_status)
 _STATUS_MAP = {"ok": "verify_fail", "gate_fail": "gate_fail", "error": "exec_error", "timeout": "timeout"}
-
-
-class FailureReport(BaseModel):
-    """One attempt's typed failure: routing category + the exact feedback the generator got."""
-    failure_id: str
-    subject_ref: str
-    attempt: int
-    status: Literal["exec_error", "timeout", "gate_fail", "verify_fail", "refused"]
-    category: str                        # loop._category value: exec-fix | validity | ... | escalate
-    error_signature: Optional[str] = None
-    traceback_head: Optional[str] = None
-    failed_rows: List[CheckRow] = Field(default_factory=list)
-    feedback: str
-    repeated_error: bool = False
-    regressed: bool = False
-
-
-# --------------------------------------------------------------------- repair_transcript
-class Attempt(BaseModel):
-    attempt: int
-    code: str
-    verifier_report: Optional[VerifierReport] = None   # None when execution produced no geometry
-    failure_report: Optional[FailureReport] = None     # None iff this attempt passed
-    feedback_to_next: Optional[str] = None
-    edit_distance_lines: Optional[int] = None          # changed lines vs previous attempt
-
-
-class Outcome(BaseModel):
-    passed: bool
-    attempts_used: int
-    first_valid_attempt: Optional[int] = None
-    final_category: Optional[str] = None
-
-
-class RepairTranscript(BaseModel):
-    """A complete generate→verify→retry episode for one spec — the unit of repair-training data."""
-    transcript_id: str
-    brief_ref: str
-    generator: Dict[str, Any]            # {"model": ..., "config": {...}}
-    spec: Dict[str, Any]                 # the Spec, verbatim (our model_brief)
-    attempts: List[Attempt]
-    outcome: Outcome
-    created: str
 
 
 def _edit_lines(prev: Optional[str], cur: str) -> Optional[int]:
@@ -176,10 +113,10 @@ def transcript_from_run(spec: Spec, run_out: dict, generator: Dict[str, Any]) ->
                 failure_id=_hid("fl", brief_ref, n, fb or ""),
                 subject_ref=brief_ref, attempt=n,
                 status=_STATUS_MAP.get(res.get("status", "error"), "exec_error"),
-                category=h.get("category", "escalate"),
+                category=normalize_failure_category(h.get("category", "escalate")),
                 error_signature=error_signature(tb) or None if tb else None,
                 traceback_head=exception_head(tb) or None if tb else None,
-                failed_rows=[CheckRow(**r) for r in (res.get("report", {}) or {}).get("rows", [])
+                failed_rows=[CheckRow.from_live(r) for r in (res.get("report", {}) or {}).get("rows", [])
                              if not r["within_tol"]],
                 feedback=fb or "",
                 repeated_error=h.get("repeated_error", False),

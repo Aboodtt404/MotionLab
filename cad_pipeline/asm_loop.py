@@ -25,6 +25,7 @@ from .assembly import (Assembly, AsmPatch, apply_patch, repair_connectivity,
                        solve_layout, verify_assembly)
 from .corpus import (Attempt, CheckRow, FailureReport, Outcome, RepairTranscript,
                      VerifierReport, _hid)
+from .schemas import normalize_failure_category
 from .planner import _ask_patch, _default_joint_blend, plan as _plan
 
 # ---------------------------------------------------------------------------- generator protocol
@@ -179,8 +180,7 @@ def _asm_verifier_report(rep: dict, subject_ref: str) -> VerifierReport:
         valid=bool(valid_row["measured"]) if valid_row else False,
         solids=int(rep.get("solids", 0)),
         volume_mm3=(rep.get("envelope") or {}).get("volume"),
-        rows=[CheckRow(**{k: r.get(k) for k in ("name", "expected", "measured", "within_tol", "category")})
-              for r in rep.get("rows", [])],
+        rows=[CheckRow.from_live(r) for r in rep.get("rows", [])],
         failure_categories=sorted({r["category"] for r in rep.get("rows", []) if not r["within_tol"]}),
     )
 
@@ -207,9 +207,8 @@ def asm_transcript(prompt: str, run_out: dict, generator: dict) -> RepairTranscr
                 failure_id=_hid("fl", brief_ref, a["attempt"], fb or ""),
                 subject_ref=brief_ref, attempt=a["attempt"],
                 status="verify_fail" if rep.get("rows") else "exec_error",
-                category=history.get(a["attempt"], {}).get("category", "escalate"),
-                failed_rows=[CheckRow(**{k: r.get(k) for k in ("name", "expected", "measured", "within_tol", "category")})
-                             for r in rep.get("rows", []) if not r["within_tol"]],
+                category=normalize_failure_category(history.get(a["attempt"], {}).get("category", "escalate")),
+                failed_rows=[CheckRow.from_live(r) for r in rep.get("rows", []) if not r["within_tol"]],
                 feedback=fb or "",
                 regressed=history.get(a["attempt"], {}).get("regressed", False),
             )
