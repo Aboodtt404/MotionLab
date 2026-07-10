@@ -16,8 +16,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+import trimesh
+
 from ...assembly import Assembly, Component, Mate, repair_connectivity, solve_layout, verify_assembly
 from ...builder import build
+from ...mesh_verify import mesh_report
 from ...spec import Spec
 from ...verifier import verify
 from ..bench_specs import EVAL_BENCH
@@ -55,6 +58,23 @@ def _asm_oracle(asm_factory: Callable[[], Assembly]) -> Callable[[], dict]:
         asm = repair_connectivity(solve_layout(asm_factory()))
         return verify_assembly(asm)
     return run
+
+
+def _mesh_oracle(mesh_factory: Callable[[], "trimesh.Trimesh"], **report_kw) -> Callable[[], dict]:
+    """M-category (mesh modeling): the artifact IS a mesh — build it with trimesh.creation and gate it
+    through the §6.1 mesh verifier."""
+    def run() -> dict:
+        return mesh_report(mesh_factory(), **report_kw).to_dict()
+    return run
+
+
+# M-category mesh artifacts (mesh primitives are watertight; OCCT UV-spheres are not — pole degeneracy)
+def _m01_sphere() -> "trimesh.Trimesh":       # sphere r=25, ≤2000 tris, vol ∈ [62000,65500]
+    return trimesh.creation.icosphere(subdivisions=3, radius=25)
+
+
+def _m02_torus() -> "trimesh.Trimesh":        # torus R=30 r=8, ≤5000 tris, vol ≈ 37899 ±5%, genus-1
+    return trimesh.creation.torus(major_radius=30, minor_radius=8)
 
 
 # ─────────────────────────────────────────────────────────────── A — assemblies (golden)
@@ -185,6 +205,10 @@ _PROMPTS: Dict[str, str] = {
     "C05": "flange ⌀90×12, center bore ⌀20, 8×⌀6 on PCD 70",
     "C15": "linear pattern: 7×⌀6 holes, pitch 18, on a 140×40×6 bar",
     "C16": "grid pattern: 3×2 ⌀5 holes, spacing 25, on a 100×60×5 plate",
+    "M01": "sphere r=25 mm, ≤2000 tris, watertight, vol ∈ [62000,65500]",
+    "M02": "torus R=30 r=8, ≤5000 tris, watertight, vol ≈ 37899 ±5% (genus-1)",
+    "M06": "any closed mesh with all normals outward (winding consistent, signed vol > 0)",
+    "M07": "closed mesh, clean topology: every edge shared by exactly 2 faces",
     "A01": "4-legged stool: seat ⌀140×16, height 120, legs 90° apart, splayed 10°",
     "A02": "shelf on an L-bracket, flush-mounted, fused single solid",
     "A04": "bolt + nut clamping 2 plates, coaxial holes, grip = Σ thickness",
@@ -202,6 +226,16 @@ _ORACLES: Dict[str, Callable[[], dict]] = {
     "D04": _spec_oracle(_bottom_plate()),
     "C05": _spec_oracle(_flange_c05()), "C15": _spec_oracle(_linear_bar_c15()),
     "C16": _spec_oracle(_grid_plate_c16()),
+    "M01": _mesh_oracle(_m01_sphere, max_triangles=2000),
+    "M02": _mesh_oracle(_m02_torus, max_triangles=5000, expected_euler=0),
+    "M06": _mesh_oracle(_m01_sphere),                 # closed mesh, all normals outward
+    "M07": _mesh_oracle(_m01_sphere),                 # clean topology: every edge shared by 2 faces
+}
+
+# extra task-specific assertions on the golden report (Fable's per-task numeric criteria)
+_CRITERIA: Dict[str, Callable[[dict], bool]] = {
+    "M01": lambda r: 62000 <= (r.get("volume") or 0) <= 65500,
+    "M02": lambda r: abs((r.get("volume") or 0) - 37899) <= 0.05 * 37899,
 }
 
 # why each not-yet-runnable task is blocked (so the scorecard names the missing capability, not a silent gap)
@@ -231,8 +265,9 @@ def _build_registry() -> List[Task]:
         if oracle is None and tid in EVAL_BENCH_BY_ID:
             oracle = _spec_oracle(EVAL_BENCH_BY_ID[tid])
         prompt = _PROMPTS.get(tid, f"{tid} — see 02_benchmark.md")
-        tasks.append(Task(id=tid, level=level, category=cat, prompt=prompt,
-                          oracle=oracle, blocked_on=None if oracle else _BLOCKED.get(tid, "unencoded")))
+        tasks.append(Task(id=tid, level=level, category=cat, prompt=prompt, oracle=oracle,
+                          blocked_on=None if oracle else _BLOCKED.get(tid, "unencoded"),
+                          criteria=_CRITERIA.get(tid)))
     return tasks
 
 
