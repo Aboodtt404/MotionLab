@@ -231,7 +231,13 @@ def _engine_job(body: dict) -> dict:
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root → import engine
     from cad_pipeline.schemas import AssemblyBrief, ModelBrief
-    brief_json = body["brief"]
+    # a bare prompt → deterministic part-tree decomposition → the brief the router builds
+    if "prompt" in body and "brief" not in body:
+        from engine.decompose import decompose
+        decomposed = decompose(body["prompt"])
+        brief_json = decomposed.model_dump()
+    else:
+        brief_json = body["brief"]
     if "components" in brief_json:                       # assembly → build all parts, merge, repair
         from engine.repair import repair_asset
         brief = AssemblyBrief(**brief_json)
