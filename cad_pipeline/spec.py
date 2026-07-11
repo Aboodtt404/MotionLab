@@ -293,7 +293,7 @@ class Spec(BaseModel):
     object: str = "part"
     asset_class: Literal["hard_surface"] = "hard_surface"
     fabrication: Literal["render", "fabricate"] = "render"
-    shape: Literal["box", "cylinder", "loft", "revolve", "sweep", "profile_extrude",
+    shape: Literal["box", "cylinder", "prism", "loft", "revolve", "sweep", "profile_extrude",
                    "loft_sections"]
     # box: length/width/height · cylinder: diameter/height
     # loft (a TAPERED bar — engineered arm/strut): tapers along its length (local X) from a base
@@ -330,6 +330,11 @@ class Spec(BaseModel):
     # wire EXACTLY, so the verifier slices at the stations (exact) and tessellates only for the
     # between-station overshoot. sections: [{x, width, height, z_center?, kind?}] sorted by x.
     sections: Optional[List[Dict[str, Union[float, str]]]] = None
+    # prism (a REGULAR N-GON bar — hex standoff/boss, hex/square nut stock, octagonal housing):
+    # a regular `sides`-gon inscribed in envelope["diameter"] (the circumscribed circle, vertex-to-
+    # vertex for even N), extruded to envelope["height"]. Straight edges + planar walls, so it reuses
+    # the box finishing path (fillet/chamfer on |Z verticals & top/bottom rims, shell, draft, holes).
+    sides: int = 6
     features: List[Feature] = Field(default_factory=list)
     tolerance: float = 0.1  # ± mm on directly-specified dimensions
     # DFM gates (advisory; each off at its zero/false default so plain specs are unaffected)

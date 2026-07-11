@@ -315,6 +315,13 @@ def build(spec: Spec) -> cq.Workplane:
         r = _profile_extrude_solid(spec)
     elif spec.shape == "loft_sections":
         r = _loft_sections_solid(spec)
+    elif spec.shape == "prism":
+        # a regular N-gon bar inscribed in envelope['diameter'], built CENTERED (z −H/2..H/2) like a
+        # box so the straight-edge fillet/chamfer/shell matchers apply unchanged. draft tapers inward.
+        D, H = spec.envelope["diameter"], spec.envelope["height"]
+        draft = next((f for f in spec.features if f.type == "draft"), None)
+        wp = cq.Workplane("XY").workplane(offset=-H / 2).polygon(spec.sides, D)
+        r = wp.extrude(H, taper=draft.angle) if draft is not None else wp.extrude(H)
     else:
         D, H = spec.envelope["diameter"], spec.envelope["height"]
         r = cq.Workplane("XY").circle(D / 2).extrude(H)
@@ -322,15 +329,25 @@ def build(spec: Spec) -> cq.Workplane:
     # Edge-mods first (before cuts change the edge set), but IN THE SPEC'S ORDER so
     # chamfer-then-fillet vs fillet-then-chamfer is faithful (operation-order sensitivity).
     # Each binds to its own selector's edge set (CQ_EDGE), so distinct sets don't conflict.
-    # fillet/chamfer are only meaningful on a box's straight edges — a cylinder/loft has none,
-    # so we skip them there (a model slip can't corrupt the solid; the verifier agrees, below).
+    # box: fillet/chamfer bind to straight edge sets. cylinder/revolve: the only filletable edge is
+    # the top/bottom circular RIM (Slice 1 — rim break); |Z (straight) selects nothing there, so a
+    # mis-aimed selector is a safe no-op, and an OCCT failure leaves the solid intact (guard intent).
     for f in spec.features:
-        if spec.shape != "box":
-            break
-        if f.type == "fillet":
-            r = r.edges(CQ_EDGE.get(f.edges, "|Z")).fillet(f.radius)
-        elif f.type == "chamfer":
-            r = r.edges(CQ_EDGE.get(f.edges, "|Z")).chamfer(f.distance)
+        if f.type not in ("fillet", "chamfer"):
+            continue
+        if spec.shape in ("box", "prism"):   # straight edges: |Z verticals (N on a prism) + rim edges
+            sel = CQ_EDGE.get(f.edges, "|Z")
+            r = (r.edges(sel).fillet(f.radius) if f.type == "fillet"
+                 else r.edges(sel).chamfer(f.distance))
+        elif spec.shape in ("cylinder", "revolve"):
+            sel = {"top": ">Z", "bottom": "<Z"}.get(f.edges)
+            if sel is None:
+                continue
+            try:
+                r = (r.edges(sel).fillet(f.radius) if f.type == "fillet"
+                     else r.edges(sel).chamfer(f.distance))
+            except Exception:  # noqa: BLE001 — a rim op OCCT can't apply leaves the solid intact
+                pass
     # variable-radius fillet (box): raw OCCT — the fluent API can't vary the radius along an edge
     vf = next((f for f in spec.features if f.type == "var_fillet"), None)
     if vf is not None and spec.shape == "box":
@@ -343,7 +360,9 @@ def build(spec: Spec) -> cq.Workplane:
     # shell (box): hollow to a thin wall, optionally leaving one face open. Before pockets/holes so
     # those cut through the finished wall.
     sh = next((f for f in spec.features if f.type == "shell"), None)
-    if sh is not None and spec.shape == "box":
+    if sh is not None and spec.shape in ("box", "cylinder", "prism"):
+        # box → hollow rect enclosure; cylinder → hollow tube (open) / sealed shell. open_face removes
+        # the +Z (or −Z) face so the wall is exposed; "none" leaves a fully-sealed hollow.
         if sh.open_face == "none":
             r = r.shell(-sh.thickness)
         else:
@@ -567,15 +586,20 @@ def _revolve_solid(spec: Spec) -> cq.Workplane:
 
 
 def _sweep_solid(spec: Spec) -> cq.Workplane:
-    """A round tube: sweep a circle of envelope['diameter'] along the 3D `path` polyline. The path
-    wire is assembled from 3D line edges (so non-planar paths work), and the profile sits on a plane
-    perpendicular to the first segment so it starts square to the path."""
+    """A swept prism: sweep a profile along the 3D `path` polyline. Profile = a RECTANGLE of
+    envelope['width']×['height'] (a channel / box-section beam / rail) when both are given, else a
+    round tube of envelope['diameter']. The path wire is assembled from 3D line edges (so non-planar
+    paths work), and the profile sits on a plane perpendicular to the first segment (square to the path)."""
     pts = [cq.Vector(*p) for p in (spec.path or [])]
-    d = spec.envelope["diameter"]
     edges = [cq.Edge.makeLine(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
     path_wire = cq.Wire.assembleEdges(edges)
     t0 = (pts[1] - pts[0]).normalized()
-    prof = cq.Workplane(cq.Plane(origin=pts[0].toTuple(), normal=t0.toTuple())).circle(d / 2)
+    plane = cq.Plane(origin=pts[0].toTuple(), normal=t0.toTuple())
+    e = spec.envelope
+    if "width" in e and "height" in e:
+        prof = cq.Workplane(plane).rect(e["width"], e["height"])
+    else:
+        prof = cq.Workplane(plane).circle(e["diameter"] / 2)
     return prof.sweep(cq.Workplane(obj=path_wire), isFrenet=True)
 
 
@@ -674,6 +698,8 @@ def _axis_extent(spec: Spec, axis: str) -> float:
     if spec.shape == "loft_sections":
         d = spec.envelope_dims()
         return {"x": d["length"], "y": d["width"], "z": d["height"]}[axis]
+    if spec.shape == "prism":   # circumscribed N-gon: max XY span = circumdiameter (even N); z = height
+        return spec.envelope["height"] if axis == "z" else spec.envelope["diameter"]
     return spec.envelope["height"] if axis == "z" else spec.envelope["diameter"]
 
 
@@ -683,7 +709,7 @@ def _axis_center(spec: Spec, axis: str) -> float:
     through-cutter at 0 on those HALF-DRILLS the hole (the corpus-flange bug: bolt circles that
     stop mid-part yet verified, because the census checks position/⌀, not depth)."""
     if axis == "z":
-        if spec.shape == "cylinder":
+        if spec.shape == "cylinder":   # cylinder rises z 0..H; prism/box are centered (z-center 0)
             return spec.envelope["height"] / 2.0
         if spec.shape == "revolve":
             zs = [z for _, z in (spec.profile or [(0.0, 0.0)])]
@@ -742,8 +768,10 @@ def emit_code(spec: Spec) -> str:
         L.append(f"_pts = [cq.Vector(*p) for p in {[list(p) for p in (spec.path or [])]}]")
         L.append("_edges = [cq.Edge.makeLine(_pts[i], _pts[i+1]) for i in range(len(_pts)-1)]")
         L.append("_path = cq.Wire.assembleEdges(_edges); _t0 = (_pts[1]-_pts[0]).normalized()")
-        L.append(f'result = cq.Workplane(cq.Plane(origin=_pts[0].toTuple(), normal=_t0.toTuple())).circle({e["diameter"] / 2}).sweep(cq.Workplane(obj=_path), isFrenet=True)')
-        L.append(f"L = {e['diameter']}")
+        _prof = (f'.rect({e["width"]}, {e["height"]})' if "width" in e and "height" in e
+                 else f'.circle({e["diameter"] / 2})')
+        L.append(f'result = cq.Workplane(cq.Plane(origin=_pts[0].toTuple(), normal=_t0.toTuple())){_prof}.sweep(cq.Workplane(obj=_path), isFrenet=True)')
+        L.append(f"L = {e.get('diameter', e.get('width', 0))}")
     elif spec.shape == "profile_extrude":
         # SILHOUETTE body: side (X-Z) extruded ±Y (both=True), optional ∩ plan (X-Y) extruded Z, then
         # centered — MUST match _profile_extrude_solid() exactly (corpus gates on the emitted artifact).
@@ -785,17 +813,29 @@ def emit_code(spec: Spec) -> str:
         L.append("    _sks.append(_sk.moved(cq.Location(cq.Vector(0, _s.get('z_center', _h/2), _s['x']))))")
         L.append('result = cq.Workplane("YZ").placeSketch(*_sks).loft(ruled=False)')
         L.append(f"L = {round(max(s['x'] for s in ss) - min(s['x'] for s in ss), 4) if ss else 0.0}")
+    elif spec.shape == "prism":
+        L.append(f"D, H = {e['diameter']}, {e['height']}")
+        _dr = next((f for f in spec.features if f.type == "draft"), None)
+        _tp = f", taper={_dr.angle}" if _dr is not None else ""
+        L.append(f'result = cq.Workplane("XY").workplane(offset=-H / 2).polygon({spec.sides}, D).extrude(H{_tp})')
+        L.append("L = W = D")
     else:
         L.append(f"D, H = {e['diameter']}, {e['height']}")
         L.append('result = cq.Workplane("XY").circle(D / 2).extrude(H)')
         L.append("L = W = D")
-    for f in spec.features:
-        if spec.shape != "box":   # parity with build(): fillet/chamfer are box-only (no straight edges elsewhere)
-            break
-        if f.type == "fillet":
-            L.append(f'result = result.edges("{CQ_EDGE.get(f.edges, "|Z")}").fillet({f.radius})')
-        elif f.type == "chamfer":
-            L.append(f'result = result.edges("{CQ_EDGE.get(f.edges, "|Z")}").chamfer({f.distance})')
+    for f in spec.features:   # parity with build(): box/prism use straight-edge sets; cylinder/revolve = rim
+        if f.type not in ("fillet", "chamfer"):
+            continue
+        if spec.shape in ("box", "prism"):
+            _op = f"fillet({f.radius})" if f.type == "fillet" else f"chamfer({f.distance})"
+            L.append(f'result = result.edges("{CQ_EDGE.get(f.edges, "|Z")}").{_op}')
+        elif spec.shape in ("cylinder", "revolve"):
+            _sel = {"top": ">Z", "bottom": "<Z"}.get(f.edges)
+            if _sel is None:
+                continue
+            _op = f"fillet({f.radius})" if f.type == "fillet" else f"chamfer({f.distance})"
+            L.append(f'try: result = result.edges("{_sel}").{_op}')
+            L.append("except Exception: pass")
     _vf = next((f for f in spec.features if f.type == "var_fillet"), None)
     if _vf is not None and spec.shape == "box":
         L.insert(0, "from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet")
@@ -803,7 +843,7 @@ def emit_code(spec: Spec) -> str:
         L.append(f'for _e in result.edges("{CQ_EDGE.get(_vf.edges, "|Z")}").vals(): _mk.Add({_vf.r1}, {_vf.r2}, _e.wrapped)')
         L.append("result = cq.Workplane(obj=cq.Shape.cast(_mk.Shape()))")
     _sh = next((f for f in spec.features if f.type == "shell"), None)
-    if _sh is not None and spec.shape == "box":
+    if _sh is not None and spec.shape in ("box", "cylinder", "prism"):
         if _sh.open_face == "none":
             L.append(f"result = result.shell(-{_sh.thickness})")
         else:

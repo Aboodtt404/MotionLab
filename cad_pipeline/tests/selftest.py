@@ -128,6 +128,39 @@ GOLDEN = [
          features=[{"type": "pocket", "length": 24, "width": 24, "depth": 2, "at": [-28, 0]},
                    {"type": "pocket", "length": 24, "width": 24, "depth": 2, "at": [28, 0]},
                    {"type": "pocket", "length": 80, "width": 3, "depth": 1.5, "at": [0, -22]}], tolerance=0.1),
+    # Slice 1: rim break on TURNED bodies — fillet/chamfer the top/bottom circular rim of a cylinder
+    # (a torus / cone the verifier resolves back to the fillet r / 45° chamfer on exactly that rim) and
+    # a revolve. Lifts the box-only guard so non-box parts read as machined, not raw stock.
+    Spec(object="rim-filleted spacer", shape="cylinder", envelope={"diameter": 40, "height": 25},
+         features=[{"type": "fillet", "radius": 3, "edges": "top"}], tolerance=0.1),
+    Spec(object="chamfered boss", shape="cylinder", envelope={"diameter": 50, "height": 30},
+         features=[{"type": "chamfer", "distance": 2, "edges": "top"}], tolerance=0.1),
+    Spec(object="rim-filleted hub", shape="revolve",
+         profile=[(0, 0), (20, 0), (20, 15), (12, 15), (12, 30), (0, 30)],
+         features=[{"type": "fillet", "radius": 2, "edges": "top"}], tolerance=0.1),
+    # Slice 2: shell on a CYLINDER — an open-top cup and a sealed hollow canister. The wall = the
+    # radial gap between the outer wall and the inner cavity (both Z-cylinders); a solid cylinder reads
+    # as one radius ⇒ "shell ignored" is caught, same guarantee as the box min-dim check.
+    Spec(object="open-top cup", shape="cylinder", envelope={"diameter": 50, "height": 40},
+         features=[{"type": "shell", "thickness": 3, "open_face": "top"}], tolerance=0.1),
+    Spec(object="sealed canister", shape="cylinder", envelope={"diameter": 40, "height": 60},
+         features=[{"type": "shell", "thickness": 2, "open_face": "none"}], tolerance=0.1),
+    # Slice 4: regular N-gon PRISM base (hex standoff / hex boss / octagon housing). Straight edges +
+    # planar walls ⇒ reuses the box finishing path (corner fillets on |Z verticals, rim chamfer, shell,
+    # holes). Verified by circum-⌀ (fillet-corner-shrink corrected) + exact side count + height.
+    Spec(object="hex standoff", shape="prism", sides=6, envelope={"diameter": 16, "height": 20},
+         features=[{"type": "through_hole", "diameter": 5}], tolerance=0.1),
+    Spec(object="hex boss (rounded corners)", shape="prism", sides=6, envelope={"diameter": 24, "height": 12},
+         features=[{"type": "fillet", "radius": 1.5, "edges": "all_vertical"}], tolerance=0.1),
+    Spec(object="octagon housing (shelled)", shape="prism", sides=8, envelope={"diameter": 44, "height": 30},
+         features=[{"type": "shell", "thickness": 2.5, "open_face": "top"}], tolerance=0.1),
+    # Slice 5: NON-CIRCULAR sweep — a rectangular section (channel / box-section beam / rail) swept
+    # along the path. The section area is back-computed from volume ÷ path-length (vs the round tube's
+    # effective ⌀), so a wrong-section beam is caught.
+    Spec(object="box-section beam", shape="sweep", envelope={"width": 20, "height": 12},
+         path=[(0, 0, 0), (100, 0, 0)], tolerance=0.1),
+    Spec(object="rect channel (L-path)", shape="sweep", envelope={"width": 16, "height": 10},
+         path=[(0, 0, 0), (60, 0, 0), (60, 0, 40)], tolerance=0.1),
 ]
 
 
@@ -136,6 +169,14 @@ def _swept(path, d):
     edges = [cq.Edge.makeLine(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
     t0 = (pts[1] - pts[0]).normalized()
     return cq.Workplane(cq.Plane(origin=pts[0].toTuple(), normal=t0.toTuple())).circle(d / 2).sweep(
+        cq.Workplane(obj=cq.Wire.assembleEdges(edges)), isFrenet=True)
+
+
+def _swept_rect(path, w, h):
+    pts = [cq.Vector(*p) for p in path]
+    edges = [cq.Edge.makeLine(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+    t0 = (pts[1] - pts[0]).normalized()
+    return cq.Workplane(cq.Plane(origin=pts[0].toTuple(), normal=t0.toTuple())).rect(w, h).sweep(
         cq.Workplane(obj=cq.Wire.assembleEdges(edges)), isFrenet=True)
 
 
@@ -191,6 +232,30 @@ ADVERSARIAL = [
      Spec(object="top-filleted plate", shape="box", envelope={"length": 80, "width": 50, "height": 20},
           features=[{"type": "fillet", "radius": 4, "edges": "top"}], tolerance=0.1),
      lambda: cq.Workplane("XY").box(80, 50, 20).edges("|Z").fillet(4), "selector-binding"),
+    # Slice 1 rim resolve-twice: spec fillets the TOP rim of a cylinder; wrong solid fillets the
+    # BOTTOM rim (same radius torus, wrong end) — only the rim-side binding catches it
+    ("rim fillet on the WRONG end (bottom rim built for a top-rim spec)",
+     Spec(object="rim-filleted spacer", shape="cylinder", envelope={"diameter": 40, "height": 25},
+          features=[{"type": "fillet", "radius": 3, "edges": "top"}], tolerance=0.1),
+     lambda: cq.Workplane("XY").circle(20).extrude(25).edges("<Z").fillet(3), "selector-binding"),
+    # Slice 5: swept beam WRONG section — a 12×12 beam built where a 20×12 was specified; the
+    # section area back-computed from volume (144 vs 240) catches it
+    ("swept beam wrong section (12×12 built for a 20×12 spec)",
+     Spec(object="box-section beam", shape="sweep", envelope={"width": 20, "height": 12},
+          path=[(0, 0, 0), (100, 0, 0)], tolerance=0.1),
+     lambda: _swept_rect([(0, 0, 0), (100, 0, 0)], 12, 12), "dimensional"),
+    # Slice 4: prism side-count resolve-twice — spec asks for a HEXAGON, wrong solid is an OCTAGON
+    # (both inscribed in the same ⌀, so the envelope matches; only the side-count check catches it)
+    ("prism wrong side count (octagon built for a hexagon spec)",
+     Spec(object="hex standoff", shape="prism", sides=6, envelope={"diameter": 16, "height": 20},
+          features=[{"type": "through_hole", "diameter": 5}], tolerance=0.1),
+     lambda: cq.Workplane("XY").workplane(offset=-10).polygon(8, 16).extrude(20).faces(">Z").workplane().hole(5), "selector-binding"),
+    # Slice 2: shell ignored on a cylinder — a solid cylinder built for a hollow-cup spec. The single
+    # outer Z-radius (no cavity) makes the wall unmeasurable ⇒ caught, like the box "shell ignored" case
+    ("cylinder shell ignored (solid cylinder built for a hollow-cup spec)",
+     Spec(object="open-top cup", shape="cylinder", envelope={"diameter": 50, "height": 40},
+          features=[{"type": "shell", "thickness": 3, "open_face": "top"}], tolerance=0.1),
+     lambda: cq.Workplane("XY").circle(25).extrude(40), "missing_feature"),
     # multi-axis resolve-twice: spec says an X-axis cross-hole; wrong solid drills it on Z
     ("hole on the WRONG axis (Z instead of the specified X)",
      Spec(object="cross-drilled bar", shape="box", envelope={"length": 80, "width": 50, "height": 40},

@@ -91,12 +91,22 @@ class Cone:
 
 
 @dataclass
+class Torus:
+    minor_r: float  # tube radius = the rim-fillet radius
+    major_r: float  # center-circle radius (rim radius − minor_r)
+    axis: str       # x | y | z | diagonal
+    x: float; y: float; z: float
+
+
+@dataclass
 class Measured:
     dx: float; dy: float; dz: float
     valid: bool; solids: int; volume: float
+    zc: float = 0.0   # z-midpoint of the bbox — classifies a rim feature as top (z>zc) vs bottom
     cyls: List[Cyl] = field(default_factory=list)
     planes: List[Plane] = field(default_factory=list)
     cones: List[Cone] = field(default_factory=list)
+    tori: List[Torus] = field(default_factory=list)
 
 
 def measure(solid) -> Measured:
@@ -109,7 +119,7 @@ def measure(solid) -> Measured:
     while sx.More():
         solids += 1; sx.Next()
 
-    cyls: List[Cyl] = []; planes: List[Plane] = []; cones: List[Cone] = []
+    cyls: List[Cyl] = []; planes: List[Plane] = []; cones: List[Cone] = []; tori: List[Torus] = []
     fx = TopExp_Explorer(shape, TopAbs_FACE)
     while fx.More():
         face = TopoDS.Face_s(fx.Current())
@@ -118,8 +128,16 @@ def measure(solid) -> Measured:
             cy = surf.Cylinder(); d = cy.Axis().Direction(); loc = cy.Axis().Location()
             cyls.append(Cyl(round(cy.Radius(), 4), _label(d.X(), d.Y(), d.Z()), round(loc.X(), 4), round(loc.Y(), 4), round(loc.Z(), 4)))
         elif t == GeomAbs_Cone:
-            co = surf.Cone(); d = co.Axis().Direction(); loc = co.Axis().Location()
+            co = surf.Cone(); d = co.Axis().Direction()
+            # store the PHYSICAL face-bbox center (not the parametric apex/ref location, which can sit
+            # far off the frustum): its z reliably places a rim chamfer top vs bottom, and its XY still
+            # equals the axis position (the frustum face is symmetric about its axis) for _nearest_cone.
+            b = _optimal_bbox(face)
             cones.append(Cone(round(math.degrees(abs(co.SemiAngle())), 4), _label(d.X(), d.Y(), d.Z()),
+                              round((b[0] + b[3]) / 2, 4), round((b[1] + b[4]) / 2, 4), round((b[2] + b[5]) / 2, 4)))
+        elif t == GeomAbs_Torus:
+            to = surf.Torus(); d = to.Axis().Direction(); loc = to.Axis().Location()
+            tori.append(Torus(round(to.MinorRadius(), 4), round(to.MajorRadius(), 4), _label(d.X(), d.Y(), d.Z()),
                               round(loc.X(), 4), round(loc.Y(), 4), round(loc.Z(), 4)))
         elif t == GeomAbs_Plane:
             pl = surf.Plane(); n = pl.Axis().Direction(); loc = pl.Location()
@@ -132,7 +150,8 @@ def measure(solid) -> Measured:
         fx.Next()
 
     return Measured(round(xmax - xmin, 4), round(ymax - ymin, 4), round(zmax - zmin, 4),
-                    valid, solids, round(float(props.Mass()), 2), cyls, planes, cones)
+                    valid, solids, round(float(props.Mass()), 2), round((zmin + zmax) / 2, 4),
+                    cyls, planes, cones, tori)
 
 
 # ----------------------------------------------------------------------------- report types
@@ -225,6 +244,19 @@ def _chamfer_matches(nz: float, zloc: float, dz: float, selector: str) -> bool:
     if loc == "bottom":
         return zloc < -band
     return True   # any rim
+
+
+def _rim_matches(zloc: float, zc: float, dz: float, selector: str) -> bool:
+    """Does an axisymmetric rim feature (torus fillet / cone chamfer at absolute z `zloc`) belong
+    to the selector's rim? A cylinder/revolve is NOT built centered (z runs 0..H), so classify by the
+    part's own z-midpoint `zc`: top rim ⇒ zloc above center, bottom rim ⇒ below (with a dead-band)."""
+    _, loc = resolve(selector)
+    band = 0.15 * dz
+    if loc == "top":
+        return zloc > zc + band
+    if loc == "bottom":
+        return zloc < zc - band
+    return True
 
 
 def _clearances(placed: List[tuple], shape: str, dx: float, dy: float) -> List[tuple]:
@@ -459,6 +491,15 @@ def _shell_wall_thickness(solid) -> Optional[float]:
     return best
 
 
+def _shell_wall_axisym(cyls: List[Cyl]) -> Optional[float]:
+    """Wall of a shelled TURNED body: the radial gap between the outer wall and the inner cavity,
+    both Z-axis cylinders. = largest_R − next-largest_R (any through-hole is a much smaller radius, so
+    the outer/cavity pair is always the top two). A solid (un-hollowed) cylinder has one Z-radius ⇒
+    None ⇒ the 'shell ignored' failure is caught, exactly like the box min-dim reading."""
+    rs = sorted({round(c.r, 4) for c in cyls if c.axis == "z"}, reverse=True)
+    return round(rs[0] - rs[1], 4) if len(rs) >= 2 else None
+
+
 def _pop_cyl_at(pool: List[Cyl], r_target: float, x: float, y: float, window: float) -> Optional[Cyl]:
     """Pop the Z-axis cylinder of radius ≈ r_target nearest the XY point (x, y) — the pilot/recess
     bore of a counterbore/countersink lives on the Z axis through its placement."""
@@ -578,13 +619,23 @@ def verify(solid, spec: Spec) -> Report:
                             "ok" if ok else "dimensional"))
         return Report(m.valid, m.solids, m.volume, rows)
     if spec.shape == "sweep":
-        # a constant round section swept along the path ⇒ vol = π·r²·(path length). Back-compute the
-        # effective ⌀ from the measured volume (a small number that measures exactly), so a wrong-bore
-        # tube or a non-tube is caught. Validity/single-solid come from Report.passed.
-        d, length = spec.envelope.get("diameter", 0.0), spec.path_length()
-        d_meas = 2.0 * (m.volume / (math.pi * length)) ** 0.5 if length > 0 and m.volume > 0 else None
-        rows.append(Row("sweep · profile ⌀ (from volume)", d, round(d_meas, 4) if d_meas else None,
-                        d_meas is not None and abs(d_meas - d) <= tol, "ok" if (d_meas is not None and abs(d_meas - d) <= tol) else "dimensional"))
+        # a constant section swept along the path ⇒ vol = section_area·(path length). Back-compute the
+        # section from the measured volume so a wrong-bore tube / wrong-section beam / non-sweep is
+        # caught. round ⇒ effective ⌀; rect ⇒ w·h area. Validity/single-solid come from Report.passed.
+        e, length = spec.envelope, spec.path_length()
+        if "width" in e and "height" in e:
+            exp_a = e["width"] * e["height"]
+            a_meas = m.volume / length if length > 0 and m.volume > 0 else None
+            # 3%+1: a mitered corner adds/removes a little vs the straight-run w·h·L idealization
+            a_ok = a_meas is not None and abs(a_meas - exp_a) <= exp_a * 0.03 + 1.0
+            rows.append(Row("sweep · section area (from volume)", round(exp_a, 2),
+                            round(a_meas, 2) if a_meas else None, a_ok, "ok" if a_ok else "dimensional"))
+        else:
+            d = e.get("diameter", 0.0)
+            d_meas = 2.0 * (m.volume / (math.pi * length)) ** 0.5 if length > 0 and m.volume > 0 else None
+            d_ok = d_meas is not None and abs(d_meas - d) <= tol
+            rows.append(Row("sweep · profile ⌀ (from volume)", d, round(d_meas, 4) if d_meas else None,
+                            d_ok, "ok" if d_ok else "dimensional"))
         return Report(m.valid, m.solids, m.volume, rows)
 
     if spec.shape == "loft" and any(f.type == "greeble" for f in spec.features):   # greebled bar (Stage C)
@@ -611,6 +662,29 @@ def verify(solid, spec: Spec) -> Report:
         # the taper itself: the −X end face must measure the base profile, the +X end the tip
         # (a plain bar that ignored the taper fails here — bbox alone can't see it).
         _verify_taper(m, w, h, wt, ht, dim)
+    elif spec.shape == "prism":
+        # circumscribed N-gon: for even N the max XY bbox span = the circum-⌀ (opposite vertices). A
+        # vertical-edge fillet rounds each corner, pulling the vertex IN by exactly r·(1/sin(interior½)−1)
+        # — subtract it so a corner-filleted hex still verifies its ⌀ (a chamfer cuts ≈ its distance).
+        half = math.radians((spec.sides - 2) * 90.0 / spec.sides)
+        shelled = any(f.type == "shell" for f in spec.features)
+        shrink = 0.0
+        for f in spec.features:
+            if f.type not in ("fillet", "chamfer") or resolve(f.edges)[0] != "vertical":
+                continue
+            if f.type == "fillet":
+                shrink = max(shrink, f.radius * (1.0 / math.sin(half) - 1.0))
+            else:
+                shrink = max(shrink, f.distance)
+        dim("envelope · ⌀ (circum)", round(e["diameter"] - 2 * shrink, 4), max(m.dx, m.dy))
+        dim("envelope · height", e["height"], m.dz)
+        # resolve-twice on the SIDE COUNT: exactly `sides` vertical outer walls (a shell doubles them
+        # with the inner cavity walls ⇒ 2·sides).
+        walls = sum(1 for p in m.planes if abs(p.nz) < 0.1)   # side faces are vertical (nz≈0)
+        want_walls = spec.sides * (2 if shelled else 1)
+        sides_ok = walls == want_walls
+        rows.append(Row("prism · sides", want_walls, walls, sides_ok,
+                        "ok" if sides_ok else "selector-binding"))
     else:
         dim("envelope · ⌀", e["diameter"], max(m.dx, m.dy))
         dim("envelope · height", e["height"], m.dz)
@@ -767,10 +841,15 @@ def verify(solid, spec: Spec) -> Report:
     # walls (normal in the XY plane), excluding the ∥Z caps. §3.2 ----
     # shell — the thinnest wall must equal the requested thickness (a solid box reads as min-dim ≫ t) §3.4
     for f in spec.features:
-        if f.type != "shell" or spec.shape != "box":
+        if f.type != "shell":
             continue
-        t_meas = _shell_wall_thickness(solid)
-        dim("shell · wall thickness", f.thickness, t_meas)
+        if spec.shape in ("box", "prism"):   # planar walls ⇒ the antiparallel-plane gap is the wall t
+            dim("shell · wall thickness", f.thickness, _shell_wall_thickness(solid))
+        elif spec.shape == "cylinder":
+            dim("shell · wall thickness", f.thickness, _shell_wall_axisym(m.cyls))
+            # the inner cavity is a Z-cylinder at R−t — pop it so the leftover check doesn't read it
+            # as an "unexpected cylinder" (box walls are planar, so this only applies to turned bodies).
+            _pop_nearest(e["diameter"] / 2 - f.thickness, pool, window, axis="z")
 
     for f in spec.features:
         if f.type != "draft" or spec.shape != "box":
@@ -785,29 +864,44 @@ def verify(solid, spec: Spec) -> Report:
         rows.append(Row("draft · angle (worst wall)", f.angle, round(worst, 3), ok, "ok" if ok else "dimensional"))
 
     # fillets — RESOLVE-TWICE: right radius on the right oriented edge set -----
-    # (box-only: cylinder/loft have no straight vertical edges, matching the builder's guard)
+    # box: fillet arcs are Z/rim CYLINDER fragments (straight edges). cylinder/revolve: the top/bottom
+    # circular rim rolls into a TORUS whose minor radius = the fillet r (Slice 1 — rim break).
     for f in spec.features:
-        if f.type != "fillet" or spec.shape != "box":
+        if f.type != "fillet":
             continue
-        want_n = expected_edge_count(spec.shape, f.edges)
-        matched = [c for c in list(pool) if abs(c.r - f.radius) <= window and _fillet_matches(c.axis, c.z, f.radius, m.dz, f.edges)]
-        for c in matched:
-            pool.remove(c)
-        if matched:
-            dim("fillet · r", f.radius, sum(c.r for c in matched) / len(matched))
-        else:
-            rows.append(Row("fillet · r", f.radius, None, False, "missing_feature"))
-        # selector binding: fillet faces on EXACTLY the resolved oriented+located edge set
-        binding_ok = len(matched) == want_n
-        rows.append(Row(f"fillet · binding ({f.edges})", want_n, len(matched), binding_ok,
-                        "ok" if binding_ok else "selector-binding"))
+        if spec.shape in ("box", "prism"):
+            want_n = expected_edge_count(spec.shape, f.edges, spec.sides)
+            matched = [c for c in list(pool) if abs(c.r - f.radius) <= window and _fillet_matches(c.axis, c.z, f.radius, m.dz, f.edges)]
+            for c in matched:
+                pool.remove(c)
+            if matched:
+                dim("fillet · r", f.radius, sum(c.r for c in matched) / len(matched))
+            else:
+                rows.append(Row("fillet · r", f.radius, None, False, "missing_feature"))
+            # selector binding: fillet faces on EXACTLY the resolved oriented+located edge set
+            binding_ok = len(matched) == want_n
+            rows.append(Row(f"fillet · binding ({f.edges})", want_n, len(matched), binding_ok,
+                            "ok" if binding_ok else "selector-binding"))
+        elif spec.shape in ("cylinder", "revolve"):
+            want_n = expected_edge_count(spec.shape, f.edges)
+            if want_n == 0:
+                continue   # selector denotes no rim on a turned body (e.g. all_vertical) — nothing bound
+            matched = [t for t in m.tori if t.axis == "z" and abs(t.minor_r - f.radius) <= window
+                       and _rim_matches(t.z, m.zc, m.dz, f.edges)]
+            if matched:
+                dim("fillet · r (rim)", f.radius, sum(t.minor_r for t in matched) / len(matched))
+            else:
+                rows.append(Row("fillet · r (rim)", f.radius, None, False, "missing_feature"))
+            binding_ok = len(matched) == want_n
+            rows.append(Row(f"fillet · binding ({f.edges})", want_n, len(matched), binding_ok,
+                            "ok" if binding_ok else "selector-binding"))
 
     # variable-radius fillet — HEURISTIC (BSpline blends): binding count + curvature-sampled radius
     # range ≈ [min(r1,r2), max(r1,r2)]. Looser tol than analytic features (sampling ~0.05 error). §3.10
     for f in spec.features:
-        if f.type != "var_fillet" or spec.shape != "box":
+        if f.type != "var_fillet" or spec.shape not in ("box", "prism"):
             continue
-        want_n = expected_edge_count(spec.shape, f.edges)
+        want_n = expected_edge_count(spec.shape, f.edges, spec.sides)
         n, rmin, rmax = _var_fillet_blends(solid)
         bind_ok = n == want_n
         rows.append(Row(f"var-fillet · binding ({f.edges})", want_n, n, bind_ok, "ok" if bind_ok else "selector-binding"))
@@ -817,15 +911,27 @@ def verify(solid, spec: Spec) -> Report:
         rows.append(Row("var-fillet · r-min (≈)", min(f.r1, f.r2), round(rmin, 3) if rmin else None, lo_ok, "ok" if lo_ok else "dimensional"))
         rows.append(Row("var-fillet · r-max (≈)", max(f.r1, f.r2), round(rmax, 3) if rmax else None, hi_ok, "ok" if hi_ok else "dimensional"))
 
-    # chamfers — diagonal planar bevel faces on the resolved edge set (box-only) ----------
+    # chamfers — box: diagonal planar bevel faces on the resolved edge set. cylinder/revolve: the
+    # top/bottom rim bevels into a CONE (frustum) whose semi-angle is 45° for a symmetric chamfer
+    # (Slice 1 — rim break); matched by axis Z + rim side, so a revolve's own profile cones don't count.
     for f in spec.features:
-        if f.type != "chamfer" or spec.shape != "box":
+        if f.type != "chamfer":
             continue
-        want_n = expected_edge_count(spec.shape, f.edges)
-        bevels = [p for p in m.planes if p.normal == "diagonal" and _chamfer_matches(p.nz, p.z, m.dz, f.edges)]
-        n = len(bevels)
-        ok = n == want_n
-        rows.append(Row(f"chamfer · binding ({f.edges})", want_n, n, ok, "ok" if ok else "selector-binding"))
+        if spec.shape in ("box", "prism"):
+            want_n = expected_edge_count(spec.shape, f.edges, spec.sides)
+            bevels = [p for p in m.planes if p.normal == "diagonal" and _chamfer_matches(p.nz, p.z, m.dz, f.edges)]
+            n = len(bevels)
+            ok = n == want_n
+            rows.append(Row(f"chamfer · binding ({f.edges})", want_n, n, ok, "ok" if ok else "selector-binding"))
+        elif spec.shape in ("cylinder", "revolve"):
+            want_n = expected_edge_count(spec.shape, f.edges)
+            if want_n == 0:
+                continue
+            bevels = [c for c in m.cones if c.axis == "z" and abs(c.semi - 45.0) <= 5.0
+                      and _rim_matches(c.z, m.zc, m.dz, f.edges)]
+            n = len(bevels)
+            ok = n == want_n
+            rows.append(Row(f"chamfer · binding (rim {f.edges})", want_n, n, ok, "ok" if ok else "selector-binding"))
 
     # pockets / panel insets — match EACH spec pocket to a floor face by footprint + position, so
     # several positioned cuts (panel lines, greeble detail) all verify (depth + footprint + position).

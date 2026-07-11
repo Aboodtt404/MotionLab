@@ -44,13 +44,21 @@ def orientation_of(selector: str) -> str:
     return "z" if kind == "vertical" else "xy"
 
 
-def expected_edge_count(shape_kind: str, selector: str) -> int:
+def expected_edge_count(shape_kind: str, selector: str, sides: int = 4) -> int:
     """Set-valued resolution: how many edges the selector denotes on the base envelope.
-    A box has 4 collinear vertical edges, and 4 horizontal edges per (top/bottom) face;
-    a cylinder has no straight edges, so any straight-edge selector is the empty set."""
-    if shape_kind != "box":
-        return 0
-    kind, loc = resolve(selector)
-    if kind == "vertical":
-        return 4
-    return 8 if loc == "any" else 4
+    A box has 4 collinear vertical edges, and 4 horizontal edges per (top/bottom) face.
+    A regular N-gon PRISM generalizes the box: N vertical edges, N horizontal edges per rim.
+    An axisymmetric body (cylinder / revolve) has no straight edges, so a straight-edge
+    selector is the empty set — but its TOP/BOTTOM circular rim IS a single filletable/
+    chamferable edge, so `top`/`bottom` denote exactly one rim edge there."""
+    if shape_kind in ("box", "prism"):
+        n = 4 if shape_kind == "box" else sides
+        kind, loc = resolve(selector)
+        if kind == "vertical":
+            return n
+        return 2 * n if loc == "any" else n
+    if shape_kind in ("cylinder", "revolve"):
+        kind, loc = resolve(selector)
+        # only the top/bottom circular rim is a rim-break target on a turned body
+        return 1 if kind == "horizontal" and loc in ("top", "bottom") else 0
+    return 0

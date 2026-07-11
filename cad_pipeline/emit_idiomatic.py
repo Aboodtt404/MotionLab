@@ -25,7 +25,7 @@ from .builder import _DIR, _axis_extent
 from .selectors import CQ_EDGE
 from .spec import Spec, expected_holes
 
-_FLAT_TOP = {"box", "cylinder"}  # shapes whose +Z face is a flat disc/rect ⇒ fluent .hole() is safe
+_FLAT_TOP = {"box", "cylinder", "prism"}  # +Z face is a flat disc/rect/N-gon ⇒ fluent .hole() is safe
 
 
 def _make_cylinder_cut(px: float, py: float, pz: float, d: float, axis: str, spec: Spec) -> str:
@@ -76,6 +76,12 @@ def emit_idiomatic(spec: Spec) -> str:
     elif spec.shape == "cylinder":
         out.append(f"D, H = {e['diameter']}, {e['height']}")
         out.append('result = cq.Workplane("XY").circle(D / 2).extrude(H)')
+    elif spec.shape == "prism":
+        out.append(f"D, H = {e['diameter']}, {e['height']}  # circumscribed ⌀, height")
+        dr = next((f for f in spec.features if f.type == "draft"), None)
+        _tp = f", taper={dr.angle}" if dr is not None else ""
+        out.append(f'result = cq.Workplane("XY").workplane(offset=-H / 2).polygon({spec.sides}, D)'
+                   f".extrude(H{_tp})  # regular {spec.sides}-gon bar, centered")
     elif spec.shape == "loft":
         ln, w, h, wt, ht = spec.loft_profiles()
         out.append(f"L, W, H = {ln}, {w}, {h}")
@@ -93,20 +99,30 @@ def emit_idiomatic(spec: Spec) -> str:
         out.append("_path = cq.Wire.assembleEdges([cq.Edge.makeLine(_pts[i], _pts[i + 1]) "
                    "for i in range(len(_pts) - 1)])")
         out.append("_t0 = (_pts[1] - _pts[0]).normalized()  # profile ⟂ first segment")
+        prof = (f'.rect({e["width"]}, {e["height"]})' if "width" in e and "height" in e
+                else f".circle({round(e['diameter'] / 2, 4)})")
         out.append(f'result = cq.Workplane(cq.Plane(origin=_pts[0].toTuple(), normal=_t0.toTuple()))'
-                   f".circle({round(e['diameter'] / 2, 4)}).sweep(cq.Workplane(obj=_path), isFrenet=True)")
+                   f"{prof}.sweep(cq.Workplane(obj=_path), isFrenet=True)")
     else:
         raise ValueError(f"unknown shape {spec.shape!r}")
 
-    # ---- edge mods (box only), in SPEC ORDER (op-order sensitive) -------------------------
+    # ---- edge mods, in SPEC ORDER (op-order sensitive) -----------------------------------
+    # box: straight-edge sets. cylinder/revolve: the top/bottom circular RIM (Slice 1 rim break) —
+    # the rim op is wrapped so a selector OCCT can't apply is a safe no-op (matches builder.build).
     var_fillet_used = False
     for f in spec.features:
-        if spec.shape != "box":
-            break
-        if f.type == "fillet":
-            out.append(f'result = result.edges("{CQ_EDGE.get(f.edges, "|Z")}").fillet({f.radius})')
-        elif f.type == "chamfer":
-            out.append(f'result = result.edges("{CQ_EDGE.get(f.edges, "|Z")}").chamfer({f.distance})')
+        if f.type not in ("fillet", "chamfer"):
+            continue
+        if spec.shape in ("box", "prism"):
+            op = f"fillet({f.radius})" if f.type == "fillet" else f"chamfer({f.distance})"
+            out.append(f'result = result.edges("{CQ_EDGE.get(f.edges, "|Z")}").{op}')
+        elif spec.shape in ("cylinder", "revolve"):
+            sel = {"top": ">Z", "bottom": "<Z"}.get(f.edges)
+            if sel is None:
+                continue
+            op = f"fillet({f.radius})" if f.type == "fillet" else f"chamfer({f.distance})"
+            out.append(f'try: result = result.edges("{sel}").{op}  # break the top/bottom rim')
+            out.append("except Exception: pass")
     vf = next((f for f in spec.features if f.type == "var_fillet"), None)
     if vf is not None and spec.shape == "box":
         var_fillet_used = True
@@ -115,9 +131,9 @@ def emit_idiomatic(spec: Spec) -> str:
                    f"_mk.Add({vf.r1}, {vf.r2}, _e.wrapped)  # radius varies r1→r2 along each edge")
         out.append("result = cq.Workplane(obj=cq.Shape(_mk.Shape()))")
 
-    # ---- shell (box), before pockets/holes so they cut the finished wall ------------------
+    # ---- shell (box / cylinder), before pockets/holes so they cut the finished wall -------
     sh = next((f for f in spec.features if f.type == "shell"), None)
-    if sh is not None and spec.shape == "box":
+    if sh is not None and spec.shape in ("box", "cylinder", "prism"):
         if sh.open_face == "none":
             out.append(f"result = result.shell(-{sh.thickness})  # sealed hollow")
         else:
