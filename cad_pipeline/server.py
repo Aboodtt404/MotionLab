@@ -83,7 +83,12 @@ def _run_model(spec: Spec, max_attempts: int) -> dict:
         return {"passed": rep["passed"], "attempts": 1, "history": [{"attempt": 1, "status": "ok",
                 "category": "ok" if rep["passed"] else "fail"}], "code": emit_code(spec),
                 "report": rep, "solid": solid, "fallback": True}
-    gen = VLLMGenerator(model=os.environ.get("CAD_MODEL", "qwen3.6-27b"))
+    # phase22 (the Phase-1-operator SFT) is the production adapter. RAG is OFF by default: the TF-IDF
+    # doc-lookup injects BOX-convention fillet examples that override the fine-tune's rim idioms
+    # (measured: rag=on emits edges("|Z") on a cylinder → fails; rag=off emits edges(">Z") → passes).
+    # CAD_RAG=1 restores it for the un-tuned base model.
+    gen = VLLMGenerator(model=os.environ.get("CAD_MODEL", "phase22"),
+                        rag=os.environ.get("CAD_RAG", "0") == "1")
     feedback = None
     history, best = [], None
     for attempt in range(1, max_attempts + 1):
