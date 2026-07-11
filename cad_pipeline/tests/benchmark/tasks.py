@@ -162,6 +162,35 @@ def _b06_checks(m):   # 200 seeded scatter instances → 200×12 tris
     return [_row("scatter · instance tris (200×12)", 2400, n, abs(n - 2400) <= 24, "missing_feature")]
 
 
+def _g03_uv_oracle() -> Callable[[], dict]:
+    """G03: single clean UV set (§6.4) — xatlas unwrap → UVs in [0,1], one set, covered."""
+    def run() -> dict:
+        from cad_pipeline.uv import uv_report
+        return uv_report(trimesh.creation.box((0.5, 0.5, 0.5))).to_dict()
+    return run
+
+
+def _w03_draco_oracle() -> Callable[[], dict]:
+    """W03: Draco-compress a mesh (§5/§6.5) — gltf-transform optimize → size ≤ 40% of source."""
+    def run() -> dict:
+        from cad_pipeline.glb_verify import optimize_glb
+        d = tempfile.mkdtemp()
+        try:
+            src, opt = os.path.join(d, "s.glb"), os.path.join(d, "o.glb")
+            trimesh.creation.icosphere(subdivisions=5).export(src)
+            res = optimize_glb(src, opt, draco=True)
+            if res is None:
+                return {"passed": False, "valid": False, "solids": 0, "rows": [], "failure_categories": ["validity"]}
+            ok = res["ratio"] <= 0.40
+            return {"passed": ok, "valid": True, "solids": 1,
+                    "rows": [{"name": "web · draco size ≤40% source", "expected": "≤0.40",
+                              "measured": res["ratio"], "within_tol": ok, "category": "ok" if ok else "dfm"}],
+                    "failure_categories": [] if ok else ["dfm"]}
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    return run
+
+
 def _g07_lod_oracle() -> Callable[[], dict]:
     """G07: LOD chain 6000/1500/400 tris + §4.2 silhouette-IoU acceptance (cad_pipeline.lod)."""
     def run() -> dict:
@@ -334,6 +363,8 @@ _PROMPTS: Dict[str, str] = {
     "B05": "boolean-cut a 1×1.2 window through a 4×3×0.2 wall (bpy)",
     "B06": "geometry-nodes scatter: exactly 200 seeded instances on a 10×10 plane (bpy)",
     "G07": "LOD chain 6000/1500/400 tris, silhouette IoU ≥0.97/0.92 (§4.2)",
+    "G03": "single clean UV set: 0 overlaps, all inside [0,1] (§6.4)",
+    "W03": "Draco-compress a 50k-tri mesh → ≤40% of source (§5)",
     "A01": "4-legged stool: seat ⌀140×16, height 120, legs 90° apart, splayed 10°",
     "A02": "shelf on an L-bracket, flush-mounted, fused single solid",
     "A04": "bolt + nut clamping 2 plates, coaxial holes, grip = Σ thickness",
@@ -364,6 +395,8 @@ _ORACLES: Dict[str, Callable[[], dict]] = {
     "B05": _bpy_oracle("window", {"wall": [4, 0.2, 3], "window": [1, 1.2]}, _b05_checks),
     "B06": _bpy_oracle("scatter", {"count": 200, "seed": 42}, _b06_checks),
     "G07": _g07_lod_oracle(),                          # LOD chain 6000/1500/400 + silhouette IoU (§4.2)
+    "G03": _g03_uv_oracle(),                            # single clean UV set (xatlas §6.4)
+    "W03": _w03_draco_oracle(),                         # Draco compression ≤40% (gltf-transform §5)
 }
 
 # extra task-specific assertions on the golden report (Fable's per-task numeric criteria)

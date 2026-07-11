@@ -23,6 +23,28 @@ from .verifier import Report, Row
 _TOOLS = os.path.join(os.path.dirname(__file__), "tools")
 _VALIDATOR_JS = os.path.join(_TOOLS, "gltf_validate.js")
 _BLRENDER = os.path.join(_TOOLS, "blrender.py")
+_GLTF_TRANSFORM = os.path.join(_TOOLS, "node_modules", ".bin", "gltf-transform")
+
+
+def optimize_glb(in_path: str, out_path: str, *, draco: bool = True, ktx2: bool = False,
+                 timeout: int = 120) -> Optional[dict]:
+    """§5 tool stack: gltf-transform optimize (Draco geometry + optional KTX2 texture). Returns
+    {size_before, size_after, ratio} or None if the CLI is absent (honest skip)."""
+    if not os.path.exists(_GLTF_TRANSFORM):
+        return None
+    cmd = [_GLTF_TRANSFORM, "optimize", in_path, out_path]
+    if draco:
+        cmd += ["--compress", "draco"]
+    if ktx2:
+        cmd += ["--texture-compress", "ktx2"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0 or not os.path.exists(out_path):
+            return None
+        before, after = os.path.getsize(in_path), os.path.getsize(out_path)
+        return {"size_before": before, "size_after": after, "ratio": round(after / max(before, 1), 3)}
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ───────────────────────────────────────────────────── tooling oracles

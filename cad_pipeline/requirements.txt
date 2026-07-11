@@ -14,3 +14,5 @@ pymeshlab>=2023.12         # §6.1 self-intersection (compute_selection_by_self_
 #   prusa-slicer --info x.stl        → manifold/parts/volume, exit 0
 #   prusa-slicer --export-gcode ...  → gcode with "estimated printing time"
 fast_simplification>=0.1     # §4.2 LOD quadric decimation (standalone, no OCP dep)
+xatlas>=0.0.9              # §6.4 UV unwrap (standalone, no OCP dep)
+# GLB optimize (§5): gltf-transform CLI via local npm in cad_pipeline/tools (npm i @gltf-transform/cli)
