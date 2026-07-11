@@ -79,12 +79,14 @@ def _first_valid_attempt(history: list[dict]) -> int | None:
     return None
 
 
-def evaluate(specs: list, max_attempts: int = 3, transcripts_out: str | None = None) -> dict:
+def evaluate(specs: list, max_attempts: int = 3, transcripts_out: str | None = None,
+             model: str = "qwen3.6-27b") -> dict:
     """`transcripts_out`: append every episode as a schema-valid RepairTranscript JSONL —
     eval runs double as repair-pair harvest (03_training_recipe §3c: repair pairs at ~15% of
     the SFT mixture teach 'minimum-change correction from typed feedback', the highest-value
-    skill). Costs nothing: the loop already records attempt_log."""
-    gen = VLLMGenerator()
+    skill). Costs nothing: the loop already records attempt_log.
+    `model`: the served model/adapter name to evaluate (e.g. 'sft', 'dpo' as vLLM --lora-modules)."""
+    gen = VLLMGenerator(model=model)
     gen_meta = {"model": gen.model, "base_url": gen.base_url, "rag": gen.rag,
                 "loop": "loop.run", "max_attempts": max_attempts}
     tfh = open(transcripts_out, "a") if transcripts_out else None
@@ -179,10 +181,11 @@ def main() -> int:
     set_name = next((a for a in args if a in SETS), "golden")
     max_attempts = next((int(a) for a in args if a.isdigit()), 3)
     tout = next((a.split("=", 1)[1] for a in args if a.startswith("--transcripts=")), None)
+    model = next((a.split("=", 1)[1] for a in args if a.startswith("--model=")), "qwen3.6-27b")
     specs = SETS[set_name]
-    print(f"Eval set='{set_name}' — {len(specs)} specs, max_attempts={max_attempts}, model=qwen3.6-27b (live)\n")
+    print(f"Eval set='{set_name}' — {len(specs)} specs, max_attempts={max_attempts}, model={model} (live)\n")
     preflight(specs)
-    summary = evaluate(specs, max_attempts, transcripts_out=tout)
+    summary = evaluate(specs, max_attempts, transcripts_out=tout, model=model)
 
     print("=" * 66)
     for r in summary["results"]:
