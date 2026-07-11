@@ -23,10 +23,10 @@ def test_drone_multi_rep():
     brief = decompose("a quadcopter drone with a camera canopy")
     check(isinstance(brief, AssemblyBrief) and len(brief.components) == 6, "6 parts (frame+4 motors+canopy)")
     res = build_asset(brief)
-    reps = {p.name: p.representation for p in res.parts}
-    check(reps.get("quad frame plate") == "brep", "frame → brep")
-    check(sum(1 for r in reps.values() if r == "library") == 4, "4 motors → library (catalog instances)")
-    check(any(r == "mesh" for r in reps.values()), "organic canopy → mesh")
+    reps = [p.representation for p in res.parts]              # list, not name-keyed (4 motors share a name)
+    check(any(p.name == "quad frame plate" and p.representation == "brep" for p in res.parts), "frame → brep")
+    check(sum(1 for r in reps if r == "library") == 4, "4 motors → library (catalog instances)")
+    check(any(r == "mesh" for r in reps), "organic canopy → mesh")
     inproc = [p for p in res.parts if p.representation in ("brep", "library")]
     check(all(p.passed for p in inproc), "all in-process (brep+library) parts verify")
 
