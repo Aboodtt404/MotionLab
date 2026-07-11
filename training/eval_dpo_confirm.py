@@ -75,7 +75,8 @@ def main():
     SETS["bench"] = EVAL_BENCH
     specs = [(n, s) for n, lst in SETS.items() for s in lst]
     print(f"Confirmation A/B — {len(specs)} specs (golden {len(GOLDEN)} + hard {len(EVAL_HARD)} + bench {len(EVAL_BENCH)})\n")
-    for model in ("sft", "dpo"):
+    models = sys.argv[1:] or ["sft", "phase22"]
+    for model in models:
         p1 = pk = p3 = 0
         for _set, spec in specs:
             a1 = _one_pass(model, spec, 0.2)
