@@ -19,7 +19,8 @@ Representation = str   # "brep" | "library" | "mesh" | "procedural"
 # signal → representation (order matters: earlier wins). Fable §1.2 rows.
 # NB: "bolt" only as a fastener, not "bolt circle/hole/pattern" (a brep feature — a ring of holes)
 _LIBRARY = re.compile(r"\b(m[2-8]\b|screw|bolt(?!\s*(?:circle|hole|pattern|pcd))|nut|washer|bearing|"
-                      r"gear|standoff|dowel|pin|nema17|608|623|685|shcs|heat-?set|pulley|gt2)\b", re.I)
+                      r"gear|standoff|dowel|pin|nema17|608|623|685|624|shcs|heat-?set|pulley|gt2|"
+                      r"motor|2207|1404|n20|stepper|servo)\b", re.I)
 _MESH = re.compile(r"\b(organic|sculpt|creature|character|animal|figure|statue|face|body|"
                    r"looks like|blob|hand|tree|foliage|rock|terrain-?less|natural)\b", re.I)
 _PROCEDURAL = re.compile(r"\b(family of|variations?|randomi[sz]ed|greebles?|scatter|array of|"
@@ -32,12 +33,13 @@ def choose_representation(*, representation: Optional[str] = None, prompt: str =
                           name: str = "", target_use: Optional[str] = None) -> Representation:
     """Return the representation for one part. An explicit `representation` on the brief always wins;
     otherwise infer from the text signals; default to brep (the verifiable, parametric fallback)."""
+    # underscores are word chars → they break \b boundaries ("motor_2207"); normalise to spaces
+    text = f"{name} {prompt}".replace("_", " ")
     if representation in ("brep", "mesh", "procedural"):
         # a brief that literally names a catalog part is still 'library' even if tagged brep
-        if _LIBRARY.search(f"{name} {prompt}") and representation == "brep":
+        if _LIBRARY.search(text) and representation == "brep":
             return "library"
         return representation
-    text = f"{name} {prompt}"
     if _LIBRARY.search(text):
         return "library"
     if _PROCEDURAL.search(text):
