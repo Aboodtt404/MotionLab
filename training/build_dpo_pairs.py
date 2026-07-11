@@ -104,7 +104,37 @@ def _fails_against(pert: Spec, target: Spec) -> Tuple[bool, List[str]]:
         return True, ["validity"]
 
 
+def _holdout() -> set:
+    """Benchmark/eval spec signatures the DPO set must NOT contain (03_training_recipe §5 — same
+    discipline as build_curriculum). A pair whose golden spec matches an eval spec is dropped."""
+    sigs: set = set()
+    try:
+        from training.build_curriculum import _holdout_sigs
+        sigs |= _holdout_sigs()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from training.canary import canary_signatures
+        sigs |= canary_signatures()
+    except Exception:  # noqa: BLE001
+        pass
+    return sigs
+
+
+def _sig(spec: Spec) -> str:
+    try:
+        from training.build_curriculum import _sig as sig
+        return sig(json.loads(spec.model_dump_json()))
+    except Exception:  # noqa: BLE001
+        return spec.model_dump_json()
+
+
+_HOLDOUT: set = set()
+
+
 def make_pair(spec: Spec, rng: random.Random) -> Optional[dict]:
+    if _sig(spec) in _HOLDOUT:                    # never build a DPO pair on a held-out eval spec
+        return None
     if not _passes(spec):
         return None
     caps = describe(spec, rng)
@@ -133,6 +163,9 @@ def main() -> int:
     ap.add_argument("--out", default="/workspace/.hf_home/cad_corpus/dpo_pairs.jsonl")
     a = ap.parse_args()
     rng = random.Random(a.seed)
+    global _HOLDOUT
+    _HOLDOUT = _holdout()
+    print(f"holdout: {len(_HOLDOUT)} eval-spec signatures excluded from the DPO set")
     pairs: List[dict] = []
     tries = 0
     while len(pairs) < a.n and tries < a.n * 6:

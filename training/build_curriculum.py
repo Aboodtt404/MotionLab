@@ -49,9 +49,13 @@ def _sig(spec: dict) -> tuple:
 def _holdout_sigs() -> set:
     from cad_pipeline.tests.bench_specs import EVAL_BENCH
     from cad_pipeline.tests.eval_baseline import EVAL_HARD
+    try:
+        from training.canary import CANARY   # contamination canaries are held out of ALL training
+    except Exception:  # noqa: BLE001
+        CANARY = []
     from cad_pipeline.tests.selftest import GOLDEN
     sigs = set()
-    for s in [*GOLDEN, *EVAL_HARD, *EVAL_BENCH]:
+    for s in [*GOLDEN, *EVAL_HARD, *EVAL_BENCH, *CANARY]:
         sigs.add(_sig(json.loads(s.model_dump_json())))
     return sigs
 
