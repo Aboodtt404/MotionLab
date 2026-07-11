@@ -191,6 +191,14 @@ def _w03_draco_oracle() -> Callable[[], dict]:
     return run
 
 
+def _g09_trim_oracle() -> Callable[[], dict]:
+    """G09: UV islands in 4 declared V-bands (§4) — cad_pipeline.art.verify_trim_sheet."""
+    def run() -> dict:
+        from cad_pipeline.art import verify_trim_sheet
+        return verify_trim_sheet(trimesh.creation.box((1, 1, 0.5)), n_bands=4).to_dict()
+    return run
+
+
 def _g07_lod_oracle() -> Callable[[], dict]:
     """G07: LOD chain 6000/1500/400 tris + §4.2 silhouette-IoU acceptance (cad_pipeline.lod)."""
     def run() -> dict:
@@ -397,6 +405,7 @@ _ORACLES: Dict[str, Callable[[], dict]] = {
     "G07": _g07_lod_oracle(),                          # LOD chain 6000/1500/400 + silhouette IoU (§4.2)
     "G03": _g03_uv_oracle(),                            # single clean UV set (xatlas §6.4)
     "W03": _w03_draco_oracle(),                         # Draco compression ≤40% (gltf-transform §5)
+    "G09": _g09_trim_oracle(),                          # trim-sheet UV in 4 V-bands (§4)
 }
 
 # extra task-specific assertions on the golden report (Fable's per-task numeric criteria)
