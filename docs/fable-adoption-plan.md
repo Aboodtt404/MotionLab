@@ -161,4 +161,5 @@ the export/validate toolchain wired into the router.
       hybrid merge→repair→/engine).**
 - [ ] Phase 6 — training SFT→DPO→GRPO
 - [ ] Phase 7 — skill packaging
-- [ ] Phase 8 — tool stack + build123d
+- [~] Phase 8 — build123d EVALUATED → stay on CadQuery (docs/build123d-evaluation.md; its OCP 7.9.3
+      breaks cadquery 2.7 — same kernel, stylistic-only, negative cost/benefit). Remaining: §4 LOD/UV.
