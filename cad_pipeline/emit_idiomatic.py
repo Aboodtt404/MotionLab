@@ -121,8 +121,9 @@ def emit_idiomatic(spec: Spec) -> str:
             if sel is None:
                 continue
             op = f"fillet({f.radius})" if f.type == "fillet" else f"chamfer({f.distance})"
-            out.append(f'try: result = result.edges("{sel}").{op}  # break the top/bottom rim')
-            out.append("except Exception: pass")
+            # clean idiomatic target (no defensive try/except): the corpus only ships specs whose
+            # emitted code exec+verifies, so a rim op that OCCT can't apply is filtered out upstream.
+            out.append(f'result = result.edges("{sel}").{op}  # break the {f.edges} rim')
     vf = next((f for f in spec.features if f.type == "var_fillet"), None)
     if vf is not None and spec.shape == "box":
         var_fillet_used = True

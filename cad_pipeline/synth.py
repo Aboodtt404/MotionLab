@@ -57,22 +57,25 @@ _SPEC_SYS = (
     "You are a mechanical/sci-fi CAD designer producing TRAINING specs. Output ONE part as JSON matching "
     "the schema. Make it REALISTIC and DETAILED for the requested category — give it the functional "
     "features it needs and VARY dimensions, proportions and feature COMBINATIONS run-to-run (never a bare "
-    "primitive). Shapes: box, cylinder, loft (tapered/adapter — length,width,height[,width_top,height_top|"
-    "diameter_top]), revolve (turned — `profile` of [radius,z]), sweep (tube — `path` of [x,y,z] + "
-    "envelope.diameter). Features: through_hole, hole_pattern, fillet/chamfer (box only), pocket(+at for "
-    "panel insets), draft (box, molding), counterbore, countersink, mirror (box), shell (box, hollow), "
-    "var_fillet, thread. Prefer 2–4 features in combination. Keep dimensions manufacturable (fillet/shell/"
-    "draft small vs the part; holes clear of edges and each other). ALWAYS fill `envelope` with the "
-    "shape's dims — box: {length,width,height} · cylinder: {diameter,height} · loft: {length,width,height"
-    "[,width_top,height_top|diameter_top]} · sweep: {diameter} + `path`; revolve uses `profile` [[r,z],…] "
-    "instead (envelope {} or {angle}) and may add `profile_arcs` (sagitta per segment; 0=straight, "
-    "negative bows OUTWARD on an upward run — domes/barrels/flares). "
-    "HARD FEATURE-COMPATIBILITY RULES (violations are rejected): fillet, chamfer, draft, shell, "
-    "var_fillet and mirror go on BOX parts ONLY — never on cylinder/loft/revolve/sweep. draft "
-    "NEVER combines with fillet/chamfer/var_fillet (tapered walls have no vertical edges). pocket, "
-    "counterbore, countersink and internal thread need a FLAT TOP: box or cylinder only. "
-    "through_hole and hole_pattern work on any shape. A cylinder/revolve/loft/sweep part gets its "
-    "character from its PROFILE (steps, tapers, arcs) and holes — not from box features."
+    "primitive). Shapes: box, cylinder, prism (regular N-gon bar — hex/square/octagon standoff/boss/nut, "
+    "`sides`:N + envelope.diameter (circumscribed ⌀) + height), loft (tapered/adapter — length,width,"
+    "height[,width_top,height_top|diameter_top]), revolve (turned — `profile` of [radius,z]), sweep "
+    "(tube/beam — `path` of [x,y,z] + a round envelope.diameter OR a rectangular envelope.width+height). "
+    "Features: through_hole, hole_pattern, fillet/chamfer, pocket(+at for panel insets), draft (molding), "
+    "counterbore, countersink, mirror, shell (hollow), var_fillet, thread. Prefer 2–4 features in "
+    "combination. Keep dimensions manufacturable (fillet/shell/draft small vs the part; holes clear of "
+    "edges and each other). ALWAYS fill `envelope` with the shape's dims — box: {length,width,height} · "
+    "cylinder/prism: {diameter,height} (prism also sets `sides`) · loft: {length,width,height[,width_top,"
+    "height_top|diameter_top]} · sweep: {diameter} OR {width,height} + `path`; revolve uses `profile` "
+    "[[r,z],…] instead (envelope {} or {angle}) and may add `profile_arcs` (sagitta per segment; "
+    "0=straight, negative bows OUTWARD — domes/barrels/flares). "
+    "HARD FEATURE-COMPATIBILITY RULES (violations are rejected): fillet & chamfer go on box/prism (edges "
+    "+ rims) and on the top/bottom RIM of a cylinder/revolve (edges='top'|'bottom') — NOT on loft/sweep. "
+    "shell hollows box/prism/cylinder. draft, var_fillet, mirror and pocket/counterbore/countersink & "
+    "internal thread need a FLAT-TOP straight-walled body: box/prism (+ cylinder for shell/pocket/holes). "
+    "draft NEVER combines with fillet/chamfer/var_fillet (tapered walls lose the vertical edges). "
+    "through_hole and hole_pattern work on any shape. A loft/sweep part gets its character from its "
+    "PROFILE/PATH and holes — not from box features."
 )
 
 _CAPTION_SYS = (
@@ -87,7 +90,7 @@ _CAPTION_SYS = (
 
 
 _ENV_KEYS = {"box": ("length", "width", "height"), "cylinder": ("diameter", "height"),
-             "loft": ("length", "width", "height")}
+             "prism": ("diameter", "height"), "loft": ("length", "width", "height")}
 
 
 def _spec_complete(spec: Spec) -> bool:
@@ -100,7 +103,9 @@ def _spec_complete(spec: Spec) -> bool:
     if spec.shape == "revolve":
         return bool(spec.profile and len(spec.profile) >= 3)
     if spec.shape == "sweep":
-        return "diameter" in spec.envelope and bool(spec.path and len(spec.path) >= 2)
+        # round (diameter) OR rectangular (width+height) section, swept along a ≥2-point path
+        has_section = "diameter" in spec.envelope or {"width", "height"} <= set(spec.envelope)
+        return has_section and bool(spec.path and len(spec.path) >= 2)
     return all(k in spec.envelope for k in _ENV_KEYS[spec.shape])
 
 

@@ -44,14 +44,25 @@ def _shape_noun(spec: Spec, rng: random.Random) -> str:
         return _pick(rng, "turned body", "revolved part")
     if spec.shape == "loft":
         return "round-to-rectangular adapter" if spec.loft_top_round() else "tapered body"
+    if spec.shape == "prism":
+        poly = {3: "triangular", 4: "square", 5: "pentagonal", 6: "hexagonal",
+                8: "octagonal"}.get(spec.sides, f"{spec.sides}-sided")
+        return _pick(rng, f"{poly} bar", f"{poly} standoff", f"{poly} prism")
+    if spec.shape == "sweep" and {"width", "height"} <= set(spec.envelope):
+        return _pick(rng, "box-section beam", "extruded channel", "rail")
     return _pick(rng, "swept tube", "pipe")
 
 
 def _dims_phrase(spec: Spec, precise: bool) -> str:
     def n(x: float) -> str:
         return f"{x:.1f}".rstrip("0").rstrip(".") if precise else f"{round(x / 5) * 5:g}"
-    if spec.shape == "sweep":   # no envelope_dims() for sweep (it carries only `diameter`)
+    if spec.shape == "sweep":   # round bore OR a rectangular section, swept along the path
+        if {"width", "height"} <= set(spec.envelope):
+            return (f"{n(spec.envelope['width'])}×{n(spec.envelope['height'])} mm section, "
+                    f"{n(spec.path_length())} mm long")
         return f"{n(spec.envelope['diameter'])} mm bore, {n(spec.path_length())} mm long"
+    if spec.shape == "prism":   # regular N-gon bar: circumscribed ⌀ across corners × height
+        return f"{n(spec.envelope['diameter'])} mm across, {n(spec.envelope['height'])} mm tall"
     d = spec.envelope_dims()
     if spec.shape in ("box", "loft"):
         return f"{n(d['length'])}×{n(d['width'])}×{n(d['height'])} mm"

@@ -415,11 +415,24 @@ class Spec(BaseModel):
         return (2 * rmax, zmax - zmin)
 
 
-# Feature ↔ shape compatibility (mirrors the builder's guards — single source of truth).
-# BOX_ONLY features are silently SKIPPED by the builder on other shapes, which would make a
-# spec/caption lie about geometry that isn't there; FLAT_TOP features sketch on a planar +Z
-# face, which loft/revolve/sweep don't have.
-BOX_ONLY = frozenset({"fillet", "chamfer", "draft", "shell", "var_fillet", "mirror"})
+# Feature ↔ shape compatibility (mirrors the builder's guards — single source of truth). A feature
+# on a shape NOT in its set is silently skipped / unrealizable, which would make a spec+caption lie
+# about geometry that isn't there. Updated for Phase 1's guard-lifts: fillet/chamfer now bind the
+# top/bottom rim of a turned body (cylinder/revolve) and the straight edges of a prism; shell hollows
+# cylinders/prisms; the prism reuses the whole box finishing path.
+_FEATURE_SHAPES = {
+    "fillet":      frozenset({"box", "prism", "cylinder", "revolve"}),
+    "chamfer":     frozenset({"box", "prism", "cylinder", "revolve"}),
+    "var_fillet":  frozenset({"box", "prism"}),
+    "shell":       frozenset({"box", "prism", "cylinder"}),
+    "draft":       frozenset({"box", "prism"}),
+    "mirror":      frozenset({"box"}),
+    "pocket":      frozenset({"box", "prism", "cylinder"}),   # sketch on a planar +Z face
+    "counterbore": frozenset({"box", "prism", "cylinder"}),
+    "countersink": frozenset({"box", "prism", "cylinder"}),
+}
+# back-compat aliases (nothing imports these now, but keep the names meaningful)
+BOX_ONLY = frozenset({"var_fillet", "draft", "mirror"})
 FLAT_TOP = frozenset({"pocket", "counterbore", "countersink"})
 
 
@@ -428,12 +441,11 @@ def feature_shape_conflicts(spec: "Spec") -> List[str]:
     out: List[str] = []
     has_draft = any(f.type == "draft" for f in spec.features)
     for f in spec.features:
-        if f.type in BOX_ONLY and spec.shape != "box":
-            out.append(f.type)
-        elif f.type in FLAT_TOP and spec.shape not in ("box", "cylinder"):
+        allowed = _FEATURE_SHAPES.get(f.type)
+        if allowed is not None and spec.shape not in allowed:
             out.append(f.type)
         elif f.type == "thread" and getattr(f, "kind", "internal") == "internal" \
-                and spec.shape not in ("box", "cylinder"):
+                and spec.shape not in ("box", "cylinder", "prism"):
             out.append(f.type)
         # an EXTERNAL thread lives on the part's own outer diameter — an M20 thread floating on
         # an ⌀80 axle is unrealizable (and its helical render poisons downstream booleans)
