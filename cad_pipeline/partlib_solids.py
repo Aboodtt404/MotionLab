@@ -123,9 +123,61 @@ def tooth_count(gear_wp, nb: int = 720) -> int:
     return int(np.argmax(spec[1:120]) + 1)
 
 
+# ── motors / drivetrain (§2.4 minimum: instantiate real components, never remodel) ──────────────
+NEMA17 = {"body": 42.3, "length": 48.0, "shaft_d": 5.0, "shaft_len": 24.0, "boss_d": 22.0, "boss_h": 2.0}
+M2207 = {"stator_d": 27.7, "bell_h": 12.0, "base_h": 6.0, "shaft_d": 5.0, "shaft_len": 15.0}   # FPV outrunner
+N20 = {"body_w": 12.0, "body_h": 10.0, "body_l": 15.0, "shaft_d": 3.0, "shaft_len": 10.0}      # micro gearmotor
+
+
+def nema17_motor() -> Tuple[cq.Workplane, Datums]:
+    """NEMA17 stepper body (42.3 mm square × 48 long) + ⌀22 register boss + ⌀5 shaft."""
+    b = NEMA17
+    body = cq.Workplane("XY").box(b["body"], b["body"], b["length"])
+    top = body.faces(">Z").workplane()
+    boss = top.circle(b["boss_d"] / 2).extrude(b["boss_h"])
+    shaft = boss.faces(">Z").workplane().circle(b["shaft_d"] / 2).extrude(b["shaft_len"])
+    dat = {"shaft_axis": {"origin": (0, 0, b["length"] / 2), "axis": (0, 0, 1)},
+           "mount_face": {"origin": (0, 0, b["length"] / 2), "axis": (0, 0, 1)}}
+    return shaft, dat
+
+
+def motor_2207() -> Tuple[cq.Workplane, Datums]:
+    """2207 FPV brushless outrunner: ⌀27.7 stator, base + bell, ⌀5 shaft. Mount = 16/19 M3 cross."""
+    m = M2207
+    base = cq.Workplane("XY").circle(m["stator_d"] / 2).extrude(m["base_h"])
+    bell = base.faces(">Z").workplane().circle(m["stator_d"] / 2).extrude(m["bell_h"])
+    shaft = bell.faces(">Z").workplane().circle(m["shaft_d"] / 2).extrude(m["shaft_len"])
+    dat = {"shaft_axis": {"origin": (0, 0, 0), "axis": (0, 0, 1)}}
+    return shaft, dat
+
+
+def n20_gearmotor() -> Tuple[cq.Workplane, Datums]:
+    """N20 micro gearmotor: 12×10×15 body + ⌀3 output shaft."""
+    n = N20
+    body = cq.Workplane("XY").box(n["body_w"], n["body_h"], n["body_l"])
+    shaft = body.faces(">Z").workplane().circle(n["shaft_d"] / 2).extrude(n["shaft_len"])
+    return shaft, {"shaft_axis": {"origin": (0, 0, n["body_l"] / 2), "axis": (0, 0, 1)}}
+
+
+def gt2_pulley(teeth: int = 20, bore: float = 5.0, width: float = 6.0) -> Tuple[cq.Workplane, Datums]:
+    """GT2 timing pulley (2 mm pitch): pitch ⌀ = teeth·2/π, with two retaining flanges + bore.
+    Teeth are represented as a fine scalloped rim (GT2 is a curvilinear profile, not involute)."""
+    pitch = 2.0
+    pd = teeth * pitch / pi
+    body = cq.Workplane("XY").circle(pd / 2).extrude(width)
+    fl_d = pd + 2.0
+    body = body.faces("<Z").workplane().circle(fl_d / 2).extrude(1.0)          # bottom flange
+    body = body.faces(">Z").workplane().circle(fl_d / 2).extrude(1.0)          # top flange
+    body = body.faces(">Z").workplane().hole(bore)
+    return body, {"axis": {"origin": (0, 0, width / 2), "axis": (0, 0, 1)},
+                  "pitch_radius": {"origin": (pd / 2, 0, 0), "axis": (0, 0, 1)}}
+
+
 SOLID_PARTS = {
     "shcs": shcs, "hex_nut": hex_nut, "washer": washer, "bearing": bearing,
     "dowel_pin": dowel_pin, "involute_gear": involute_gear,
+    "nema17_motor": nema17_motor, "motor_2207": motor_2207, "n20_gearmotor": n20_gearmotor,
+    "gt2_pulley": gt2_pulley,
 }
 
 
@@ -158,6 +210,14 @@ def selftest() -> int:
     add("bearing 608 width", b, bbb.zlen, 7.0, 0.1)
     p, _ = dowel_pin(3, 16); bbp = _bbox(p)
     add("dowel_pin ⌀3 length", p, bbp.zlen, 16.0, 0.1)
+    nm, _ = nema17_motor(); bbnm = _bbox(nm)
+    add("nema17_motor body square", nm, max(bbnm.xlen, bbnm.ylen), 42.3, 0.1)
+    mo, _ = motor_2207(); bbmo = _bbox(mo)
+    add("motor_2207 stator ⌀", mo, max(bbmo.xlen, bbmo.ylen), 27.7, 0.1)
+    nn, _ = n20_gearmotor(); bbnn = _bbox(nn)
+    add("n20 body length", nn, bbnn.zlen, N20["body_l"] + N20["shaft_len"], 0.2)
+    gp, _ = gt2_pulley(20); bbgp = _bbox(gp)
+    add("gt2_pulley flange ⌀", gp, max(bbgp.xlen, bbgp.ylen), 20 * 2.0 / pi + 2.0, 0.2)
 
     bad = [c for c in checks if not c[1]]
     for name, ok, detail in checks:
