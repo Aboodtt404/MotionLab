@@ -13,3 +13,4 @@ pymeshlab>=2023.12         # §6.1 self-intersection (compute_selection_by_self_
 # print §6.3 slicer-oracle uses the SYSTEM binary `prusa-slicer` (apt: prusa-slicer 2.7.2) — not pip.
 #   prusa-slicer --info x.stl        → manifold/parts/volume, exit 0
 #   prusa-slicer --export-gcode ...  → gcode with "estimated printing time"
+fast_simplification>=0.1     # §4.2 LOD quadric decimation (standalone, no OCP dep)

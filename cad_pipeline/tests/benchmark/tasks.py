@@ -162,6 +162,17 @@ def _b06_checks(m):   # 200 seeded scatter instances → 200×12 tris
     return [_row("scatter · instance tris (200×12)", 2400, n, abs(n - 2400) <= 24, "missing_feature")]
 
 
+def _g07_lod_oracle() -> Callable[[], dict]:
+    """G07: LOD chain 6000/1500/400 tris + §4.2 silhouette-IoU acceptance (cad_pipeline.lod)."""
+    def run() -> dict:
+        from cad_pipeline.lod import generate_lods, verify_lod_chain
+        src = trimesh.creation.icosphere(subdivisions=5)
+        budgets = [6000, 1500, 400]
+        rep = verify_lod_chain(src, generate_lods(src, budgets), budgets)
+        return rep.to_dict()
+    return run
+
+
 def _gear_oracle(module: float, teeth: int) -> Callable[[], dict]:
     """P05/A05 gear tasks: involute gear from the library, checked on tip ⌀ = m(z+2) and the polar
     tooth count (FFT) = z (fable_run §8.5 / P05)."""
@@ -322,6 +333,7 @@ _PROMPTS: Dict[str, str] = {
     "B02": "array modifier: 10 columns ⌀0.3×3 spaced 2.0 in X → x-extent 18.3 (bpy)",
     "B05": "boolean-cut a 1×1.2 window through a 4×3×0.2 wall (bpy)",
     "B06": "geometry-nodes scatter: exactly 200 seeded instances on a 10×10 plane (bpy)",
+    "G07": "LOD chain 6000/1500/400 tris, silhouette IoU ≥0.97/0.92 (§4.2)",
     "A01": "4-legged stool: seat ⌀140×16, height 120, legs 90° apart, splayed 10°",
     "A02": "shelf on an L-bracket, flush-mounted, fused single solid",
     "A04": "bolt + nut clamping 2 plates, coaxial holes, grip = Σ thickness",
@@ -351,6 +363,7 @@ _ORACLES: Dict[str, Callable[[], dict]] = {
     "B02": _bpy_oracle("array", {"count": 10, "spacing": 2.0}, _b02_checks),
     "B05": _bpy_oracle("window", {"wall": [4, 0.2, 3], "window": [1, 1.2]}, _b05_checks),
     "B06": _bpy_oracle("scatter", {"count": 200, "seed": 42}, _b06_checks),
+    "G07": _g07_lod_oracle(),                          # LOD chain 6000/1500/400 + silhouette IoU (§4.2)
 }
 
 # extra task-specific assertions on the golden report (Fable's per-task numeric criteria)
