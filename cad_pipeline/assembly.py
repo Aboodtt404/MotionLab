@@ -277,10 +277,10 @@ def _mated_pairs(asm: Assembly) -> set:
             siblings.setdefault(c.parent, []).append(c.name)
     pairs: set = set()
     for m in asm.mates:
-        # corners parts sit ON their reference by design (axles overlap the chassis to weld;
-        # wheels ride adjacent to it) — sanctioned for interference. Welding is decided later:
-        # _rigid_groups skips any sanctioned pair that a JOINT claims (joint wins over weld).
-        if m.kind == "corners" and m.around:
+        # corners/radial parts sit ON their reference by design (axles overlap the chassis to
+        # weld; radial arms weld into their hub rim — same intent) — sanctioned for interference.
+        # Welding is decided later: _rigid_groups skips any sanctioned pair a JOINT claims.
+        if m.kind in ("corners", "radial") and m.around:
             for p in (m.parts or []):
                 pairs.add(frozenset((p, m.around)))
         if m.kind in ("stack", "flush", "attach", "coaxial") and m.a and m.b:

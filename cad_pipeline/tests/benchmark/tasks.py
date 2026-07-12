@@ -22,7 +22,8 @@ import tempfile
 
 import trimesh
 
-from ...assembly import Assembly, Component, Mate, repair_connectivity, solve_layout, verify_assembly
+from ...assembly import (Assembly, Component, Joint, Mate, repair_connectivity, solve_layout,
+                         verify_assembly)
 from ...builder import build
 from ...glb_verify import verify_game, verify_web
 from ...mesh_verify import mesh_report
@@ -263,6 +264,30 @@ def _bolt_stack() -> Assembly:                              # A04
         Mate(kind="stack", a="plate2", b="plate1", overlap=0.1)], fuse=True)
 
 
+def _hinge() -> Assembly:                                   # A03 — revolute hinge, 1 DOF, clean 0–90° sweep
+    post = Component(name="post", role="support", at=(0.0, 0.0, 50.0), part=Spec(
+        object="post", shape="box", envelope={"length": 10, "width": 10, "height": 100}))
+    door = Component(name="door", role="panel", at=(45.3, 0.0, 50.0), part=Spec(
+        object="door", shape="box", envelope={"length": 80, "width": 6, "height": 90}))
+    # door edge 0.3 mm off the post face — hung on the hinge line, not welded to the post
+    return Assembly(object="hinged door", components=[post, door], fuse=True,
+                    joints=[Joint(a="door", b="post", axis="z", at=(5.3, 10.0, 50.0), limits=(0, 90))])
+
+
+def _pcb_standoffs() -> Assembly:                           # A09 — enclosure + 4 parented standoffs + PCB
+    standoffs = [Component(name=f"so{i}", role="support", parent="enc", at=(x, y, 2.0), part=Spec(
+        object="standoff", shape="cylinder", envelope={"diameter": 6, "height": 5}))
+        for i, (x, y) in enumerate([(-35, -25), (35, -25), (-35, 25), (35, 25)])]
+    return Assembly(object="pcb on standoffs", components=[
+        Component(name="enc", role="base", at=(0.0, 0.0, 2.0), part=Spec(
+            object="enclosure floor", shape="box", envelope={"length": 90, "width": 70, "height": 4})),
+        *standoffs,
+        Component(name="pcb", role="panel", part=Spec(
+            object="pcb", shape="box", envelope={"length": 80, "width": 60, "height": 1.6})),
+    ], mates=[Mate(kind="ground", a="enc"),
+              Mate(kind="stack", a="pcb", b="so0", overlap=0.1, offset=(35, 25))])
+
+
 def _shaft_bearings() -> Assembly:                          # A08 — bearings at ±20 (shoulder spacing 40)
     shaft = Component(name="shaft", role="body", part=Spec(
         object="shaft", shape="cylinder", envelope={"diameter": 8, "height": 60}))
@@ -391,6 +416,7 @@ _PROMPTS: Dict[str, str] = {
 # runnable oracles (golden by construction)
 _ORACLES: Dict[str, Callable[[], dict]] = {
     "A01": _asm_oracle(_stool), "A02": _asm_oracle(_shelf_bracket),
+    "A03": _asm_oracle(_hinge), "A09": _asm_oracle(_pcb_standoffs),   # unblocked: kinematic oracle shipped
     "A04": _asm_oracle(_bolt_stack), "A08": _asm_oracle(_shaft_bearings),
     "D01": _spec_oracle(_quad_frame()), "D02": _spec_oracle(_motor_mount()),
     "D04": _spec_oracle(_bottom_plate()),
@@ -431,8 +457,8 @@ _BLOCKED: Dict[str, str] = {
     **{f"P{i:02d}": "product verifier (mesh cavity / DFM — Phase-3)" for i in range(1, 11)},
     "D03": "airfoil propeller (loft) verifier", "D05": "landing-gear layout", "D06": "angled mount plate",
     "D07": "full 13-part quad assembly + prop-clearance sweep", "D08": "ducted fan (duct+struts+hub)",
-    "A03": "revolute hinge pose-sweep task criteria", "A05": "involute gear pair (Phase-4)",
-    "A06": "4-bar linkage Grashof", "A07": "prismatic drawer slide", "A09": "enclosure + PCB standoffs",
+    "A05": "involute gear pair (Phase-4)",
+    "A06": "4-bar linkage Grashof", "A07": "prismatic drawer slide",
     "A10": "3R arm chained joints", "A11": "screw-clamp travel", "A12": "swivel caster",
     "A13": "planetary gear set (Phase-4)",
 }
