@@ -452,11 +452,20 @@ def translate_set(path: str) -> dict:
 def main() -> int:
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 5
     export = "--export" in sys.argv
-    sets = sorted(glob.glob(f"{ROOT}/joint_set_*.json"))[:n * 3]   # headroom for skips
+    # resume-safe: every processed set is logged to a sidecar; reruns skip them (no duplicate keeps)
+    seen_path = OUT.replace(".jsonl", ".processed.txt")
+    try:
+        seen = set(open(seen_path).read().split())
+    except FileNotFoundError:
+        seen = set()
+    sets = [p for p in sorted(glob.glob(f"{ROOT}/joint_set_*.json"))
+            if p.split("/")[-1] not in seen][:n * 3]   # headroom for skips
     done = kept = 0
     for p in sets:
         if done >= n:
             break
+        with open(seen_path, "a") as sf:
+            sf.write(p.split("/")[-1] + "\n")
         try:
             r = translate_set(p)
         except Exception as e:  # noqa: BLE001 — one bad set must not stop the sweep

@@ -53,7 +53,10 @@ def main():
         ds = ds.map(lambda r: {"text": r["code"]})                # raw code, causal LM
     else:
         def fmt(r):
-            msgs = [{"role": "user", "content": r["prompt"]}, {"role": "assistant", "content": r["code"]}]
+            # optional system message (assembly pairs train in the planner's EXACT serving format —
+            # system prompt included; part-level pairs carry no system and are unchanged)
+            msgs = ([{"role": "system", "content": r["system"]}] if r.get("system") else []) + \
+                   [{"role": "user", "content": r["prompt"]}, {"role": "assistant", "content": r["code"]}]
             return {"text": tok.apply_chat_template(msgs, tokenize=False)}
         ds = ds.map(fmt)
 

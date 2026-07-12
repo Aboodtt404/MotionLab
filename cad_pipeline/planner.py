@@ -313,7 +313,10 @@ def _ask_patch(system: str, user: str, base_url: str, model: str, timeout: float
             raw = json.loads(_extract_json(_chat(system, user, base_url, model, timeout, temp,
                                                  AsmPatch.model_json_schema())))
             norm = _normalize({"components": raw.get("upsert", [])})   # tolerate feature-format drift
-            return AsmPatch(upsert=norm["components"], remove=raw.get("remove", []))
+            # pass mates/joints REPLACEMENTS through — they were silently dropped, which stripped the
+            # model's fix for the two DOMINANT repair classes (disconnected + welded-joint are mate edits)
+            return AsmPatch(upsert=norm["components"], remove=raw.get("remove", []),
+                            mates=raw.get("mates"), joints=raw.get("joints"))
         except (json.JSONDecodeError, ValueError, TypeError) as e:
             last = e
     raise ValueError(f"could not produce a valid edit patch: {last}")
