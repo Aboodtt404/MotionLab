@@ -18,6 +18,7 @@ are training data in the same format as part repairs.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from typing import Optional, Protocol
 
@@ -114,7 +115,7 @@ def _resolve(asm: Assembly) -> Assembly:
 class VLLMAsmGenerator:
     """The live generator: planner.plan() for attempt 1, repair patches thereafter."""
     def __init__(self, base_url: str = "http://localhost:8002/v1",
-                 model: str = "qwen3.6-27b", timeout: float = 300.0):
+                 model: str = os.environ.get("PLAN_MODEL", "qwen3.6-27b"), timeout: float = 300.0):
         self.base_url, self.model, self.timeout = base_url, model, timeout
 
     def plan(self, prompt: str) -> Assembly:

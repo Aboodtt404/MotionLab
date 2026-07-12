@@ -11,6 +11,7 @@ hole_pattern / fillet / chamfer / pocket) — so a plan is executable AND checka
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.request
 
@@ -342,7 +343,7 @@ def _default_joint_blend(asm: Assembly) -> None:
 
 
 def plan(prompt: str, base_url: str = "http://localhost:8002/v1",
-         model: str = "qwen3.6-27b", timeout: float = 300.0) -> Assembly:
+         model: str = os.environ.get("PLAN_MODEL", "qwen3.6-27b"), timeout: float = 300.0) -> Assembly:
     """prompt → validated multi-part Assembly (the planner). Two-stage (CAD-HLLM): a high-level parts
     outline commits to a rich part set first, then Stage 2 realizes geometry; one-shot is the fallback."""
     parts = _outline(prompt, base_url, model, timeout)
@@ -363,7 +364,7 @@ def plan(prompt: str, base_url: str = "http://localhost:8002/v1",
 
 
 def edit(asm: Assembly, instruction: str, base_url: str = "http://localhost:8002/v1",
-         model: str = "qwen3.6-27b", timeout: float = 300.0) -> Assembly:
+         model: str = os.environ.get("PLAN_MODEL", "qwen3.6-27b"), timeout: float = 300.0) -> Assembly:
     """current assembly + an edit instruction → modified, re-validated Assembly (the edit-loop).
     Parametric editing is a structured JSON transform — change params/parts, keep the rest."""
     user = f"current assembly:\n{asm.model_dump_json()}\n\nedit: {instruction}"
