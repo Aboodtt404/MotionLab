@@ -87,7 +87,7 @@ def _run_model(spec: Spec, max_attempts: int) -> dict:
     # doc-lookup injects BOX-convention fillet examples that override the fine-tune's rim idioms
     # (measured: rag=on emits edges("|Z") on a cylinder → fails; rag=off emits edges(">Z") → passes).
     # CAD_RAG=1 restores it for the un-tuned base model.
-    gen = VLLMGenerator(model=os.environ.get("CAD_MODEL", "phase22"),
+    gen = VLLMGenerator(model=os.environ.get("CAD_MODEL", "phase23"),
                         rag=os.environ.get("CAD_RAG", "0") == "1")
     feedback = None
     history, best = [], None

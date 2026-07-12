@@ -10,7 +10,7 @@ exec /home/abdelrahman/MotionLab/serve_venv/bin/vllm serve unsloth/Qwen3.6-27B -
   --served-model-name qwen3.6-27b \
   --quantization fp8 \
   --enable-lora --max-lora-rank 32 \
-  --lora-modules phase22=/workspace/.hf_home/training/phase22/final phase21b=/workspace/.hf_home/training/phase21b/final parser3=/workspace/.hf_home/training/nl_spec_parser_v3/final \
+  --lora-modules phase23=/workspace/.hf_home/training/phase23/final phase21b=/workspace/.hf_home/training/phase21b/final parser3=/workspace/.hf_home/training/nl_spec_parser_v3/final \
   --port 8002 \
   --max-model-len 12288 \
   --enforce-eager \
