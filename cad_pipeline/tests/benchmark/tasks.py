@@ -305,6 +305,12 @@ def _bottom_plate() -> Spec:                                # D04 (2 mm plate + 
 
 
 # ─────────────────────────────────────────── C tasks not in bench_specs (eval-only, buildable)
+def _hex_standoff_c04() -> Spec:                            # C04: hex standoff ⌀14 (across corners) ×25, ⌀3.2 bore
+    return Spec(object="C04 hex standoff", shape="prism", sides=6,
+                envelope={"diameter": 14, "height": 25},
+                features=[{"type": "through_hole", "diameter": 3.2}], tolerance=0.1)
+
+
 def _flange_c05() -> Spec:                                  # C05: ⌀90×12, ⌀20 bore, 8×⌀6 on PCD 70
     return Spec(object="C05 bolt-circle flange", shape="cylinder",
                 envelope={"diameter": 90, "height": 12},
@@ -388,6 +394,7 @@ _ORACLES: Dict[str, Callable[[], dict]] = {
     "A04": _asm_oracle(_bolt_stack), "A08": _asm_oracle(_shaft_bearings),
     "D01": _spec_oracle(_quad_frame()), "D02": _spec_oracle(_motor_mount()),
     "D04": _spec_oracle(_bottom_plate()),
+    "C04": _spec_oracle(_hex_standoff_c04()),               # unblocked by the Phase-1 prism shape
     "C05": _spec_oracle(_flange_c05()), "C15": _spec_oracle(_linear_bar_c15()),
     "C16": _spec_oracle(_grid_plate_c16()),
     "M01": _mesh_oracle(_m01_sphere, max_triangles=2000),
@@ -416,7 +423,6 @@ _CRITERIA: Dict[str, Callable[[dict], bool]] = {
 
 # why each not-yet-runnable task is blocked (so the scorecard names the missing capability, not a silent gap)
 _BLOCKED: Dict[str, str] = {
-    "C04": "hex-prism shape (Phase-3 vocab)",
     "C18": "harness re-exec-with-overridden-params", "C20": "STEP AP214 round-trip harness",
     **{f"M{i:02d}": "mesh verifier (Phase-3 §6.1)" for i in range(1, 16)},
     **{f"B{i:02d}": "Blender bpy verifier (Phase-3/5 §6 [BPY])" for i in range(1, 13)},

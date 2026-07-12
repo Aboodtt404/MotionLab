@@ -38,12 +38,26 @@ sys.path.insert(0, ".")
 
 
 def _sig(spec: dict) -> tuple:
-    """Cheap near-duplicate signature: shape + feature-type multiset + envelope dims @5mm."""
+    """Cheap near-duplicate signature: shape + feature-type multiset + envelope dims @5mm + the
+    STRUCTURAL extents of profile/section/path shapes. Without the structural part, a shape that
+    carries no envelope (loft_sections; profile_extrude with a plan) collapses to ONE signature and
+    a single held-out eval spec silently nukes the whole training family."""
     env = spec.get("envelope") or {}
     dims = tuple(sorted((k, round(float(v) / 5.0) * 5) for k, v in env.items()
                         if isinstance(v, (int, float))))
     feats = tuple(sorted(f["type"] for f in spec.get("features", [])))
-    return (spec.get("shape"), feats, dims)
+
+    def _ext(pts):   # rounded bbox of a 2D/3D point list — the structural footprint
+        if not pts:
+            return ()
+        cols = list(zip(*pts))
+        return tuple(round((max(c) - min(c)) / 5.0) * 5 for c in cols)
+
+    struct = (_ext(spec.get("profile") or []), _ext(spec.get("side_profile") or []),
+              _ext(spec.get("path") or []),
+              (len(spec.get("sections") or []),
+               *_ext([(s["x"], s["width"], s["height"]) for s in (spec.get("sections") or [])])))
+    return (spec.get("shape"), feats, dims, struct)
 
 
 def _holdout_sigs() -> set:
@@ -53,9 +67,17 @@ def _holdout_sigs() -> set:
         from training.canary import CANARY   # contamination canaries are held out of ALL training
     except Exception:  # noqa: BLE001
         CANARY = []
+    try:
+        # the new-operator + growth eval suites are eval sets too — filter them like GOLDEN (the
+        # phase22 newops eval predated this and may have had near-dup training samples; the clean
+        # signal there was the 61-spec regression. From phase23 on, ALL suites are holdout-clean.)
+        from training.eval_newops import EVAL_COMBOS, EVAL_NEWOPS
+        extra = [s for _n, s in [*EVAL_NEWOPS, *EVAL_COMBOS]]
+    except Exception:  # noqa: BLE001
+        extra = []
     from cad_pipeline.tests.selftest import GOLDEN
     sigs = set()
-    for s in [*GOLDEN, *EVAL_HARD, *EVAL_BENCH, *CANARY]:
+    for s in [*GOLDEN, *EVAL_HARD, *EVAL_BENCH, *CANARY, *extra]:
         sigs.add(_sig(json.loads(s.model_dump_json())))
     return sigs
 

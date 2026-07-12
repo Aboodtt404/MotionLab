@@ -44,6 +44,13 @@ def _shape_noun(spec: Spec, rng: random.Random) -> str:
         return _pick(rng, "turned body", "revolved part")
     if spec.shape == "loft":
         return "round-to-rectangular adapter" if spec.loft_top_round() else "tapered body"
+    if spec.shape == "profile_extrude":
+        return (_pick(rng, "silhouette body (side outline trimmed by a plan outline)",
+                      "profiled body with a shaped side view and plan cutout")
+                if spec.plan_profile else
+                _pick(rng, "silhouette body (extruded side outline)", "profiled slab"))
+    if spec.shape == "loft_sections":
+        return _pick(rng, "smoothly lofted hull", "multi-station lofted body", "fuselage-like lofted form")
     if spec.shape == "prism":
         poly = {3: "triangular", 4: "square", 5: "pentagonal", 6: "hexagonal",
                 8: "octagonal"}.get(spec.sides, f"{spec.sides}-sided")
@@ -64,6 +71,8 @@ def _dims_phrase(spec: Spec, precise: bool) -> str:
     if spec.shape == "prism":   # regular N-gon bar: circumscribed ⌀ across corners × height
         return f"{n(spec.envelope['diameter'])} mm across, {n(spec.envelope['height'])} mm tall"
     d = spec.envelope_dims()
+    if spec.shape in ("profile_extrude", "loft_sections"):   # hero bodies: bbox extents
+        return f"{n(d['length'])}×{n(d['width'])}×{n(d['height'])} mm overall"
     if spec.shape in ("box", "loft"):
         return f"{n(d['length'])}×{n(d['width'])}×{n(d['height'])} mm"
     return f"{n(d['diameter'])} mm dia × {n(d['height'])} mm"
@@ -115,6 +124,12 @@ def _feat_phrase(f, level: int, rng: random.Random) -> str:
             f"an internal M{f.diameter:g}×{f.pitch:g} tapped bore"
     if t == "mirror":
         return f"mirror-symmetric about {f.plane}"
+    if t == "greeble":
+        where = "the top face" if f.face == "top" else "the lateral (side) surface"
+        if level <= 1:
+            return "a paneled greeble detail pass"
+        return (f"a procedural greeble pass on {where} (~{f.panel:g} mm panels, {f.depth:g} mm recesses, "
+                f"~{round(f.density * 100):g}% detailed with panel-line grooves)")
     return t
 
 
@@ -169,6 +184,17 @@ def describe(spec: Spec, rng: random.Random) -> Dict[str, str]:
         extra = f" The meridian profile is {[[round(r, 1), round(z, 1)] for r, z in spec.profile]} (radius, z)."
     elif spec.shape == "sweep" and spec.path:
         extra = f" Swept along the path {[[round(c, 1) for c in p] for p in spec.path]}."
+    elif spec.shape == "profile_extrude" and spec.side_profile:
+        extra = f" The side (X–Z) outline is {[[round(x, 1), round(z, 1)] for x, z in spec.side_profile]}"
+        if spec.side_arcs and any(spec.side_arcs):
+            extra += f" with per-segment sagitta {list(spec.side_arcs)}"
+        extra += "."
+        if spec.plan_profile:
+            extra += f" The plan (X–Y) outline is {[[round(x, 1), round(y, 1)] for x, y in spec.plan_profile]}."
+    elif spec.shape == "loft_sections" and spec.sections:
+        st = [{k: (round(v, 1) if isinstance(v, (int, float)) else v) for k, v in s.items()}
+              for s in sorted(spec.sections, key=lambda s: s["x"])]
+        extra = f" Lofted smoothly through the stations {st} (x along the length)."
     l3 = (f"Model a {obj}: a {noun} measuring {_dims_phrase(spec, True)}"
           + (f", featuring {feats_l3}." if feats_l3 else ".") + extra)
 

@@ -31,7 +31,7 @@ sys.path.insert(0, ".")
 
 import cadquery as cq  # noqa: E402
 
-from cad_pipeline.builder import build  # noqa: E402
+from cad_pipeline.builder import build, emit_code  # noqa: E402
 from cad_pipeline.captions import describe  # noqa: E402
 from cad_pipeline.emit_idiomatic import emit_idiomatic  # noqa: E402
 from cad_pipeline.corpus import training_sample  # noqa: E402
@@ -151,37 +151,242 @@ FAMILIES = [cyl_rim_fillet, cyl_rim_chamfer, revolve_rim, cyl_shell,
             prism_standoff, prism_boss_fillet, prism_shell, rect_sweep]
 
 
-def _gate(spec: Spec):
-    """Survival filter: no shape conflict, builds+verifies, AND the emitted idiomatic artifact
-    exec+verifies (gate the SHIPPED code). Returns the verifier report dict or None."""
+# ---------------------------------------------------------------- batch6: part-level GROWTH families
+# L3 multi-feature combos on the lifted vocabulary, the cylinder-bolt-circle (half-drill) fix,
+# micro-bevel styling (film-hardware research: break every rim), greeble detail passes (feature-pure —
+# the greeble verifier short-circuits per-feature inventory, so greebled samples carry no other
+# features to keep captions honest), and the HERO shapes (profile_extrude / loft_sections — the
+# structural-richness arc's film bodies, absent from every earlier batch).
+
+def flange_cyl_boltcircle(rng) -> tuple:
+    # THE half-drill fix: bolt circles on a z∈[0,H] cylinder (the model assumed box-centered z)
+    D = round(rng.uniform(50, 110), 1); H = round(rng.uniform(8, 22), 1)
+    n = rng.choice([4, 6, 8]); pcd = round(D * rng.uniform(0.6, 0.8), 1)
+    d = round(rng.uniform(4, 8), 1)
+    feats = [{"type": "through_hole", "diameter": round(rng.uniform(10, D * 0.3), 1)},
+             {"type": "hole_pattern", "pattern": "bolt_circle", "count": n, "pitch_diameter": pcd, "diameter": d}]
+    if rng.random() < 0.4:
+        feats.append({"type": "chamfer", "distance": round(rng.uniform(0.8, 2.0), 1), "edges": "top"})
+    return "bolt-circle flange (cylinder)", Spec(
+        object=rng.choice(["bolt-circle flange", "bearing flange", "pipe flange", "motor flange"]),
+        shape="cylinder", envelope={"diameter": D, "height": H}, features=feats, tolerance=0.1)
+
+
+def combo_shelled_rim_cyl(rng) -> tuple:
+    # hollow cup with a broken rim — shell(top) removes the top rim, so break the BOTTOM
+    D = round(rng.uniform(34, 80), 1); H = round(rng.uniform(24, 60), 1)
+    t = round(rng.uniform(1.8, min(4.0, D / 9)), 1)
+    kind = rng.choice(["fillet", "chamfer"])
+    rim = ({"type": "fillet", "radius": round(rng.uniform(1.0, 2.5), 1), "edges": "bottom"} if kind == "fillet"
+           else {"type": "chamfer", "distance": round(rng.uniform(0.8, 2.0), 1), "edges": "bottom"})
+    return "hollow housing with a finished base rim", Spec(
+        object=rng.choice(["canister housing", "sensor pod shell", "cup housing", "battery sleeve"]),
+        shape="cylinder", envelope={"diameter": D, "height": H},
+        features=[rim, {"type": "shell", "thickness": t, "open_face": "top"}], tolerance=0.1)
+
+
+def combo_prism_l3(rng) -> tuple:
+    sides = rng.choice([4, 6, 8]); D = round(rng.uniform(26, 52), 1); H = round(rng.uniform(14, 34), 1)
+    feats = []
+    if rng.random() < 0.5:
+        feats.append({"type": "fillet", "radius": round(rng.uniform(0.8, min(2.0, D / 14)), 1), "edges": "all_vertical"})
+    else:
+        feats.append({"type": "chamfer", "distance": round(rng.uniform(0.8, 1.8), 1), "edges": "top"})
+    if rng.random() < 0.5:
+        feats.append({"type": "counterbore", "diameter": round(rng.uniform(4, 6), 1),
+                      "cbore_diameter": round(rng.uniform(8, 12), 1), "cbore_depth": round(rng.uniform(2, 4), 1),
+                      "at": [0, 0]})
+    else:
+        pw = round(D * rng.uniform(0.25, 0.4), 1)
+        feats.append({"type": "pocket", "length": pw, "width": pw, "depth": round(rng.uniform(1.5, H * 0.25), 1)})
+        feats.append({"type": "through_hole", "diameter": round(rng.uniform(3.5, 6), 1)})
+    return "multi-feature polygonal mount", Spec(
+        object=rng.choice(["hex mount boss", "octagon fitting", "square coupler block"]),
+        shape="prism", sides=sides, envelope={"diameter": D, "height": H}, features=feats, tolerance=0.1)
+
+
+def combo_revolve_arcs_rim(rng) -> tuple:
+    # turned body with a CURVED meridian (arc flank — barrel/flare) + a broken top rim
+    R0 = round(rng.uniform(12, 26), 1); R1 = round(rng.uniform(7, R0 - 3), 1)
+    h0 = round(rng.uniform(10, 22), 1); h1 = round(rng.uniform(10, 20), 1)
+    profile = [(0, 0), (R0, 0), (R0, h0), (R1, h0 + h1), (0, h0 + h1)]
+    sag = round(-rng.uniform(1.0, 3.0), 1)          # outward bulge on the taper run
+    arcs = [0.0, 0.0, sag, 0.0]
+    kind = rng.choice(["fillet", "chamfer"])
+    rim = ({"type": "fillet", "radius": round(rng.uniform(1.0, min(2.5, R1 / 3)), 1), "edges": "top"} if kind == "fillet"
+           else {"type": "chamfer", "distance": round(rng.uniform(0.8, min(2.0, R1 / 3)), 1), "edges": "top"})
+    return "flared turned body with a finished rim", Spec(
+        object=rng.choice(["flared hub", "barrel spindle", "curved nozzle body", "vase-turned boss"]),
+        shape="revolve", profile=profile, profile_arcs=arcs, features=[rim], tolerance=0.1)
+
+
+def micro_bevel_box(rng) -> tuple:
+    # film-hardware rule: break EVERY edge — verticals filleted, both rims chamfered
+    L = round(rng.uniform(40, 110), 1); W = round(rng.uniform(30, 80), 1); H = round(rng.uniform(12, 40), 1)
+    feats = [{"type": "fillet", "radius": round(rng.uniform(1.5, 4.0), 1), "edges": "all_vertical"},
+             {"type": "chamfer", "distance": round(rng.uniform(0.6, 1.2), 1), "edges": "top"},
+             {"type": "chamfer", "distance": round(rng.uniform(0.6, 1.2), 1), "edges": "bottom"}]
+    if rng.random() < 0.5:
+        feats.append({"type": "through_hole", "diameter": round(rng.uniform(5, 12), 1)})
+    return "micro-beveled housing block (every edge broken)", Spec(
+        object=rng.choice(["equipment housing", "console block", "junction body", "chassis block"]),
+        shape="box", envelope={"length": L, "width": W, "height": H}, features=feats, tolerance=0.1)
+
+
+def micro_bevel_cyl(rng) -> tuple:
+    D = round(rng.uniform(24, 70), 1); H = round(rng.uniform(14, 50), 1)
+    feats = [{"type": "chamfer", "distance": round(rng.uniform(0.7, 1.6), 1), "edges": "top"},
+             {"type": "chamfer", "distance": round(rng.uniform(0.7, 1.6), 1), "edges": "bottom"}]
+    if rng.random() < 0.5:
+        feats.append({"type": "through_hole", "diameter": round(rng.uniform(5, D * 0.3), 1)})
+    return "double-chamfered cylindrical body", Spec(
+        object=rng.choice(["spacer bushing", "drum body", "piston blank", "roller sleeve"]),
+        shape="cylinder", envelope={"diameter": D, "height": H}, features=feats, tolerance=0.1)
+
+
+def _greeble_feat(rng, face="top") -> dict:
+    return {"type": "greeble", "face": face,
+            "panel": round(rng.uniform(12, 26), 1), "depth": round(rng.uniform(1.2, 3.0), 1),
+            "density": round(rng.uniform(0.35, 0.7), 2), "groove": round(rng.uniform(0.8, 1.4), 1),
+            "seed": rng.randint(0, 9999), "levels": rng.choice([1, 2, 2]),
+            "subdiv": round(rng.uniform(0.25, 0.45), 2), "raised": round(rng.uniform(0.15, 0.4), 2),
+            "raise_h": round(rng.uniform(1.0, 2.0), 1), "focal": rng.choice(["center", "edges", "none"]),
+            "bevel": rng.choice([0.0, 0.5, 0.8])}
+
+
+def greeble_box(rng) -> tuple:
+    L = round(rng.uniform(70, 160), 1); W = round(rng.uniform(50, 110), 1); H = round(rng.uniform(6, 16), 1)
+    return "greebled hull/deck panel", Spec(
+        object=rng.choice(["hull panel", "deck plate", "bulkhead panel", "sci-fi wall tile"]),
+        shape="box", envelope={"length": L, "width": W, "height": H},
+        features=[_greeble_feat(rng)], tolerance=0.1)
+
+
+def greeble_cyl(rng) -> tuple:
+    D = round(rng.uniform(45, 100), 1); H = round(rng.uniform(40, 100), 1)
+    return "greebled cylindrical housing (lateral panels)", Spec(
+        object=rng.choice(["engine housing", "thruster drum", "reactor casing", "silo body"]),
+        shape="cylinder", envelope={"diameter": D, "height": H},
+        features=[_greeble_feat(rng, face="side")], tolerance=0.1)
+
+
+def greeble_revolve(rng) -> tuple:
+    R0 = round(rng.uniform(22, 40), 1); R1 = round(rng.uniform(14, R0 - 4), 1)
+    h0 = round(rng.uniform(20, 40), 1); h1 = round(rng.uniform(16, 30), 1)
+    profile = [(0, 0), (R0, 0), (R0, h0), (R1, h0), (R1, h0 + h1), (0, h0 + h1)]
+    return "greebled stepped drum (turned)", Spec(
+        object=rng.choice(["stepped engine drum", "turbine casing", "turret base"]),
+        shape="revolve", profile=profile, features=[_greeble_feat(rng, face="side")], tolerance=0.1)
+
+
+def hero_profile_extrude(rng) -> tuple:
+    """Silhouette bodies: a stepped/chamfered side outline (X–Z), optionally trimmed by a hexagonal-ish
+    plan; arcs on one run for a curved deck. Parametric + always simple/closed by construction."""
+    L = round(rng.uniform(120, 240), 1)
+    h_nose = round(rng.uniform(10, 22), 1); h_mid = round(rng.uniform(28, 52), 1)
+    x_rise = round(L * rng.uniform(0.2, 0.35), 1); x_fall = round(L * rng.uniform(0.65, 0.8), 1)
+    h_tail = round(rng.uniform(12, 26), 1)
+    side = [(0, 0), (L, 0), (L, h_tail), (x_fall, h_mid), (x_rise, h_mid), (0, h_nose)]
+    side_arcs = [0.0] * 6
+    if rng.random() < 0.5:                       # curved canopy run between the two mid stations
+        side_arcs[3] = round(-rng.uniform(2, 6), 1)
+    W = round(rng.uniform(40, 90), 1)
+    if rng.random() < 0.5:                       # plan taper: hexagonal plan narrows nose + tail
+        wn = round(W * rng.uniform(0.35, 0.6), 1)
+        plan = [(0, -wn / 2), (x_rise, -W / 2), (x_fall, -W / 2), (L, -wn / 2),
+                (L, wn / 2), (x_fall, W / 2), (x_rise, W / 2), (0, wn / 2)]
+        spec = Spec(object=rng.choice(["hull silhouette body", "vehicle body blank", "fuselage slab"]),
+                    shape="profile_extrude", side_profile=side, side_arcs=side_arcs,
+                    plan_profile=plan, tolerance=0.1)
+    else:
+        spec = Spec(object=rng.choice(["profiled chassis slab", "silhouette bracket blank", "deck profile body"]),
+                    shape="profile_extrude", side_profile=side, side_arcs=side_arcs,
+                    envelope={"width": W}, tolerance=0.1)
+    return "hero silhouette body (side ∩ plan)", spec
+
+
+def hero_loft_sections(rng) -> tuple:
+    """Fuselage: 3–5 stations along X, small nose → full mid → tapered tail, mixed rect/ellipse."""
+    n = rng.choice([3, 4, 5])
+    L = round(rng.uniform(140, 260), 1)
+    wmax = round(rng.uniform(40, 80), 1); hmax = round(rng.uniform(30, 60), 1)
+    xs = sorted(round(L * k / (n - 1), 1) for k in range(n))
+    # bell-shaped size profile: ends small, middle full
+    def _sz(i):
+        t = abs((i / (n - 1)) - 0.5) * 2          # 0 at mid → 1 at ends
+        s = 1.0 - t * rng.uniform(0.5, 0.7)
+        return s
+    sections = []
+    kind = rng.choice(["ellipse", "rect", "mix"])
+    for i, x in enumerate(xs):
+        s = _sz(i)
+        k = ("ellipse" if kind == "ellipse" else "rect" if kind == "rect"
+             else rng.choice(["ellipse", "rect"]))
+        sections.append({"x": x, "width": round(max(10.0, wmax * s), 1),
+                         "height": round(max(8.0, hmax * s), 1),
+                         "z_center": round(hmax / 2, 1), "kind": k})
+    return "hero lofted fuselage (multi-station)", Spec(
+        object=rng.choice(["fuselage body", "lofted hull", "pod body", "nacelle body"]),
+        shape="loft_sections", sections=sections, tolerance=0.1)
+
+
+def mirror_combo_box(rng) -> tuple:
+    L = round(rng.uniform(60, 110), 1); W = round(rng.uniform(30, 60), 1); H = round(rng.uniform(12, 28), 1)
+    hx = round(L * rng.uniform(0.25, 0.4), 1)
+    return "mirror-symmetric bracket", Spec(
+        object=rng.choice(["symmetric bracket", "twin-boss plate", "mirrored link plate"]),
+        shape="box", envelope={"length": L, "width": W, "height": H},
+        features=[{"type": "through_hole", "diameter": round(rng.uniform(5, 10), 1), "at": [hx, 0]},
+                  {"type": "mirror", "plane": "YZ"}], tolerance=0.1)
+
+
+GROWTH_FAMILIES = [flange_cyl_boltcircle, combo_shelled_rim_cyl, combo_prism_l3, combo_revolve_arcs_rim,
+                   micro_bevel_box, micro_bevel_cyl, greeble_box, greeble_cyl, greeble_revolve,
+                   hero_profile_extrude, hero_loft_sections, mirror_combo_box]
+
+# hero shapes + greeble aren't in emit_idiomatic's vocabulary (greeble is a precomputed layout dump
+# shared verbatim by build/emit/verifier — emit_code IS its canonical form) — their training target is
+# the golden emit_code trace (same double-gate discipline: the SHIPPED string must exec+verify).
+_EMIT_CODE_FAMILIES = {"hero_profile_extrude", "hero_loft_sections",
+                       "greeble_box", "greeble_cyl", "greeble_revolve"}
+
+
+def _gate(spec: Spec, emitter) -> tuple:
+    """Survival filter: no shape conflict, builds+verifies, AND the emitted artifact exec+verifies
+    (gate the SHIPPED code). Returns (verifier report, code) or (None, None)."""
     if feature_shape_conflicts(spec):
-        return None
+        return None, None
     try:
         rep = verify(build(spec), spec)
         if not rep.passed:
-            return None
+            return None, None
+        code = emitter(spec)
         ns = {"cq": cq}
-        exec(emit_idiomatic(spec), ns)  # noqa: S102 — our own emitter
+        exec(code, ns)  # noqa: S102 — our own emitter
         res = ns.get("result")
         wp = res if isinstance(res, cq.Workplane) else cq.Workplane(obj=res)
         if not verify(wp, spec).passed:
-            return None
-        return rep
+            return None, None
+        return rep, code
     except Exception:  # noqa: BLE001
-        return None
+        return None, None
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--per-family", type=int, default=120, help="keep target per family")
     ap.add_argument("--max-attempts", type=int, default=8, help="param resamples per keep before giving up")
+    ap.add_argument("--set", choices=["newops", "growth", "all"], default="newops",
+                    help="newops = the Phase-1 operator batch; growth = batch6 combos/heroes/greeble")
     ap.add_argument("--out", default="corpus_out/batch5_newops.jsonl")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     rng = random.Random(a.seed)
+    fams = {"newops": FAMILIES, "growth": GROWTH_FAMILIES, "all": FAMILIES + GROWTH_FAMILIES}[a.set]
 
     kept, rejects = [], []
-    for fam in FAMILIES:
+    for fam in fams:
+        emitter = emit_code if fam.__name__ in _EMIT_CODE_FAMILIES else emit_idiomatic
         got = 0
         attempts = 0
         seen_sigs = set()
@@ -192,7 +397,7 @@ def main() -> int:
             if sig in seen_sigs:
                 continue
             seen_sigs.add(sig)
-            rep = _gate(spec)
+            rep, code = _gate(spec, emitter)
             if rep is None:
                 rejects.append({"family": fam.__name__, "spec": json.loads(spec.model_dump_json())})
                 continue
@@ -202,13 +407,13 @@ def main() -> int:
                 tags={"capabilities": sorted({spec.shape, *[f.type for f in spec.features]}),
                       "level": _level(spec)},
                 prompts=prompts,
-                code=emit_idiomatic(spec),
+                code=code,
                 spec=spec,
                 report=rep.to_dict(),
             )
             kept.append(json.loads(sample.model_dump_json()))
             got += 1
-        print(f"  {fam.__name__:20s} kept {got}/{attempts} attempts", flush=True)
+        print(f"  {fam.__name__:24s} kept {got}/{attempts} attempts", flush=True)
 
     import os
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
