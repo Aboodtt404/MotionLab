@@ -1,0 +1,333 @@
+/* MotionLab Studio — global theme, transcribed from the Claude-Design handoff prototype
+ * (Main Section.dc.html helmet block). The design system is: near-black instrument panel,
+ * one azure accent reserved for verified/active states, notched (clip-path) primary buttons,
+ * Spline Sans Mono for numbers/labels, Ufficio Sans (user-supplied) for headings + body with
+ * IBM Plex Sans as fallback. */
+
+/* self-hosted fonts (public/fonts) — no external requests, no system-mono fallback */
+@font-face {
+  font-family: 'Ufficio';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/Ufficio-400.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'Ufficio';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/Ufficio-500.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'Ufficio';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/Ufficio-600.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'Ufficio';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/Ufficio-700.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/IBMPlexSans-400.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/IBMPlexSans-500.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/IBMPlexSans-600.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/IBMPlexSans-700.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Spline Sans Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/SplineSansMono-400.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Spline Sans Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/SplineSansMono-500.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Spline Sans Mono';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/SplineSansMono-600.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Spline Sans Mono';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/SplineSansMono-700.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Orbitron';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/Orbitron-600.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Orbitron';
+  font-style: normal;
+  font-weight: 800;
+  font-display: swap;
+  src: url('/fonts/Orbitron-800.woff2') format('woff2');
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; background: #0d0d0d; }
+#root { height: 100%; }
+a { color: var(--accent, #4d9eff); text-decoration: none; }
+a:hover { color: var(--accent-2, #74b6ff); }
+
+#mlk {
+  /* motion tokens — micro / standard / overlay; enter = strong ease-out, move = ease-in-out.
+   * Rules: UI < 300ms, animate transform+opacity only, no animation on high-frequency paths. */
+  --dur-1: 120ms;
+  --dur-2: 200ms;
+  --dur-3: 300ms;
+  --ease-out: cubic-bezier(.23, 1, .32, 1);
+  --ease-io: cubic-bezier(.77, 0, .175, 1);
+  --accent: #4d9eff;
+  --accent-rgb: 77, 158, 255;
+  --accent-2: #74b6ff;
+  --nc: 7px;
+  --notch: polygon(0 0, calc(100% - var(--nc, 7px)) 0, 100% var(--nc, 7px), 100% 100%, var(--nc, 7px) 100%, 0 calc(100% - var(--nc, 7px)));
+  --on-accent: #06111c;
+  --olive: #1d3d63;
+  --verified: #37d67a;
+  --verified-rgb: 55, 214, 122;
+  --fail: #e5645f;
+  --fail-rgb: 229, 100, 95;
+  --warn: #e0a63a;
+  --warn-rgb: 224, 166, 58;
+  --bg: #0d0d0d;
+  --sidebar: #090909;
+  --panel: #17171a;
+  --panel-2: #1e1e22;
+  --inset: #111113;
+  --border: rgba(255, 255, 255, .08);
+  --border-2: rgba(255, 255, 255, .17);
+  --text: #f4f4f5;
+  --text-2: #9a9aa0;
+  --text-3: #5f5f66;
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Ufficio', 'IBM Plex Sans', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+#mlk ::-webkit-scrollbar { width: 11px; height: 11px; }
+#mlk ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .13); }
+#mlk ::-webkit-scrollbar-track { background: transparent; }
+#mlk textarea, #mlk input { font-family: 'Ufficio', 'IBM Plex Sans', sans-serif; }
+#mlk textarea::placeholder, #mlk input::placeholder { color: #55555c; }
+#mlk textarea { outline: none; resize: none; }
+#mlk input { outline: none; }
+
+@keyframes mlk-spin { to { transform: rotate(360deg); } }
+@keyframes mlk-rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+@keyframes mlk-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes mlk-backdrop { from { opacity: 0; } to { opacity: 1; } }
+@keyframes mlk-pop { from { opacity: 0; transform: translateY(14px) scale(.985); } to { opacity: 1; transform: none; } }
+@keyframes mlk-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+@keyframes mlk-cutin { from { clip-path: polygon(0 0, 0 0, 0 calc(100% - 16px), 0 100%, 0 100%); } }
+@keyframes mlk-flyout { from { opacity: 0; transform: translateX(-12px); } }
+@keyframes mlk-stagger { from { opacity: 0; transform: translateY(14px); } }
+@keyframes mlk-scan { from { left: -45%; } to { left: 105%; } }
+@keyframes mlk-scanv { from { top: -3%; } to { top: 103%; } }
+@keyframes mlk-poweron { to { opacity: 0; } }
+@keyframes mlk-drawcheck { to { stroke-dashoffset: 0; } }
+@keyframes mlk-ring { 0% { box-shadow: 0 0 0 0 rgba(55, 214, 122, .5); } 100% { box-shadow: 0 0 0 30px rgba(55, 214, 122, 0); } }
+@keyframes mlk-stamp { 0% { opacity: 0; transform: scale(1.9); } 55% { opacity: 1; transform: scale(.9); } 100% { opacity: 1; transform: scale(1); } }
+/* generation theater: multi-view renders fly in from the four screen corners */
+@keyframes mlk-flyin-0 { from { opacity: 0; transform: translate(-70vw, -30vh) scale(.6) rotate(-6deg); } }
+@keyframes mlk-flyin-1 { from { opacity: 0; transform: translate(70vw, -30vh) scale(.6) rotate(5deg); } }
+@keyframes mlk-flyin-2 { from { opacity: 0; transform: translate(-70vw, 40vh) scale(.6) rotate(4deg); } }
+@keyframes mlk-flyin-3 { from { opacity: 0; transform: translate(70vw, 40vh) scale(.6) rotate(-5deg); } }
+
+/* exits — applied via [data-closing] while the element unmount is deferred (useExit in motion.ts) */
+@keyframes mlk-pop-out { to { opacity: 0; transform: translateY(8px) scale(.985); } }
+@keyframes mlk-fade-out { to { opacity: 0; } }
+@keyframes mlk-flyout-out { to { opacity: 0; transform: translateX(-10px); } }
+#mlk [data-closing] { animation: mlk-pop-out var(--dur-1) var(--ease-out) both !important; pointer-events: none; }
+#mlk [data-closing][data-exit="fade"] { animation-name: mlk-fade-out !important; }
+#mlk [data-closing][data-exit="flyout"] { animation-name: mlk-flyout-out !important; }
+#mlk [data-closing] * { pointer-events: none; }
+
+/* skeleton loading lines (content-shaped placeholders; pair with a mlk-scan shimmer overlay) */
+#mlk .sk { position: relative; overflow: hidden; background: rgba(255, 255, 255, .055); border-radius: 4px; }
+#mlk .sk::after {
+  content: ''; position: absolute; top: 0; bottom: 0; width: 45%; left: -45%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .05), transparent);
+  animation: mlk-scan 1.4s linear infinite;
+}
+
+/* tracing border — STATUS indicator for the actively-generating element ONLY, never decoration */
+@property --mlk-angle { syntax: '<angle>'; initial-value: 0deg; inherits: false; }
+@keyframes mlk-trace { to { --mlk-angle: 360deg; } }
+#mlk .mlk-tracing { position: relative; }
+#mlk .mlk-tracing::before {
+  content: ''; position: absolute; inset: -1px; padding: 1px; border-radius: inherit;
+  background: conic-gradient(from var(--mlk-angle),
+    transparent 0deg, transparent 250deg,
+    rgba(var(--accent-rgb), .9) 305deg, rgba(var(--accent-rgb), .25) 340deg, transparent 360deg);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+  animation: mlk-trace 2.4s linear infinite; pointer-events: none;
+}
+/* inside-edge variant for overflow:hidden containers (the ring at inset:-1px would be clipped) */
+#mlk .mlk-tracing.mlk-tracing-in::before { inset: 0; }
+
+/* buttons never fall back to the UA default (white-ish) face — inline styles still win */
+#mlk button { background: none; transition: background-color .16s, color .16s, border-color .16s, filter .16s, transform var(--dur-1) var(--ease-out); }
+#mlk [data-press]:active { transform: translateY(1px) scale(.985); }
+
+/* inactive segmented buttons + other bare controls: give every interactive element a hover */
+#mlk [data-seg] { transition: color .15s, background-color .15s, border-color .15s; }
+@media (hover: hover) and (pointer: fine) {
+  #mlk [data-seg]:not([data-on]):hover { color: var(--text) !important; background: rgba(255, 255, 255, .05); }
+}
+
+/* static grain — kills banding on the near-black panels; imperceptible texture, no animation */
+#mlk::after {
+  content: ''; position: fixed; inset: 0; z-index: 90; pointer-events: none; opacity: .022;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* thin underline, sized to the label text only (wrap label in [data-ulw]) */
+#mlk [data-ulw] { position: relative; display: inline-block; }
+#mlk [data-ulw]::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
+  background: currentColor; transform: scaleX(0); transform-origin: left center;
+  transition: transform .26s cubic-bezier(.4, 0, .2, 1); pointer-events: none;
+}
+#mlk button:hover [data-ulw]::after, #mlk [data-press]:hover [data-ulw]::after { transform: scaleX(1); }
+
+/* white-contrast hover (settings, help, profile) — a faint translucent pill hugging the
+   content instead of the old solid white fill. isolation:isolate keeps the z:-1 pseudo inside
+   the button's own stacking context (else it would sink behind the sidebar background). */
+#mlk [data-whitehover] { position: relative; isolation: isolate; transition: color .16s; }
+#mlk [data-whitehover]::before {
+  content: ''; position: absolute; inset: 3px 5px; border-radius: 6px; z-index: -1;
+  background: rgba(255, 255, 255, .07); opacity: 0; transition: opacity .16s; pointer-events: none;
+}
+#mlk [data-whitehover]:hover::before { opacity: 1; }
+#mlk [data-whitehover]:hover, #mlk [data-whitehover]:hover * { color: #fff !important; }
+
+/* click / focus accent border (inputs, dropdowns) */
+#mlk [data-focusaccent]:hover, #mlk [data-focusaccent]:focus, #mlk [data-focusaccent]:focus-within { border-color: var(--accent, #4d9eff) !important; }
+
+/* accent fill hover (sidebar logo, nav items, My Project, report a bug) */
+#mlk [data-accentfill] { position: relative; isolation: isolate; transition: color .16s; }
+#mlk [data-accentfill]::before {
+  content: ''; position: absolute; inset: 3px 5px; border-radius: 6px; z-index: -1;
+  background: rgba(var(--accent-rgb), .13); opacity: 0; transition: opacity .16s; pointer-events: none;
+}
+#mlk [data-accentfill]:hover::before { opacity: 1; }
+#mlk [data-accentfill]:hover, #mlk [data-accentfill]:hover * { color: var(--accent-2, #74b6ff) !important; }
+
+/* active nav item — the pill stays lit (the "already clicked" state, same translucent wrap) */
+#mlk [data-navactive]::before { opacity: 1; background: rgba(var(--accent-rgb), .16); }
+#mlk [data-navactive], #mlk [data-navactive] * { color: var(--accent-2, #74b6ff) !important; }
+
+/* selected segment (TRACK / TYPE / render mode / units / picker rows): translucent accent
+   instead of a solid block — overrides the per-component solid inline styles */
+#mlk [data-seg][data-on] { background: rgba(var(--accent-rgb), .15) !important; color: var(--accent-2, #74b6ff) !important; }
+#mlk [data-seg][data-on] * { color: var(--accent-2, #74b6ff) !important; }
+
+/* accent text + border hover (suggested chips, upload / references cards) */
+#mlk [data-accenthover] { transition: color .15s, border-color .15s; }
+#mlk [data-accenthover]:hover { border-color: var(--accent, #4d9eff) !important; }
+#mlk [data-accenthover]:hover, #mlk [data-accenthover]:hover * { color: var(--accent, #4d9eff) !important; }
+
+/* icon buttons (panel close, part actions) */
+#mlk [data-iconbtn] { transition: color .15s, background .15s; }
+#mlk [data-iconbtn]:hover { color: #fff !important; background: rgba(255, 255, 255, .09); }
+
+#mlk [data-dash-grid] > section { animation: mlk-stagger .3s var(--ease-out) both; }
+#mlk [data-dash-grid] > section:nth-child(2) { animation-delay: .06s; }
+#mlk [data-dash-grid] > section:nth-child(3) { animation-delay: .12s; }
+
+/* staggered card/row mounts: 40ms per item, capped at the 10th (rest appear together) */
+#mlk [data-cardstagger] > * { animation: mlk-stagger .3s var(--ease-out) both; }
+#mlk [data-cardstagger] > *:nth-child(2) { animation-delay: 40ms; }
+#mlk [data-cardstagger] > *:nth-child(3) { animation-delay: 80ms; }
+#mlk [data-cardstagger] > *:nth-child(4) { animation-delay: 120ms; }
+#mlk [data-cardstagger] > *:nth-child(5) { animation-delay: 160ms; }
+#mlk [data-cardstagger] > *:nth-child(6) { animation-delay: 200ms; }
+#mlk [data-cardstagger] > *:nth-child(7) { animation-delay: 240ms; }
+#mlk [data-cardstagger] > *:nth-child(8) { animation-delay: 280ms; }
+#mlk [data-cardstagger] > *:nth-child(9) { animation-delay: 320ms; }
+#mlk [data-cardstagger] > *:nth-child(n+10) { animation-delay: 360ms; }
+
+/* neutral primary (accent reserved for verified) */
+#mlk [data-primary] { background: #ededed !important; color: #0d0d0d !important; }
+#mlk [data-primary]:hover { background: #fff !important; }
+#mlk [data-primary] * { color: #0d0d0d !important; }
+#mlk [data-pill] { transition: border-color .15s, background .15s; }
+
+/* disabled "coming soon" buttons (edit-screen IMAGE / MESH) */
+#mlk [data-soon] { position: relative; opacity: .5; cursor: not-allowed; transition: opacity .15s; }
+#mlk [data-soon] .soon-hover { display: none; white-space: nowrap; font-size: 11.5px; }
+#mlk [data-soon]:hover { opacity: .85; }
+#mlk [data-soon]:hover .soon-normal { display: none !important; }
+#mlk [data-soon]:hover .soon-hover { display: inline; }
+
+/* ---- promoted style-hover cases (the prototype's per-element style-hover attribute) ---- */
+#mlk .hv-white:hover { color: #fff !important; }
+#mlk .hv-white-b2:hover { color: #fff !important; border-color: var(--border-2) !important; }
+#mlk .hv-accentborder:hover { border-color: var(--accent, #4d9eff) !important; }
+#mlk .hv-row:hover { background: var(--panel-2); border-color: var(--border) !important; }
+#mlk .hv-card:hover { border-color: var(--accent, #4d9eff) !important; background: rgba(255, 255, 255, .02); }
+#mlk .hv-cardborder:hover { border-color: var(--accent, #4d9eff) !important; }
+#mlk .hv-panel2:hover { background: var(--panel-2); color: #fff !important; }
+#mlk .hv-back:hover { background: #1e1e21 !important; }
+#mlk .hv-accent2:hover { background: var(--accent-2, #74b6ff) !important; }
+#mlk .hv-closeacc:hover { color: #fff !important; border-color: var(--accent, #4d9eff) !important; }
+
+/* login slogan halves — hidden with the vignettes on small screens (the card needs the room) */
+@media (max-width: 1100px) { #mlk .mlk-slogan { display: none; } }
+
+/* screen crossfade (View Transitions API — App wraps route swaps; no-op where unsupported) */
+::view-transition-old(root) { animation: mlk-fade-out 160ms cubic-bezier(.23, 1, .32, 1) both; }
+::view-transition-new(root) { animation: mlk-fade 200ms cubic-bezier(.23, 1, .32, 1) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  #mlk *, #mlk *::before, #mlk *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+  ::view-transition-old(root), ::view-transition-new(root) { animation: none !important; }
+}

@@ -27,13 +27,16 @@ from .assembly import (Assembly, AsmPatch, apply_patch, repair_connectivity,
 from .corpus import (Attempt, CheckRow, FailureReport, Outcome, RepairTranscript,
                      VerifierReport, _hid)
 from .schemas import normalize_failure_category
-from .planner import _ask_patch, _default_joint_blend, plan as _plan
+from .planner import (_ask_patch, _default_joint_blend, _patch_schema_scoped,
+                      plan as _plan)
 
 # ---------------------------------------------------------------------------- generator protocol
 class AsmGenerator(Protocol):
-    """Plans an assembly from a prompt, and repairs one from typed verifier feedback."""
+    """Plans an assembly from a prompt, and repairs one from typed verifier feedback.
+    `route` (optional) is the targeted-repair route dict from _route_for — a generator that
+    honors it scopes the patch grammar to that failure class."""
     def plan(self, prompt: str) -> Assembly: ...
-    def repair(self, asm: Assembly, feedback: str) -> AsmPatch: ...
+    def repair(self, asm: Assembly, feedback: str, route: Optional[dict] = None) -> AsmPatch: ...
 
 
 _REPAIR_SYSTEM = (
@@ -73,31 +76,121 @@ _CATEGORY_FIX = {
 }
 
 
-def _asm_feedback(rep: dict) -> str:
+# ------------------------------------------------------------------- targeted repair routes
+# ArtiCAD routing (placement research §3, 3-0 verified): classify each verifier failure to a
+# PATCH TYPE and scope the repair to it — rollback O(K^N) → O(N·K). Each route says which
+# AsmPatch fields exist at all (enforced in the guided-json grammar, not just prose), whether
+# the primary field must carry content, and whether upsert/remove are pinned BY NAME to the
+# failing parts. Flat repair (full grammar) remains the fallback when a route makes no progress.
+_ROUTES: dict[str, dict] = {
+    "component": {"fields": {"upsert"}, "must": "upsert", "scope_names": True,
+                  "note": "COMPONENT-GEOMETRY. Only `upsert` replacements for the named failing "
+                          "parts are accepted — fix THEIR features/dims. Mates, joints and every "
+                          "other part are locked."},
+    "validity":  {"fields": {"upsert", "mates"}, "must": None, "scope_names": False,
+                  "note": "GEOMETRY/WELD. Fix exactly-tangent faces via part dims (`upsert`) or "
+                          "make mated parts overlap cleanly 1–4 mm (`mates` = FULL replacement "
+                          "list). Removal and joints are locked."},
+    "disconnected": {"fields": {"mates"}, "must": "mates", "scope_names": False,
+                     "note": "MATE-ADD. Output ONLY a replacement `mates` list in which EVERY "
+                             "component has a mate path to the main body (stack/flush/attach/"
+                             "radial/port). Geometry edits are locked — connectivity is never "
+                             "fixed by resizing parts or nudging coordinates."},
+    "kinematic": {"fields": {"upsert", "remove", "mates", "joints"}, "must": None, "scope_names": False,
+                  "note": "JOINT SUBSYSTEM. Whichever applies: remove the mate that welds the "
+                          "moving side (`mates`), add bridging geometry — stub axle/pin/hub — "
+                          "(`upsert`), reduce `limits` or fix sides (`joints`)."},
+    "fit":       {"fields": {"upsert"}, "must": "upsert", "scope_names": True,
+                  "note": "RUNNING FIT. Only the joint's pin/bore parts may change: size the pin "
+                          "⌀ = bore ⌀ − 0.2 mm (running band 0.1–0.8 mm diametral); derive one "
+                          "from the other, never set both independently."},
+    "integrity": {"fields": {"upsert", "remove", "mates"}, "must": None, "scope_names": True,
+                  "note": "MATE-PARAM. Prefer fixing the RELATIONSHIP that derives the colliding "
+                          "pair's positions (`mates` = full list: bigger radial radius, proper "
+                          "mate kind, real offset). Shrink one of the named parts (`upsert`) or "
+                          "remove a redundant decorative one (`remove`) only when the mate is "
+                          "already right. Other parts are locked."},
+    "structure": {"fields": {"upsert", "mates"}, "must": None, "scope_names": False,
+                  "note": "SUPPORT. Widen the footprint / reach the floor via mate params "
+                          "(radius, z, fraction) and fix dangling mate references (every a/b/"
+                          "around/parts entry must be an EXISTING component name). Raise a sunk "
+                          "part via its mate, not raw coordinates."},
+    "cutout":    {"fields": {"upsert", "mates"}, "must": None, "scope_names": True,
+                  "note": "CARVE. The tool's placement mates and the cutout must AGREE: place "
+                          "the tool overlapping/abutting the target, adjust clearance, or resize "
+                          "tool/target (`upsert`) if the carve severed the target."},
+    "blend":     {"fields": {"fillet_joints"}, "must": "fillet_joints", "scope_names": False,
+                  "note": "BLEND-PARAM. Only `fillet_joints` may change — reduce it (0 disables "
+                          "the seam blend)."},
+}
+# worst-first priority: local part validity → connectivity → kinematics → interference →
+# support → cosmetics. Fixing upstream classes routinely clears downstream rows (support and
+# statics are already gated on connectivity), so one class per attempt converges.
+_ROUTE_ORDER = ("component", "validity", "disconnected", "kinematic", "fit",
+                "integrity", "cutout", "structure", "blend")
+
+
+def _failed_cats(rep: dict) -> set:
+    cats = {r["category"] for r in rep.get("rows", []) if not r["within_tol"]}
+    if any(not c["passed"] for c in rep.get("components", [])):
+        cats.add("component")
+    return cats
+
+
+def _route_for(rep: dict) -> Optional[dict]:
+    """Verifier report → the targeted route for its worst failure class (None ⇒ flat repair)."""
+    cats = _failed_cats(rep)
+    for cat in _ROUTE_ORDER:
+        if cat not in cats:
+            continue
+        route = {"category": cat, **_ROUTES[cat]}
+        if route.pop("scope_names"):
+            names = {c["name"] for c in rep.get("components", []) if not c["passed"]}
+            for r in rep.get("rows", []):
+                if not r["within_tol"] and r["category"] == cat:
+                    names |= set(r.get("parts", []))
+            route["parts"] = sorted(names) or None
+        else:
+            route["parts"] = None
+        return route
+    return None
+
+
+def _asm_feedback(rep: dict, focus: Optional[str] = None) -> str:
     """Verifier report → typed, delta-only feedback (kind + magnitude, never target values),
-    each failure paired with its catalog repair prescription."""
+    each failure paired with its catalog repair prescription. With `focus` (a routed category),
+    that class's rows lead and the rest are listed as LOCKED — one failure class per patch."""
     parts: list[str] = []
+    deferred: list[str] = []
     for c in rep.get("components", []):
         if not c["passed"]:
-            parts.append(f"part '{c['name']}' FAILED locally: {', '.join(c['fails'])} — "
-                         f"{_CATEGORY_FIX['component']}")
+            if focus in (None, "component"):
+                parts.append(f"part '{c['name']}' FAILED locally: {', '.join(c['fails'])} — "
+                             f"{_CATEGORY_FIX['component']}")
+            else:
+                deferred.append(f"part '{c['name']}' fails locally")
     for r in rep["rows"]:
         if r["within_tol"] or r["category"] == "component":
             continue
         line = f"{r['name']}: measured {r['measured']} vs expected {r['expected']}"
+        if focus is not None and r["category"] != focus:
+            deferred.append(line)
+            continue
         fix = _CATEGORY_FIX.get(r["category"])
         if fix:
             line += f" — FIX: {fix}"
         parts.append(line)
+    if deferred:
+        parts.append("ALSO failing but LOCKED for this patch (fix the above first — these are "
+                     "often downstream of it and get their own pass next):\n  " +
+                     "\n  ".join(deferred))
     return "\n".join(parts)
 
 
 def _category(rep: dict) -> str:
     """Route the attempt by its worst failure class (priority mirrors the part loop)."""
-    cats = {r["category"] for r in rep["rows"] if not r["within_tol"]}
-    if any(not c["passed"] for c in rep.get("components", [])):
-        cats.add("component")
-    for c in ("component", "validity", "disconnected", "kinematic", "fit", "integrity", "structure", "blend"):
+    cats = _failed_cats(rep)
+    for c in _ROUTE_ORDER:
         if c in cats:
             return c + "-fix"
     return "ok"
@@ -121,10 +214,17 @@ class VLLMAsmGenerator:
     def plan(self, prompt: str) -> Assembly:
         return _plan(prompt, base_url=self.base_url, model=self.model, timeout=self.timeout)
 
-    def repair(self, asm: Assembly, feedback: str) -> AsmPatch:
+    def repair(self, asm: Assembly, feedback: str, route: Optional[dict] = None) -> AsmPatch:
+        system, schema = _REPAIR_SYSTEM, None
+        if route:
+            # targeted repair: the grammar itself is scoped to the routed patch type — an
+            # out-of-scope edit is unrepresentable, not merely discouraged
+            system = (_REPAIR_SYSTEM + "\n\nTHIS PATCH IS ROUTED — one failure class only. "
+                      + route["note"])
+            schema = _patch_schema_scoped(route["fields"], route["must"], route.get("parts"))
         user = (f"current assembly:\n{asm.model_dump_json()}\n\n"
                 f"VERIFIER FAILURES (fix exactly these, minimally):\n{feedback}")
-        return _ask_patch(_REPAIR_SYSTEM, user, self.base_url, self.model, self.timeout)
+        return _ask_patch(system, user, self.base_url, self.model, self.timeout, schema=schema)
 
 
 def run_assembly(prompt: str, generator: AsmGenerator, max_attempts: int = 3) -> dict:
@@ -136,12 +236,21 @@ def run_assembly(prompt: str, generator: AsmGenerator, max_attempts: int = 3) ->
     asm: Optional[Assembly] = None
     rep: dict = {}
     feedback = ""
+    route: Optional[dict] = None
+    prev_route_cat: Optional[str] = None
+    prev_cat_fails = -1
+    from . import progress
     for attempt in range(1, max_attempts + 1):
         try:
             if asm is None:            # first attempt — or the previous plan() itself failed:
+                progress.publish(stage=f"planning · attempt {attempt} — writing the assembly spec", attempt=attempt)
                 asm = generator.plan(prompt)   # re-plan; there is nothing to patch yet
             else:
-                asm = _resolve(apply_patch(asm, generator.repair(asm, feedback)))
+                scope = f" [{route['category']}]" if route else ""
+                progress.publish(stage=f"repairing · attempt {attempt} — patching the failing checks{scope}", attempt=attempt)
+                asm = _resolve(apply_patch(asm, generator.repair(asm, feedback, route)))
+            progress.publish(assembly=json.loads(asm.model_dump_json()),
+                             stage=f"verifying · attempt {attempt} — kinematics + interference")
             rep = verify_assembly(asm)
             status = "ok"
         except Exception as e:  # noqa: BLE001 — a plan/patch that won't produce an assembly
@@ -153,17 +262,38 @@ def run_assembly(prompt: str, generator: AsmGenerator, max_attempts: int = 3) ->
         regressed = best_pass >= 0 and npass < best_pass
         if npass > best_pass:
             best_pass, best_report = npass, rep
-        history.append({"attempt": attempt, "status": status, "category": cat, "regressed": regressed})
-        attempt_log.append({"attempt": attempt,
-                            "assembly": json.loads(asm.model_dump_json()) if asm else None,
-                            "report": rep})
         if rep.get("passed"):
+            history.append({"attempt": attempt, "status": status, "category": cat, "regressed": regressed})
+            attempt_log.append({"attempt": attempt,
+                                "assembly": json.loads(asm.model_dump_json()) if asm else None,
+                                "report": rep})
             return {"passed": True, "attempt": attempt, "report": rep, "best_report": rep,
                     "history": history, "attempt_log": attempt_log}
-        feedback = _asm_feedback(rep) if status == "ok" else rep.get("error", "planning failed")
+        # targeted route for the NEXT patch — with a no-progress fallback: if the last patch was
+        # routed to this same class and its failing-row count didn't drop, the scoped grammar is
+        # too tight for the real fix → escalate to the flat (full) patch grammar.
+        route = _route_for(rep) if status == "ok" else None
+        if route:
+            cat_fails = sum(1 for r in rep.get("rows", [])
+                            if not r["within_tol"] and r["category"] == route["category"])
+            if route["category"] == "component":
+                cat_fails += sum(1 for c in rep.get("components", []) if not c["passed"])
+            if route["category"] == prev_route_cat and cat_fails >= prev_cat_fails >= 0:
+                route = None
+            else:
+                prev_route_cat, prev_cat_fails = route["category"], cat_fails
+        if route is None:
+            prev_route_cat, prev_cat_fails = None, -1
+        feedback = (_asm_feedback(rep, route["category"] if route else None)
+                    if status == "ok" else rep.get("error", "planning failed"))
         if regressed:
             feedback = ("A PREVIOUS attempt passed more checks — your patch broke working parts. "
                         "Make the MINIMUM change that fixes only the rows below.\n") + feedback
+        history.append({"attempt": attempt, "status": status, "category": cat, "regressed": regressed,
+                        "route": route["category"] if route else "flat"})
+        attempt_log.append({"attempt": attempt,
+                            "assembly": json.loads(asm.model_dump_json()) if asm else None,
+                            "report": rep, "feedback_next": feedback})
     return {"passed": False, "attempts": max_attempts, "category": "escalate", "report": rep,
             "best_report": best_report, "history": history, "attempt_log": attempt_log,
             "last_feedback": feedback}
@@ -201,7 +331,10 @@ def asm_transcript(prompt: str, run_out: dict, generator: dict) -> RepairTranscr
         vr = _asm_verifier_report(rep, brief_ref) if rep.get("rows") is not None else None
         if first_valid is None and rep.get("solids", 0) > 0:
             first_valid = a["attempt"]
-        fb = None if ok else _asm_feedback(rep) if rep.get("rows") else rep.get("error", "")
+        # prefer the RECORDED feedback (routed/scoped as the model actually saw it); recompute
+        # flat only for pre-routing logs that lack it
+        fb = None if ok else (a.get("feedback_next")
+                              or (_asm_feedback(rep) if rep.get("rows") else rep.get("error", "")))
         failure = None
         if not ok:
             failure = FailureReport(

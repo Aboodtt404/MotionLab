@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.request
 
 from .assembly import Assembly, AsmPatch, apply_patch, repair_connectivity, solve_layout
@@ -29,7 +30,10 @@ _SYSTEM = (
     "Do NOT set coordinates — describe HOW PARTS CONNECT with `mates` (named relationships); a deterministic "
     "solver computes positions. Mate kinds:\n"
     "  ground {kind:'ground', a:'part'} — the part rests on the floor (z=0).\n"
-    "  stack {kind:'stack', a:'upper', b:'lower', overlap:3} — a sits on top of b (a 1–4 mm overlap fuses them).\n"
+    "  stack {kind:'stack', a:'upper', b:'lower', overlap:3} — a sits on top of b (a 1–4 mm overlap fuses them). "
+    "Add fraction:0..1 to fix a PARTWAY UP b (or up b's whole post/leg group) instead of on top: a's center "
+    "lands at that share of the support's height — a rack's middle shelf = {kind:'stack', a:'mid_shelf', "
+    "b:'post0', fraction:0.5}; a low shelf ≈ 0.15. Omit fraction for the normal on-top stack.\n"
     "  radial {kind:'radial', parts:['leg1','leg2','leg3','leg4'], around:'seat', count:4, radius:55, splay_deg:10} — "
     "the parts arranged evenly AROUND the vertical axis of `around` IN A CIRCLE (stool/table legs, spokes, drone "
     "arms, landing gear); splay_deg leans each one outward; radial legs auto-touch the floor.\n"
@@ -42,7 +46,17 @@ _SYSTEM = (
     "for upright parts (posts, legs). Corner parts auto-touch the floor.\n"
     "  coaxial {kind:'coaxial', a, b, axis:'z'} — a shares b's axis (a hub/boss/disc centered on another); "
     "axis:'x'|'y' for a HORIZONTAL shared axis (wheel on a sideways axle).\n"
-    "  flush {kind:'flush', a, b, side:'+x'|'-x'|'+y'|'-y'|'+z'|'-z', overlap:3} — a butted against that face of b.\n"
+    "  flush {kind:'flush', a, b, side:'+x'|'-x'|'+y'|'-y'|'+z'|'-z', overlap:3} — a butted against that face of b. "
+    "On lateral sides (±x/±y) add fraction:0..1 to ALSO fix a's HEIGHT: a's center at that share of b's height — "
+    "a camera pod on the front edge, raised 60% up = {kind:'flush', a:'cam_pod', b:'plate', side:'+x', fraction:0.6}. "
+    "Without fraction a lateral flush keeps a's current z — set it whenever the part must sit at a specific height.\n"
+    "  port {kind:'port', a, b, a_port, b_port, overlap:2} — the PRECISION mate: pick one of six named "
+    "attachment faces on EACH part (top|bottom|front|back|left|right; front=+x, left=+y) and a's face-center "
+    "lands exactly on b's, pinning a on ALL THREE axes. THE way to hang a below b: a_port:'top', b_port:'bottom' "
+    "— a cable tray under a desktop = {kind:'port', a:'cable_tray', a_port:'top', b:'desktop', b_port:'bottom', "
+    "offset:[-500,0]} (offset shifts across a top/bottom face); a side pod at 60% height = a_port:'back', "
+    "b_port:'front', fraction:0.6. Prefer port over flush whenever the part must sit at a POSITION, not just "
+    "against a face.\n"
     "  mirror {kind:'mirror', a, b, plane:'YZ'|'XZ'|'XY'} — a is the mirror image of b (left/right pairs).\n"
     "  attach {kind:'attach', a, b} — generic: a snaps to the nearest face of b (use only when none of the above fit).\n"
     "  cutout {kind:'cutout', a:'front_left_wheel', b:'body_shell', clearance:40} — CARVE a's volume (grown by "
@@ -64,6 +78,15 @@ _SYSTEM = (
     "mates: [radial(parts=[leg1..4], around='seat', count=4, radius=55, splay_deg=10), stack(a='seat', b='leg1', overlap=4)].\n"
     "  • shelf bracket (L) → vertical(role 'support', box) + horizontal(role 'top', box); mates: [ground(vertical), "
     "flush(a='horizontal', b='vertical', side='+z')].\n"
+    "  • two-tier rack → post0..post3(role 'leg', box 16×16×180) + top_shelf + mid_shelf(role 'top', box 200×120×10). "
+    "mates: [corners(parts=[post0..3], around='top_shelf', dx=(200−16)/2−5, dy=(120−16)/2−5 — posts INSET inside "
+    "the shelf footprint), stack(a='top_shelf', b='post0', overlap=3), stack(a='mid_shelf', b='post0', fraction=0.5)] "
+    "— fraction fixes the middle shelf halfway up the posts; every extra tier is one more stack+fraction.\n"
+    "  • desk with under-mounted parts (the SUSPEND pattern — copy for anything hung BELOW a surface: trays, "
+    "under-shelves, hooks) → top(role 'top') + leg1..4(role 'leg') + cable_tray; mates: [corners(parts=[leg1..4], "
+    "around='top', dx=740, dy=290), stack(a='top', b='leg1', overlap=3), port(a='cable_tray', a_port='top', "
+    "b='top', b_port='bottom', overlap=2, offset=[0,-250])] — the tray's TOP face pins to the desktop's BOTTOM "
+    "face; never leave suspended parts to raw coordinates.\n"
     "  • quadcopter frame → body(role 'body', cylinder) + arm1..4(role 'arm', loft tapering to the motor end); "
     "mates: [radial(parts=[arm1..4], around='body', count=4, radius=70)].\n"
     "  • car / wheeled rover (the RIDE-HEIGHT pattern — copy this structure) → chassis(role 'base', box "
@@ -190,17 +213,66 @@ _EDIT_SYSTEM = (
 
 
 def _asm_schema() -> dict:
-    """Assembly schema with pattern-geometry fields REQUIRED-present (nullable). Guided decoding
+    """Assembly schema with the hardened $defs (see _harden_defs)."""
+    s = Assembly.model_json_schema()
+    # joints/mates are droppable optionals at the TOP level — require them present (empty list legal)
+    s["required"] = sorted(set(s.get("required", [])) | {"components", "mates", "joints"})
+    return _harden_defs(s)
+
+
+def _patch_schema() -> dict:
+    """AsmPatch schema with the SAME hardened $defs — repair/edit patches carry Mates and Specs
+    too, and an unhardened patch grammar quietly reintroduces every failure class the plan grammar
+    forbids (live: a coaxial mate carrying the full field soup arrived via a repair patch)."""
+    return _harden_defs(AsmPatch.model_json_schema())
+
+
+def _patch_schema_scoped(fields: set, must: str | None = None,
+                         part_names: list | None = None) -> dict:
+    """Targeted-repair patch grammar (ArtiCAD routing, placement research §3): the verifier's
+    failure class decides WHICH patch fields exist at all. A disconnected assembly gets a
+    mates-only grammar; a broken part gets an upsert-only grammar whose component `name` is an
+    ENUM of the failing parts — an out-of-scope edit (the flat-repair 'patch broke working parts'
+    regression) is unrepresentable at token level, same principle as the port enum."""
+    s = _patch_schema()
+    props = s["properties"]
+    dead = {"upsert": {"type": "array", "maxItems": 0},
+            "remove": {"type": "array", "maxItems": 0},
+            "mates": {"type": "null"}, "joints": {"type": "null"},
+            "fillet_joints": {"type": "null"}}
+    for f, off in dead.items():
+        if f not in fields:
+            props[f] = off
+    if part_names:
+        # scope-by-name: upsert replaces BY NAME, so an enum on `name` pins the patch to the
+        # failing parts; `remove` gets the same fence (deleting a healthy part is never the fix)
+        if "upsert" in fields:
+            s["$defs"]["Component"]["properties"]["name"] = {"enum": sorted(part_names)}
+        if "remove" in fields:
+            props["remove"] = {"type": "array", "items": {"enum": sorted(part_names)}}
+    if must:
+        # the route's primary field must carry real content, not the null/empty escape —
+        # an empty patch re-verifies the identical assembly (a wasted attempt)
+        if must in ("mates", "joints"):
+            props[must] = next(v for v in props[must]["anyOf"] if v.get("type") == "array")
+            props[must]["minItems"] = 1
+        elif must == "upsert":
+            props[must] = {**props[must], "minItems": 1}
+        elif must == "fillet_joints":
+            props[must] = {"type": "number"}
+    # guided decoding drops non-required keys entirely (corpus zero-yield lesson): require every
+    # allowed field so the model emits null/[] where inapplicable, never silently omits the fix
+    s["required"] = sorted(fields)
+    return s
+
+
+def _harden_defs(s: dict) -> dict:
+    """Shared $defs hardening. Guided decoding
     omits optional keys entirely (the corpus engine's zero-yield lesson), which starved
     hole_pattern of spacing/pitch_diameter → parts that verify-fail on hole count. Requiring the
     keys lets the model emit null where inapplicable but never silently drop the load-bearing one.
     Same treatment for Mate: corners needs dx/dy/axis, radial needs radius — droppable optionals
     would quietly degrade a corner layout to defaults."""
-    s = Assembly.model_json_schema()
-    # joints/mates are droppable optionals at the TOP level too — run-12 live: the model emitted a
-    # full car with 4 jointed wheels' worth of mates and ZERO joints (the engine omitted the key).
-    # Require them present; an empty list stays legal for genuinely static assemblies.
-    s["required"] = sorted(set(s.get("required", [])) | {"components", "mates", "joints"})
     hp = s.get("$defs", {}).get("HolePattern")
     if hp:
         hp["required"] = sorted(set(hp.get("required", [])) | {"pattern", "count", "spacing",
@@ -218,11 +290,14 @@ def _asm_schema() -> dict:
         # floor-resting parts (wheels/legs) half underground.
         kind_fields = {
             "ground": (["a"], []),
-            "stack": (["a", "b", "overlap", "offset"], []),
-            "coaxial": (["a", "b", "axis"], []),
+            # fraction stays OPTIONAL (same hazard as z: required-but-null gets emitted as 0,
+            # which reads "at the very bottom" and buries a classic top-stack underground)
+            "stack": (["a", "b", "overlap", "offset"], ["fraction"]),
+            "coaxial": (["a", "b", "axis"], ["offset"]),   # offset = axis-perpendicular shift (posts on a base)
             "radial": (["parts", "around", "count", "radius", "splay_deg"], ["z"]),
             "corners": (["parts", "around", "dx", "dy", "axis"], ["z"]),
-            "flush": (["a", "b", "side", "overlap"], []),
+            "flush": (["a", "b", "side", "overlap"], ["fraction"]),   # lateral flush: optional height share
+            "port": (["a", "b", "a_port", "b_port", "overlap"], ["fraction", "offset"]),
             "mirror": (["a", "b", "plane"], []),
             "attach": (["a", "b", "overlap"], []),
             "cutout": (["a", "b", "clearance"], []),
@@ -233,24 +308,180 @@ def _asm_schema() -> dict:
              "required": ["kind", *req],
              "additionalProperties": False}
             for k, (req, opt) in kind_fields.items()]}
+    # Spec is polymorphic on `shape` the same way Mate is on `kind` — and got the same live failure
+    # (a revolve with profile:null crashed the seat build; 3 repair rounds burned on it). Same cure:
+    # a DISCRIMINATED UNION per shape, each variant REQUIRING its geometry so shape-without-its-
+    # geometry is impossible AT GENERATION TIME, not caught 8 minutes later by the verifier.
+    sp = s.get("$defs", {}).get("Spec")
+    if sp:
+        props = sp["properties"]
+        base_req = list(sp.get("required", []))
+
+        def _arr(field: str, min_items: int) -> dict:
+            # strip the null branch and demand real content
+            arr = next(v for v in props[field]["anyOf"] if v.get("type") == "array")
+            return {**arr, "minItems": min_items}
+
+        def _env(req_keys: list) -> dict:
+            return {"type": "object",
+                    "properties": {k: {"type": "number"} for k in req_keys},
+                    "required": req_keys,
+                    "additionalProperties": {"type": "number"}}
+
+        # per-shape required geometry (the 6 shapes the planner offers; prism/loft_sections are
+        # part-lane vocabulary the assembly prompts never ask for)
+        shape_geo: dict = {
+            "box": {"envelope": _env(["length", "width", "height"])},
+            "cylinder": {"envelope": _env(["diameter", "height"])},
+            "loft": {"envelope": _env(["length", "width", "height"])},
+            "revolve": {"profile": _arr("profile", 3)},
+            "sweep": {"path": _arr("path", 2)},
+            "profile_extrude": {"side_profile": _arr("side_profile", 3), "envelope": _env(["width"])},
+        }
+        s["$defs"]["Spec"] = {"anyOf": [
+            {"type": "object",
+             "properties": {**props, "shape": {"const": k}, **geo},
+             "required": sorted(set(base_req) | set(geo))}
+            for k, geo in shape_geo.items()]}
     return s
+
+
+def _resolve(node: dict, defs: dict) -> dict:
+    """Follow a local $ref one hop (the only form _asm_schema/_patch_schema produce)."""
+    ref = node.get("$ref")
+    if ref and ref.startswith("#/$defs/"):
+        return defs.get(ref.split("/")[-1], {})
+    return node
+
+
+def _pick_variant(value: dict, schema: dict, defs: dict) -> dict | None:
+    """Which anyOf branch does this value belong to? Chosen by the branch's `const` discriminators
+    (Mate.kind / Spec.shape) — the same thing the decoder keys off."""
+    best = None
+    for v in schema.get("anyOf", []):
+        v = _resolve(v, defs)
+        props = v.get("properties", {})
+        consts = {k: p["const"] for k, p in props.items() if isinstance(p, dict) and "const" in p}
+        if consts and all(value.get(k) == c for k, c in consts.items()):
+            return v
+        if not consts and best is None and v.get("type") == "object":
+            best = v
+    return best
+
+
+def _empty_for(node: dict, defs: dict):
+    """A schema-legal placeholder for a REQUIRED key the value doesn't carry (the scoped patch
+    grammar requires every in-route field present, null where inapplicable)."""
+    node = _resolve(node, defs)
+    branches = [_resolve(b, defs) for b in node.get("anyOf", [])] or [node]
+    types = {b.get("type") for b in branches}
+    if "null" in types:
+        return None
+    if "array" in types:
+        return []
+    if "object" in types:
+        return {}
+    return None
+
+
+def conform_to_grammar(value, schema: dict, defs: dict | None = None):
+    """Reshape a JSON value into the EXACT form the guided-decoding grammar accepts.
+
+    Three things the decoder enforces that a plain pydantic dump violates (all measured
+    2026-08-02, whole-corpus audit):
+      1. `additionalProperties: false` on each discriminated-union variant — pydantic's non-None
+         DEFAULTS (Mate.clearance=5.0, parts=[], splay_deg=0.0) survive exclude_none and are
+         forbidden keys. 1,217/1,217 port targets failed on this alone.
+      2. xgrammar enforces the schema's DECLARED PROPERTY ORDER; pydantic emits field-declaration
+         order. 736/1,217 stayed unproducible after (1) was fixed, purely on key order.
+      3. `required` keys must be PRESENT (null where inapplicable) — the scoped patch grammar
+         requires every in-route field, but exclude_none strips them.
+    A target that skips this is a string the decoder masks to zero probability: the model is
+    trained to emit something it can never produce. Same family as the gate-on-artifact lesson —
+    gate on what SHIPS, not on what the builder happens to hold in memory.
+    """
+    defs = schema.get("$defs", defs or {})
+    node = _resolve(schema, defs)
+    if isinstance(value, dict):
+        if "anyOf" in node:
+            node = _pick_variant(value, node, defs) or {}
+        props = node.get("properties")
+        if not props:
+            return value
+        out = {}
+        for key, sub in props.items():          # SCHEMA order, not pydantic order
+            if key in value:
+                out[key] = conform_to_grammar(value[key], sub, defs)
+            elif key in node.get("required", []):
+                out[key] = _empty_for(sub, defs)
+        if node.get("additionalProperties") is not False:
+            for key, v in value.items():        # variant permits extras (Spec) — keep them last
+                if key not in out:
+                    out[key] = v
+        return out
+    if isinstance(value, list):
+        item = node.get("items", {})
+        return [conform_to_grammar(v, item, defs) for v in value]
+    if isinstance(value, float):
+        # NEGATIVE ZERO is schema-legal JSON but xgrammar rejects the leading '-' on a field
+        # declared minimum:0 (measured: 4/300 port targets died on "fraction":-0.0 alone).
+        return value + 0.0 if value else abs(value)
+    return value
+
+
+def dump_for_grammar(obj, schema: dict) -> str:
+    """Model/dict -> compact JSON string the decoder can actually emit. Use for EVERY training
+    target; pair it with a jsonschema assert in the builder (gate on the shipped artifact)."""
+    data = json.loads(obj.model_dump_json(exclude_none=True)) if hasattr(obj, "model_dump_json") else obj
+    return json.dumps(conform_to_grammar(data, schema), separators=(",", ":"))
 
 
 def _chat(system: str, user: str, base_url: str, model: str, timeout: float, temperature: float,
           schema: dict | None = None) -> str:
     # Structured output: vLLM constrains generation to the JSON schema (Assembly by default, or the
     # outline schema for stage 1) — guaranteed parseable (no truncation / reasoning-prefix failures).
-    payload = json.dumps({
+    from . import progress
+    body = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "temperature": temperature, "max_tokens": 6000,
         "response_format": {"type": "json_schema",
                             "json_schema": {"name": "out", "schema": schema or _asm_schema()}},
-    }).encode()
-    req = urllib.request.Request(base_url + "/chat/completions", data=payload,
+    }
+    if not progress.active():        # evals/training: the original non-streaming request, unchanged
+        req = urllib.request.Request(base_url + "/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())["choices"][0]["message"]["content"]
+    # Generation theater: stream the tokens (SSE) and publish the growing spec text so the user
+    # watches the assembly spec being written in real time. Same guided decoding, same final text.
+    body["stream"] = True
+    req = urllib.request.Request(base_url + "/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
+    chunks: list[str] = []
+    last_pub = 0.0
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())["choices"][0]["message"]["content"]
+        for raw in r:
+            line = raw.decode("utf-8", "ignore").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                delta = json.loads(data)["choices"][0].get("delta", {}).get("content") or ""
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+            if delta:
+                chunks.append(delta)
+                now = time.monotonic()
+                if now - last_pub > 0.25:
+                    progress.publish(spec_stream="".join(chunks))
+                    last_pub = now
+    text = "".join(chunks)
+    if text:
+        progress.publish(spec_stream=text)
+    return text
 
 
 def _ask(system: str, user: str, base_url: str, model: str, timeout: float) -> Assembly:
@@ -306,18 +537,21 @@ def _outline(prompt: str, base_url: str, model: str, timeout: float) -> list:
     return []
 
 
-def _ask_patch(system: str, user: str, base_url: str, model: str, timeout: float) -> AsmPatch:
-    """Call the model for an edit PATCH (small delta), validated → AsmPatch; retry with temperature."""
+def _ask_patch(system: str, user: str, base_url: str, model: str, timeout: float,
+               schema: dict | None = None) -> AsmPatch:
+    """Call the model for an edit PATCH (small delta), validated → AsmPatch; retry with temperature.
+    `schema` narrows the patch grammar (targeted repair routes pass _patch_schema_scoped)."""
     last = None
     for temp in (0.0, 0.4, 0.7):
         try:
             raw = json.loads(_extract_json(_chat(system, user, base_url, model, timeout, temp,
-                                                 AsmPatch.model_json_schema())))
+                                                 schema or _patch_schema())))
             norm = _normalize({"components": raw.get("upsert", [])})   # tolerate feature-format drift
             # pass mates/joints REPLACEMENTS through — they were silently dropped, which stripped the
             # model's fix for the two DOMINANT repair classes (disconnected + welded-joint are mate edits)
             return AsmPatch(upsert=norm["components"], remove=raw.get("remove", []),
-                            mates=raw.get("mates"), joints=raw.get("joints"))
+                            mates=raw.get("mates"), joints=raw.get("joints"),
+                            fillet_joints=raw.get("fillet_joints"))
         except (json.JSONDecodeError, ValueError, TypeError) as e:
             last = e
     raise ValueError(f"could not produce a valid edit patch: {last}")

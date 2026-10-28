@@ -67,9 +67,13 @@ def validate_glb(path: str, profile: str = "render", face_budget: int = 1_200_00
         row("M3", "outward normals (signed volume)", "> 0", round(float(g.volume), 3),
             float(g.volume) > 0, "error")
 
-    # M4 winding consistency across islands
+    # M4 winding consistency across islands. On an OPEN mesh (raw marching-cubes topology,
+    # remesh=False — our documented default) trimesh can't establish a coherent orientation to
+    # judge against, so inconsistency is a visual-quality warn there; it is a hard error on
+    # closed meshes (lit-inverted islands) and always for print.
+    m4_sev = "error" if (g.is_watertight or profile == "print") else "warn"
     row("M4", "winding consistent", True, bool(g.is_winding_consistent),
-        bool(g.is_winding_consistent), "error")
+        bool(g.is_winding_consistent), m4_sev)
 
     # M6 degenerate faces
     degenerate = int((g.area_faces < 1e-8).sum())

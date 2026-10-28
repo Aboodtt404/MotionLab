@@ -21,6 +21,7 @@ import base64
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -151,6 +152,76 @@ def _run_job(jid: str, kind: str, body: dict):
                  result={"glb_b64": glb_b64, "report": report, "biome": biome,
                          "seconds": round(time.time() - _jobs[jid]["started"])})
             return
+        if kind == "repair":                             # printability gate + repair loop (Slice 2; CPU, no GPU lock)
+            _set(jid, stage="repairing")
+            with tempfile.TemporaryDirectory() as d:
+                gin = os.path.join(d, "in.glb")
+                open(gin, "wb").write(base64.b64decode(body["glb_b64"]))
+                from .repair_glb import repair_glb
+                rep = repair_glb(gin, body.get("profile", "print"), os.path.join(d, "out.glb"))
+                glb_b64 = base64.b64encode(open(rep["out_path"], "rb").read()).decode()
+            _set(jid, status="done", stage="done",
+                 result={"glb_b64": glb_b64, "passed": rep["passed"], "passes": rep["passes"],
+                         "actions": rep["actions"], "surface_rebuilt": rep["surface_rebuilt"],
+                         "before": rep["before"], "after": rep["after"],
+                         "seconds": round(time.time() - _jobs[jid]["started"])})
+            return
+        if kind == "rig":                                # Auto-rig: mesh GLB → game-ready rigged GLB (SkinTokens venv)
+            from .rig import inspect_rig, rig_glb        # subprocess into its own py3.11 venv — see rig.py
+            _set(jid, stage="rigging")
+            with _gpu, gpu_lock():                       # SkinTokens inference needs ~14 GB
+                with tempfile.TemporaryDirectory() as d:
+                    gin, gout = os.path.join(d, "in.glb"), os.path.join(d, "out.glb")
+                    open(gin, "wb").write(base64.b64decode(body["glb_b64"]))
+                    rig_glb(gin, gout)
+                    _set(jid, stage="verifying rig")
+                    rep = inspect_rig(gout)
+                    glb_b64 = base64.b64encode(open(gout, "rb").read()).decode()
+            _set(jid, status="done", stage="done",
+                 result={"glb_b64": glb_b64, "rig_report": rep, "passed": rep["passed"],
+                         "seconds": round(time.time() - _jobs[jid]["started"])})
+            return
+        if kind == "animate_clip":                       # rigged GLB + (motion prompt | ref MP4) → GLB with an animation clip
+            from . import animate_clip as anim           # Puppeteer video-guided optimizer — see animate_clip.py
+            workdir = tempfile.mkdtemp(prefix="animclip_")
+            try:
+                gin = os.path.join(workdir, "in.glb")
+                open(gin, "wb").write(base64.b64decode(body["glb_b64"]))
+                _set(jid, stage="building rig proxy")
+                meta = anim.prepare_inputs(gin, workdir, "clip")   # raises if the GLB has no skeleton
+                seq_dir = os.path.join(workdir, "inputs", "clip")
+                guide = os.path.join(workdir, "guide.mp4")
+                if body.get("mp4_b64"):                  # reference-video path
+                    src = os.path.join(workdir, "ref.mp4")
+                    open(src, "wb").write(base64.b64decode(body["mp4_b64"]))
+                    _set(jid, stage="preparing your video")
+                    anim.normalize_guidance(src, guide)
+                elif body.get("prompt"):                 # text path: render first frame → LTX i2v motion video
+                    _set(jid, stage="rendering first frame")
+                    with _gpu, gpu_lock():
+                        front = anim.render_first_frame(os.path.join(workdir, "inputs"), "clip")
+                    _set(jid, stage="generating motion video")   # sidecar takes the GPU lock itself
+                    anim.text_to_guidance(body["prompt"], front, guide)
+                else:
+                    raise RuntimeError("need a motion prompt or a reference mp4")
+                with _gpu, gpu_lock():                   # flow + the long optimization stage
+                    _set(jid, stage="extracting frames")
+                    nframes = anim.extract_and_flow(workdir, "clip", guide,
+                                                    on_stage=lambda s: _set(jid, stage=s))
+                    iters = int(body.get("iters", 150))
+                    _set(jid, stage=f"optimizing motion ({nframes} frames, {iters} iters — slow)")
+                    motion_dir = anim.optimize(workdir, "clip", iters=iters)
+                _set(jid, stage="embedding clip")
+                gout = os.path.join(workdir, "out.glb")
+                report = anim.embed_clip(gin, motion_dir, seq_dir, gout)
+                report.update(proxy_verts=meta["n_verts"], full_verts=meta["n_verts_full"], iters=iters)
+                glb_b64 = base64.b64encode(open(gout, "rb").read()).decode()
+                _set(jid, status="done", stage="done",
+                     result={"glb_b64": glb_b64, "anim_report": report, "passed": True,
+                             "seconds": round(time.time() - _jobs[jid]["started"])})
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
+            return
         if kind == "lowpoly":                            # Low-Poly / Remesh: decimate a GLB to a face budget (CPU, no GPU)
             _set(jid, stage="decimating")
             with tempfile.TemporaryDirectory() as d:
@@ -250,7 +321,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200 if ok else 404, {"ok": ok, "cancelling": jid})
         kind = {"/image2mesh": "image2mesh", "/text2mesh": "text2mesh",
                 "/render": "render", "/animate": "animate", "/lowpoly": "lowpoly",
-                "/terrain": "terrain"}.get(route)
+                "/terrain": "terrain", "/repair": "repair", "/rig": "rig",
+                "/animate_clip": "animate_clip"}.get(route)
         if kind is None:
             return self._json(404, {"error": "not found"})
         try:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 import math
 import sys
 
@@ -449,6 +450,32 @@ def translate_set(path: str) -> dict:
             "assembly": asm.model_dump()}
 
 
+def _iso_worker(path: str, q) -> None:
+    """Subprocess wrapper for translate_set — OCCT booleans can hang FOREVER in C++ (live: 1.5h at
+    100% CPU on one profile_extrude fit; SIGALRM can't interrupt native code), so each set runs in
+    its own killable process."""
+    try:
+        q.put(translate_set(path))
+    except Exception as e:  # noqa: BLE001
+        q.put({"set": path.split("/")[-1], "skip": f"worker {type(e).__name__}: {str(e)[:120]}"})
+
+
+def translate_set_timeout(path: str, timeout_s: float = 180.0) -> dict:
+    import multiprocessing as mp
+    q = mp.Queue()
+    proc = mp.Process(target=_iso_worker, args=(path, q), daemon=True)
+    proc.start()
+    proc.join(timeout_s)
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+        return {"set": path.split("/")[-1], "skip": f"TIMEOUT >{int(timeout_s)}s (OCCT hang)"}
+    try:
+        return q.get_nowait()
+    except Exception:  # noqa: BLE001 — worker died without a result
+        return {"set": path.split("/")[-1], "skip": "worker died (no result)"}
+
+
 def main() -> int:
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 5
     export = "--export" in sys.argv
@@ -459,21 +486,32 @@ def main() -> int:
     except FileNotFoundError:
         seen = set()
     sets = [p for p in sorted(glob.glob(f"{ROOT}/joint_set_*.json"))
-            if p.split("/")[-1] not in seen][:n * 3]   # headroom for skips
+            if p.split("/")[-1] not in seen]
+    # FILTER_SETS=<file of set names> restricts the sweep to a pre-qualified subset — used to fit
+    # ONLY the AutoMate-filtered clean-port keeps (filter_fusion_joints.py) instead of burning
+    # OCCT time on sets whose joint we already know is an authoring artifact.
+    _flt = os.environ.get("FILTER_SETS")
+    if _flt:
+        want = set(open(_flt).read().split())
+        sets = [p for p in sets if p.split("/")[-1] in want]
+    sets = sets[:n * 3]   # headroom for skips
     done = kept = 0
-    for p in sets:
-        if done >= n:
-            break
-        with open(seen_path, "a") as sf:
-            sf.write(p.split("/")[-1] + "\n")
-        try:
-            r = translate_set(p)
-        except Exception as e:  # noqa: BLE001 — one bad set must not stop the sweep
-            print(f"{p.split('/')[-1]}: ERROR {type(e).__name__}: {e}")
-            continue
+    # PARALLEL sweep: K isolated worker processes (each set already runs in its own killable
+    # subprocess for the OCCT-hang timeout — this just runs K of them at once; the box has 24
+    # cores and the single-worker sweep left 22 idle). Results are consumed in COMPLETION order;
+    # the sidecar is still written at spawn time, so resume semantics are unchanged.
+    import multiprocessing as mp
+    import time as _time
+    K = max(1, int(os.environ.get("SWEEP_WORKERS", "10")))
+    TIMEOUT = 180.0
+    pending = list(sets)
+    active: list = []          # (proc, queue, path, t0)
+
+    def _handle(r: dict) -> None:
+        nonlocal done, kept
         if "skip" in r:
-            print(f"{r['set']}: SKIP {r['skip']}")
-            continue
+            print(f"{r['set']}: SKIP {r['skip']}", flush=True)
+            return
         done += 1
         keep = r["passed_fragment"] and min(r["fit_iou"]) >= 0.8
         kept += keep
@@ -482,6 +520,31 @@ def main() -> int:
         if export and keep:
             with open(OUT, "a") as f:
                 f.write(json.dumps(r) + "\n")
+
+    while (pending or active) and not (done >= n and not active):
+        while pending and len(active) < K and done < n:
+            p = pending.pop(0)
+            with open(seen_path, "a") as sf:
+                sf.write(p.split("/")[-1] + "\n")
+            q = mp.Queue()
+            proc = mp.Process(target=_iso_worker, args=(p, q), daemon=True)
+            proc.start()
+            active.append((proc, q, p, _time.monotonic()))
+        still: list = []
+        for proc, q, p, t0 in active:
+            if not proc.is_alive():
+                try:
+                    _handle(q.get_nowait())
+                except Exception:  # noqa: BLE001 — worker died without a result
+                    print(f"{p.split('/')[-1]}: SKIP worker died (no result)", flush=True)
+                proc.join()
+            elif _time.monotonic() - t0 > TIMEOUT:
+                proc.kill(); proc.join()
+                print(f"{p.split('/')[-1]}: SKIP TIMEOUT >{int(TIMEOUT)}s (OCCT hang)", flush=True)
+            else:
+                still.append((proc, q, p, t0))
+        active = still
+        _time.sleep(0.15)
     print(f"\nkeep-rate: {kept}/{done} ({100 * kept / max(done, 1):.0f}%) — "
           f"verifier-passing (statics waived for fragments) with both fit IoU >= 0.8")
     return 0

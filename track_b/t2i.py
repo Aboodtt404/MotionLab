@@ -49,9 +49,20 @@ def _pipeline():
     if _pipe is None:
         import torch
         from diffusers import FluxPipeline
-        _pipe = FluxPipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
-        _pipe = _pipe.to("cuda")           # fully resident — no offload hooks (fast + avoids cross-pipeline CUDA churn)
-        _pipe.set_progress_bar_config(disable=True)
+        # Build in a LOCAL and publish to the global only after the full .to("cuda") succeeds.
+        # Publishing first poisoned the cache once (2026-07-19): an OOM mid-move left a HALF-moved
+        # pipeline cached — every retry then hit "index on cuda:0, tensors on cpu" in the text
+        # encoder until the server was restarted. On failure the local dies; next call reloads.
+        pipe = FluxPipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
+        try:
+            pipe = pipe.to("cuda")         # fully resident — no offload hooks (fast + avoids cross-pipeline CUDA churn)
+        except Exception:
+            import gc
+            del pipe                       # free the partial CUDA allocs so the retry has room
+            gc.collect(); torch.cuda.empty_cache()
+            raise
+        pipe.set_progress_bar_config(disable=True)
+        _pipe = pipe
     return _pipe
 
 

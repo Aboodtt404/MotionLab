@@ -48,9 +48,10 @@ def main():
 
     ds = load_dataset("json", data_files=a.data, split="train")
 
-    def fmt(r):   # SFT instruct format (train_sft.py): user(NL) → assistant(code); prompt is templated
-        prompt = tok.apply_chat_template([{"role": "user", "content": r["prompt"]}],
-                                         tokenize=False, add_generation_prompt=True)
+    def fmt(r):   # SFT instruct format (train_sft.py); optional system role (repair pairs carry one)
+        msgs = ([{"role": "system", "content": r["system"]}] if r.get("system") else []) + \
+               [{"role": "user", "content": r["prompt"]}]
+        prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         return {"prompt": prompt, "chosen": r["chosen"], "rejected": r["rejected"]}
     ds = ds.map(fmt, remove_columns=[c for c in ds.column_names if c not in ("prompt", "chosen", "rejected")])
 

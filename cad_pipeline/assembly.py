@@ -13,6 +13,7 @@ sub-spec (reusing the part verifier), and the ASSEMBLY adds two checks the parts
 """
 from __future__ import annotations
 
+import json
 import math
 from typing import List, Literal, Optional, Tuple
 
@@ -54,7 +55,7 @@ class Mate(BaseModel):
     docs/research/sources.md 'emit named relationships, not coordinates'). solve_layout() resolves the
     whole graph deterministically into each component's at/rotate."""
     kind: Literal["ground", "stack", "coaxial", "radial", "corners", "flush", "mirror", "attach",
-                  "cutout"]
+                  "cutout", "port"]
     a: Optional[str] = None                 # primary part (ground/stack/coaxial/flush/mirror/attach)
     #                                         cutout: the TOOL part (its grown volume is carved out)
     b: Optional[str] = None                 # reference part (a is placed relative to b)
@@ -72,9 +73,23 @@ class Mate(BaseModel):
     axis: Optional[Literal["x", "y", "z"]] = None   # corners/coaxial: world direction each part's own
     #                                                 Z axis is turned to (wheels sideways: axis "y")
     side: Optional[str] = None              # flush: "+x"|"-x"|"+y"|"-y"|"+z"|"-z"
+    # port mate — placement as SELECTION, not coordinates (assembly-placement research 2026-07-21:
+    # ArtiCAD connectors / AutoMate discrete axes / Fusion entity-pair joints all converge here).
+    # Each part exposes six bbox-face ports; naming a pair pins a on ALL THREE axes: a's port
+    # point lands on b's port point, sunk `overlap` mm into b along b's port normal. The one
+    # sentence the old vocabulary couldn't say — "hang a below b" — is a_port:'top', b_port:'bottom'.
+    a_port: Optional[Literal["top", "bottom", "front", "back", "left", "right"]] = None
+    b_port: Optional[Literal["top", "bottom", "front", "back", "left", "right"]] = None
     plane: Optional[str] = None             # mirror: "YZ"|"XZ"|"XY"
     overlap: float = 1.5                    # stack/flush/attach: mm the parts overlap at the joint
     offset: Tuple[float, float] = (0.0, 0.0)  # stack: extra XY offset of a on b
+    fraction: Optional[float] = Field(default=None, ge=0.0, le=1.0)  # stack: fix a PARTWAY UP b (or
+    #                                         b's whole post/leg group): a's CENTER lands at this share
+    #                                         of the support's z-span (0 bottom … 1 top) — the rack's
+    #                                         middle shelf (0.5). None ⇒ classic stack ON TOP.
+    #                                         flush (lateral sides ±x/±y): same meaning — a's center
+    #                                         at this share of b's HEIGHT (a camera pod flush on the
+    #                                         front edge, raised between the plates: fraction 0.6).
 
 
 class Joint(BaseModel):
@@ -117,6 +132,9 @@ class AsmPatch(BaseModel):
     remove: List[str] = Field(default_factory=list)
     mates: Optional[List[Mate]] = None
     joints: Optional[List[Joint]] = None
+    # the ONLY repair for a `blend` failure is this assembly-level knob — without it the
+    # prescription "reduce fillet_joints" was literally unexpressable as a patch
+    fillet_joints: Optional[float] = None
 
 
 def apply_patch(asm: Assembly, patch: AsmPatch) -> Assembly:
@@ -136,6 +154,8 @@ def apply_patch(asm: Assembly, patch: AsmPatch) -> Assembly:
         out.mates = patch.mates
     if patch.joints is not None:
         out.joints = patch.joints
+    if patch.fillet_joints is not None:
+        out.fillet_joints = patch.fillet_joints
     return out
 
 
@@ -268,7 +288,10 @@ def _mated_pairs(asm: Assembly) -> set:
     group rests on ALL its members. Every other pair must not share volume."""
     radial_groups: dict = {}
     for m in asm.mates:
-        if m.kind == "radial":
+        # corners groups too: solve_layout rests a stacked part on the WHOLE pattern group
+        # (radial_of covers both kinds), so the sanction must match — a rack shelf fixed
+        # mid-height passes THROUGH all four corner posts by design.
+        if m.kind in ("radial", "corners"):
             for p in m.parts or []:
                 radial_groups[p] = list(m.parts or [])
     siblings: dict = {}                          # parent → its sub-assembly members
@@ -283,7 +306,7 @@ def _mated_pairs(asm: Assembly) -> set:
         if m.kind in ("corners", "radial") and m.around:
             for p in (m.parts or []):
                 pairs.add(frozenset((p, m.around)))
-        if m.kind in ("stack", "flush", "attach", "coaxial") and m.a and m.b:
+        if m.kind in ("stack", "flush", "attach", "coaxial", "port") and m.a and m.b:
             if m.b in radial_groups:
                 for p in radial_groups[m.b]:
                     pairs.add(frozenset((m.a, p)))
@@ -360,6 +383,30 @@ def _contact_patch_pts(solid: cq.Solid, z_top: float = 1.0) -> list:
     except Exception:  # noqa: BLE001
         pass
     return [(bb.xmin, bb.ymin), (bb.xmin, bb.ymax), (bb.xmax, bb.ymin), (bb.xmax, bb.ymax)]
+
+
+# The six bbox-face ports (world axes; front=+x, left=+y — same convention as corners naming).
+# Each port: (center-picker, outward normal). fraction (side ports only) slides the point up
+# b's z-span; offset (top/bottom ports) shifts it in XY — both reuse existing Mate fields.
+_PORTS = {
+    "top":    (lambda b: (b.center.x, b.center.y, b.zmax), (0, 0, 1)),
+    "bottom": (lambda b: (b.center.x, b.center.y, b.zmin), (0, 0, -1)),
+    "front":  (lambda b: (b.xmax, b.center.y, b.center.z), (1, 0, 0)),
+    "back":   (lambda b: (b.xmin, b.center.y, b.center.z), (-1, 0, 0)),
+    "left":   (lambda b: (b.center.x, b.ymax, b.center.z), (0, 1, 0)),
+    "right":  (lambda b: (b.center.x, b.ymin, b.center.z), (0, -1, 0)),
+}
+
+
+def _port_point(bb, port: str, fraction=None, offset=(0.0, 0.0)):
+    """World-space point of a named bbox-face port, with the optional dialect params applied."""
+    picker, normal = _PORTS[port]
+    x, y, z = picker(bb)
+    if fraction is not None and port not in ("top", "bottom"):
+        z = bb.zmin + fraction * (bb.zmax - bb.zmin)
+    if port in ("top", "bottom"):
+        x, y = x + offset[0], y + offset[1]
+    return (x, y, z), normal
 
 
 def solve_layout(asm: Assembly) -> Assembly:
@@ -444,19 +491,22 @@ def solve_layout(asm: Assembly) -> Assembly:
         b = bb(name)
         if b: set_at(name, z=comps[name].at[2] - b.zmin)   # drop so min-z = 0
 
-    # map each part in a radial group → (axis x, axis y, group names) so a part stacked ON a leg group
-    # centers on the AXIS and rests on ALL of them (not on one leg's offset center).
+    # map each part in a radial OR corners group → (axis x, axis y, group names) so a part stacked
+    # ON any group member centers on the PATTERN AXIS and rests on ALL of them — the planner's
+    # natural dialect (stack(top_plate, leg_0) must not drag the plate onto one corner leg; that
+    # was the dominant eval failure: 3-4 rigid groups from a torn-off top).
     radial_of: dict = {}
     for m in asm.mates:
-        if m.kind == "radial":
+        if m.kind in ("radial", "corners"):
             cx, cy = (0.0, 0.0)
             if m.around and m.around in comps and bare.get(m.around) is not None:
                 ab = _placed_bb(bare[m.around], comps[m.around], comps); cx, cy = ab.center.x, ab.center.y
             for p in (m.parts or []):
                 radial_of[p] = (cx, cy, list(m.parts or []))
 
-    # order: radial/corners → ground → coaxial → stack → flush → mirror → attach (supports before dependents)
-    order = {"radial": 0, "corners": 0, "ground": 1, "coaxial": 2, "stack": 3, "flush": 4, "mirror": 5, "attach": 6}
+    # order: radial/corners → ground → coaxial → stack → flush/port → mirror → attach (supports before dependents)
+    order = {"radial": 0, "corners": 0, "ground": 1, "coaxial": 2, "stack": 3, "flush": 4, "port": 4,
+             "mirror": 5, "attach": 6}
     for m in sorted(asm.mates, key=lambda m: order.get(m.kind, 9)):
         try:
             if m.kind == "radial":
@@ -543,34 +593,75 @@ def solve_layout(asm: Assembly) -> Assembly:
                     comps[m.a].rotate = {"x": (0.0, 90.0, 0.0), "y": (90.0, 0.0, 0.0)}[ax]
                 rb = bb(m.b)
                 if rb:
+                    # honor the mate's offset: the planner's natural dialect for "N posts on the
+                    # base at (dx,dy)" is coaxial+offset per post (live fail: 4 standoffs all solved
+                    # to the base axis and clumped — the intent was a spread row). offset shifts the
+                    # placement in the plane PERPENDICULAR to the axis; axis-true coaxial = (0,0).
+                    ox, oy = (m.offset[0], m.offset[1]) if m.offset else (0.0, 0.0)
                     if ax == "z":
-                        set_at(m.a, x=rb.center.x, y=rb.center.y)
+                        set_at(m.a, x=rb.center.x + ox, y=rb.center.y + oy)
                     elif ax == "y":
-                        set_at(m.a, x=rb.center.x, z=rb.center.z)
+                        set_at(m.a, x=rb.center.x + ox, z=rb.center.z + oy)
                     else:
-                        set_at(m.a, y=rb.center.y, z=rb.center.z)
+                        set_at(m.a, y=rb.center.y + ox, z=rb.center.z + oy)
             elif m.kind == "stack" and m.a in comps and m.b in comps:
                 ba = bb(m.a)
-                if m.b in radial_of:                              # stacking onto a radial group (e.g. seat on legs)
+                if m.b in radial_of:                              # stacking onto a radial/corners group (e.g. seat on legs)
                     cx, cy, grp = radial_of[m.b]
-                    tops = [bb(p).zmax for p in grp if bb(p) is not None]
-                    if ba and tops:
-                        set_at(m.a, x=cx + m.offset[0], y=cy + m.offset[1],
-                               z=comps[m.a].at[2] + (max(tops) - m.overlap - ba.zmin))  # centered on axis, on all legs
+                    boxes = [b for b in (bb(p) for p in grp) if b is not None]
+                    if ba and boxes:
+                        if m.fraction is not None:
+                            # mid-height dialect: a's CENTER at `fraction` of the group's z-span —
+                            # a rack's middle shelf partway up its posts (the z the eval said was
+                            # inexpressible). The shelf welds by passing THROUGH the posts;
+                            # _mated_pairs sanctions that overlap group-wide.
+                            lo = min(b.zmin for b in boxes); hi = max(b.zmax for b in boxes)
+                            zc = lo + m.fraction * (hi - lo)
+                            set_at(m.a, x=cx + m.offset[0], y=cy + m.offset[1],
+                                   z=comps[m.a].at[2] + (zc - ba.center.z))
+                        else:
+                            tops = [b.zmax for b in boxes]
+                            set_at(m.a, x=cx + m.offset[0], y=cy + m.offset[1],
+                                   z=comps[m.a].at[2] + (max(tops) - m.overlap - ba.zmin))  # centered on axis, on all legs
                 else:
                     rb = bb(m.b)
                     if ba and rb:
-                        set_at(m.a, x=rb.center.x + m.offset[0], y=rb.center.y + m.offset[1],
-                               z=comps[m.a].at[2] + (rb.zmax - m.overlap - ba.zmin))   # a's bottom onto b's top
+                        if m.fraction is not None:                # a's center at fraction of b's own height
+                            zc = rb.zmin + m.fraction * (rb.zmax - rb.zmin)
+                            set_at(m.a, x=rb.center.x + m.offset[0], y=rb.center.y + m.offset[1],
+                                   z=comps[m.a].at[2] + (zc - ba.center.z))
+                        else:
+                            set_at(m.a, x=rb.center.x + m.offset[0], y=rb.center.y + m.offset[1],
+                                   z=comps[m.a].at[2] + (rb.zmax - m.overlap - ba.zmin))   # a's bottom onto b's top
             elif m.kind == "flush" and m.a in comps and m.b in comps:
                 ba, rb = bb(m.a), bb(m.b); s = (m.side or "+z")
                 if ba and rb:
                     ax = {"+x": rb.xmax - m.overlap - ba.xmin, "-x": rb.xmin + m.overlap - ba.xmax}.get(s)
                     ay = {"+y": rb.ymax - m.overlap - ba.ymin, "-y": rb.ymin + m.overlap - ba.ymax}.get(s)
                     az = {"+z": rb.zmax - m.overlap - ba.zmin, "-z": rb.zmin + m.overlap - ba.zmax}.get(s)
+                    # height dialect on LATERAL flush: without it, a's z stays wherever the raw spec
+                    # left it — the quad's cam mounts landed inside an arm (484 mm³). fraction pins
+                    # a's CENTER at that share of b's z-span, same meaning as the stack dialect.
+                    if m.fraction is not None and az is None:
+                        zc = rb.zmin + m.fraction * (rb.zmax - rb.zmin)
+                        az = zc - ba.center.z
                     set_at(m.a, x=comps[m.a].at[0] + ax if ax is not None else None,
                            y=comps[m.a].at[1] + ay if ay is not None else None,
                            z=comps[m.a].at[2] + az if az is not None else None)
+            elif m.kind == "port" and m.a in comps and m.b in comps and m.a_port and m.b_port:
+                ba, rb = bb(m.a), bb(m.b)
+                if ba and rb:
+                    # a's port point lands ON b's port point, sunk `overlap` mm INTO b along b's
+                    # outward normal — pins a on ALL THREE axes (flush/stack left axes raw; that
+                    # freedom was the desk-islands / cam-in-arm bug). fraction slides the SIDE
+                    # port up b's height; offset shifts a TOP/BOTTOM port across b's face.
+                    (pb, nb) = _port_point(rb, m.b_port, m.fraction, m.offset)
+                    (pa, _na) = _port_point(ba, m.a_port)
+                    dx = pb[0] - pa[0] - nb[0] * m.overlap
+                    dy = pb[1] - pa[1] - nb[1] * m.overlap
+                    dz = pb[2] - pa[2] - nb[2] * m.overlap
+                    cx, cy, cz = comps[m.a].at
+                    set_at(m.a, x=cx + dx, y=cy + dy, z=cz + dz)
             elif m.kind == "mirror" and m.a in comps and m.b in comps:
                 bx, by, bz = comps[m.b].at; pl = (m.plane or "YZ")
                 set_at(m.a, x=-bx if pl == "YZ" else bx, y=-by if pl == "XZ" else by, z=-bz if pl == "XY" else bz)
@@ -1066,19 +1157,51 @@ def _pose_groups(asm: Assembly, group_solids: dict, gid_of: dict, angles: Option
     return posed
 
 
+def _solid_stl_b64(solid) -> str:
+    """One placed solid → base64 binary STL (the generation-theater per-part payload)."""
+    import base64 as _b64
+    import os as _os
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as d:
+        p = _os.path.join(d, "part.stl")
+        cq.exporters.export(cq.Workplane(obj=solid), p)
+        with open(p, "rb") as fh:
+            return _b64.b64encode(fh.read()).decode()
+
+
 def build_assembly(asm: Assembly) -> cq.Workplane:
     """Place buildable components; joints ⇒ fuse each rigid group and POSE them (a compound of
     separate movable bodies); no joints ⇒ fuse everything (default) and blend the seams."""
+    from . import progress
     comps = {c.name: c for c in asm.components}
     placed_by_name: dict = {}
-    for c in asm.components:
+    theater = progress.active()   # live construction view: stream each placed part's STL to the
+    n = len(asm.components)       # job record — ONLY when a job sink exists (never in evals/training)
+    for i, c in enumerate(asm.components):
         try:
+            if theater:
+                progress.publish(stage=f"building part · {c.name} ({i + 1}/{n})")
             placed_by_name[c.name] = _place_world(build(c.part).val(), c, comps)
+            if theater:
+                try:
+                    progress.publish(part={"name": c.name, "role": getattr(c, "role", None),
+                                           "stl_b64": _solid_stl_b64(placed_by_name[c.name])})
+                except Exception:  # noqa: BLE001 — the theater must never kill the build
+                    pass
         except Exception:  # noqa: BLE001 — one bad part must not kill the assembly
             pass
     if not placed_by_name:
         raise ValueError("assembly has no buildable components")
+    pre_cut = {k: id(v) for k, v in placed_by_name.items()}
     _apply_cutouts(asm, placed_by_name, comps)   # cut phase: arches/pockets carved post-placement
+    if theater:
+        for k, v in placed_by_name.items():      # re-publish parts the cut phase changed (e.g. wheel
+            if pre_cut.get(k) != id(v):          # arches) so the live view matches final geometry
+                try:
+                    progress.publish(part={"name": k, "role": getattr(comps.get(k), "role", None),
+                                           "stl_b64": _solid_stl_b64(v), "revised": True})
+                except Exception:  # noqa: BLE001
+                    pass
     solids = list(placed_by_name.values())
     if asm.joints:
         gid_of = _rigid_groups(asm)
@@ -1107,7 +1230,11 @@ def verify_assembly(asm: Assembly) -> dict:
             ps = _place_world(wp.val(), c, comps_map)
             placed.append(ps); built.append((c, ps))
         except Exception as e:  # noqa: BLE001 — a part that won't build is a (caught) failure
-            comps.append({"name": c.name, "passed": False, "fails": [f"build error: {type(e).__name__}"]})
+            # include the MESSAGE: "build error: IndexError" is useless to the repair model, while
+            # "revolve requires `profile` [(radius,z),…]" is a fixable instruction
+            msg = str(e)[:160]
+            comps.append({"name": c.name, "passed": False,
+                          "fails": [f"build error: {type(e).__name__}" + (f": {msg}" if msg else "")]})
     built_all = len(placed) == len(asm.components)
     placed_by_name = {c.name: s for c, s in built}
     # CUT phase (mirrors build_assembly): carve each cutout, then RESYNC placed/built so every
@@ -1165,10 +1292,65 @@ def verify_assembly(asm: Assembly) -> dict:
     connectivity_ok = built_all and conn_measured == expected_solids
     conn_name = ("assembly · connectivity (attached rigid groups)" if asm.joints
                  else "assembly · connectivity (all parts attached)" if asm.fuse else "assembly · part count")
-    rows = [
+
+    # ROOT-CAUSE rows (live-fail lesson, hinged-door: radial.around='z' silently no-oped and the
+    # report only showed the downstream symptoms — the repair model chased connectivity/interference
+    # for 3 rounds while the CAUSE was withheld). Two checks that name the cause directly:
+    # 1) dangling mate/joint references — a name that matches no component makes the solver skip
+    #    that mate entirely, so the part quietly stays wherever it was.
+    names = {c.name for c in asm.components}
+    dangling: list = []
+    for m in asm.mates:
+        for field in ("a", "b", "around"):
+            ref = getattr(m, field, None)
+            if ref and ref not in names:
+                dangling.append(f"{m.kind}.{field}='{ref}'")
+        for p in (m.parts or []):
+            if p not in names:
+                dangling.append(f"{m.kind}.parts→'{p}'")
+    for jt in asm.joints:
+        for field in ("a", "b"):
+            ref = getattr(jt, field, None)
+            if ref and ref not in names:
+                dangling.append(f"joint.{field}='{ref}'")
+    ref_rows: list = []
+    if dangling:
+        ref_rows.append({"name": "assembly · mate references resolve", "expected": "all component names",
+                         "measured": "; ".join(dangling[:6]) +
+                         " — every a/b/around/parts entry must be an EXISTING component name "
+                         "(an axis like 'z' is not a part; a mate with a bad name is silently skipped)",
+                         "within_tol": False, "category": "structure"})
+    # 2) coincident duplicates — identical parts resolving to the same spot is never intended
+    #    (guaranteed interference); the fix is ONE pattern mate, not N copies of the same mate.
+    by_spec: dict = {}
+    for c in asm.components:
+        by_spec.setdefault(json.dumps(c.part.model_dump(exclude_none=True), sort_keys=True), []).append(c)
+    coincident: list = []
+    for group in by_spec.values():
+        for i in range(len(group)):
+            for k in range(i + 1, len(group)):
+                # `at` is LOCAL for parented children — only comparable within the SAME frame.
+                # Children of DIFFERENT parents legitimately share one local offset (motor pads
+                # at each arm tip: the pattern rotation differentiates their world positions);
+                # if the parents themselves coincide, the row catches the parents directly.
+                if group[i].parent != group[k].parent:
+                    continue
+                if all(abs(group[i].at[d] - group[k].at[d]) < 1.0 for d in range(3)):
+                    coincident.append(f"{group[i].name}↔{group[k].name}")
+    if coincident:
+        involved = sorted({n for pair in coincident for n in pair.split("↔")})
+        ref_rows.append({"name": "assembly · duplicate parts coincident", "expected": "distinct positions",
+                         "measured": ", ".join(coincident[:6]) +
+                         f" — replace their per-part mates with ONE pattern mate: corners(parts={involved}, "
+                         "around=<the part they sit on>, dx=…, dy=…) for a rectangle, or radial(...) for a circle",
+                         "within_tol": False, "category": "structure", "parts": involved})
+
+    rows = ref_rows + [
         {"name": "assembly · components", "expected": len(asm.components),
          "measured": sum(1 for c in comps if c["passed"]), "within_tol": comps_ok,
-         "category": "ok" if comps_ok else "component"},
+         "category": "ok" if comps_ok else "component",
+         # structured names so the repair router can SCOPE the patch to exactly these parts
+         **({"parts": [c["name"] for c in comps if not c["passed"]]} if not comps_ok else {})},
         # When a part didn't BUILD, the fused count is computed from the survivors — reporting
         # that as "disconnected" (often with measured == expected) misdirects repair toward
         # mates when the real fault is the broken part. Say so, and route it as `component`.
@@ -1194,7 +1376,7 @@ def verify_assembly(asm: Assembly) -> dict:
         if not info["ok"]:
             rows.append({"name": f"assembly · cutout ({m.a} carved from {m.b})",
                          "expected": "material removed", "measured": info["why"],
-                         "within_tol": False, "category": "cutout"})
+                         "within_tol": False, "category": "cutout", "parts": [m.a, m.b]})
             continue
         rows.append({"name": f"assembly · cutout ({m.a} carved from {m.b})",
                      "expected": "material removed",
@@ -1203,18 +1385,20 @@ def verify_assembly(asm: Assembly) -> dict:
         intact = info["post_solids"] <= info["pre_solids"]
         rows.append({"name": f"assembly · cutout target intact ({m.b})",
                      "expected": f"{info['pre_solids']} solid(s)", "measured": info["post_solids"],
-                     "within_tol": intact, "category": "ok" if intact else "cutout"})
+                     "within_tol": intact, "category": "ok" if intact else "cutout",
+                     **({} if intact else {"parts": [m.a, m.b]})})
         if m.a in placed_by_name and m.b in placed_by_name:
             try:
                 gap, _d = _solid_gap(placed_by_name[m.a], placed_by_name[m.b])
                 gap_ok = gap >= m.clearance - 0.1
                 rows.append({"name": f"assembly · cutout clearance ({m.a}↔{m.b})",
                              "expected": f"≥ {m.clearance:g} mm", "measured": round(gap, 3),
-                             "within_tol": gap_ok, "category": "ok" if gap_ok else "cutout"})
+                             "within_tol": gap_ok, "category": "ok" if gap_ok else "cutout",
+                             **({} if gap_ok else {"parts": [m.a, m.b]})})
             except Exception:  # noqa: BLE001 — an unmeasurable gap is a failure, not a pass
                 rows.append({"name": f"assembly · cutout clearance ({m.a}↔{m.b})",
                              "expected": f"≥ {m.clearance:g} mm", "measured": "unmeasurable",
-                             "within_tol": False, "category": "cutout"})
+                             "within_tol": False, "category": "cutout", "parts": [m.a, m.b]})
     # Structural-support check — catches the "connected but stacked/clumped" failure that the single-solid
     # connectivity test misses (the research's 'false convergence'). Intent-aware via component roles:
     #   • grounded   — the assembly rests on the floor (min-z ≈ 0), not floating or sunk
@@ -1222,13 +1406,18 @@ def verify_assembly(asm: Assembly) -> dict:
     #   • footprint  — ≥3 legs/supports/arms are SPREAD in XY, not piled at one center (the stool clump)
     if built:
         bbs = [(c, s.BoundingBox()) for c, s in built]
-        # ground contact is only EXPECTED for STANDING objects (those with legs/base); a free frame
-        # (drone, wall bracket, a 'support' member up in the air) legitimately floats — don't require z≈0
-        # unless the object actually stands on legs/base. 'support' is a generic strut, not a foot.
-        footed = [(c, b) for c, b in bbs if c.role in ("leg", "base")]
+        # Ground contact is required only when the spec DECLARES floor intent: an explicit ground
+        # mate, actual legs, or a 'base' that is the LOWEST member (a pedestal). A flying frame's
+        # "base plate" with arms/pads hanging BELOW it is not floor intent — demanding z≈0 there
+        # was the quadcopter false positive (role=base on a drone ⇒ 'not grounded', regression
+        # brief 2026-07-21). 'support' is a generic strut, not a foot.
         min_z = min(b.zmin for _, b in bbs)
-        grounded = (not footed) or abs(min_z) <= 2.0
         legs = [(c, b) for c, b in bbs if c.role == "leg"]
+        bases = [(c, b) for c, b in bbs if c.role == "base"]
+        base_is_lowest = any(b.zmin <= min_z + 2.0 for _, b in bases)
+        has_ground_mate = any(mm.kind == "ground" for mm in asm.mates)
+        needs_ground = has_ground_mate or bool(legs) or base_is_lowest
+        grounded = (not needs_ground) or abs(min_z) <= 2.0
         legs_reach = all(b.zmin <= 2.0 for _, b in legs)   # legs must actually touch the floor
         spread = [(c, b) for c, b in bbs if c.role in ("leg", "support", "arm")]
         footprint_ok = True
@@ -1236,16 +1425,19 @@ def verify_assembly(asm: Assembly) -> dict:
             cxs = [b.center.x for _, b in spread]; cys = [b.center.y for _, b in spread]
             span = max(max(cxs) - min(cxs), max(cys) - min(cys))
             footprint_ok = span > 10.0   # legs/arms must fan out, not clump at the axis (the old stool bug)
-        supported = grounded and legs_reach and footprint_ok
+        # Arrangement is only judgeable on a CONNECTED assembly — "supported ok" next to
+        # "8 islands" (the gaming-desk report) graded a pile of islands as structure.
+        supported = connectivity_ok and grounded and legs_reach and footprint_ok
         detail = "ok" if supported else ", ".join(
-            x for x, ok in [("not grounded", grounded), ("legs hover", legs_reach), ("clumped", footprint_ok)] if not ok)
+            x for x, ok in [("disconnected — not judgeable", connectivity_ok), ("not grounded", grounded),
+                            ("legs hover", legs_reach), ("clumped", footprint_ok)] if not ok)
         rows.append({"name": "assembly · structurally supported", "expected": "ok", "measured": detail,
                      "within_tol": supported, "category": "ok" if supported else "structure"})
         # Statics — the real test behind the heuristic above: c = (1/m)∫ρ·p dV must project INSIDE
         # the support polygon (convex hull of the actual ground-contact patches), else it tips.
         # Uniform density (GProp volume centroid); measured = the stability margin in mm (signed
         # distance from the CoM's XY projection to the hull boundary; positive = inside).
-        if footed and grounded:
+        if needs_ground and grounded and connectivity_ok:   # tipping is meaningful only for floor-standing, connected objects
             props = GProp_GProps()
             BRepGProp.VolumeProperties_s(shape.wrapped if hasattr(shape, "wrapped") else shape, props)
             com = props.CentreOfMass()
@@ -1298,6 +1490,7 @@ def verify_assembly(asm: Assembly) -> dict:
                      "category": "ok" if inter_ok else "integrity"})
         if not inter_ok:
             rows[-1]["name"] = f"assembly · interference (worst non-mated pair: {worst_pair})"
+            rows[-1]["parts"] = worst_pair.split("↔")
 
     # Kinematics — DOF accounting + configuration-space clearance (only when joints declared).
     if asm.joints and groups:
@@ -1305,14 +1498,15 @@ def verify_assembly(asm: Assembly) -> dict:
         # returns exactly 1. A joint whose sides landed in the SAME group is over-constrained
         # (welded hinge); a repeat joint between the same two groups is redundant (also flagged).
         movable, problems, seen_pairs = 0, [], set()
+        dof_parts: list = []
         for j in asm.joints:
             ga, gb = gid_of.get(j.a), gid_of.get(j.b)
             if ga is None or gb is None:
-                problems.append(f"{j.a}/{j.b} unknown")
+                problems.append(f"{j.a}/{j.b} unknown"); dof_parts += [j.a, j.b]
             elif ga == gb:
-                problems.append(f"{j.a}↔{j.b} welded (over-constrained)")
+                problems.append(f"{j.a}↔{j.b} welded (over-constrained)"); dof_parts += [j.a, j.b]
             elif frozenset((ga, gb)) in seen_pairs:
-                problems.append(f"{j.a}↔{j.b} redundant")
+                problems.append(f"{j.a}↔{j.b} redundant"); dof_parts += [j.a, j.b]
             else:
                 seen_pairs.add(frozenset((ga, gb)))
                 movable += 1
@@ -1334,7 +1528,8 @@ def verify_assembly(asm: Assembly) -> dict:
         rows.append({"name": "assembly · DOF (1 per revolute)"
                      + ("" if dof_ok else f" [{'; '.join(problems) or 'floating: ' + ', '.join(floating)}]"),
                      "expected": len(asm.joints), "measured": movable, "within_tol": dof_ok,
-                     "category": "ok" if dof_ok else "kinematic"})
+                     "category": "ok" if dof_ok else "kinematic",
+                     **({} if dof_ok else {"parts": sorted(set(dof_parts + floating))})})
         # Pose sweep (configuration space): clearance must hold at EVERY sampled pose across each
         # joint's limits, not just the rest pose — gap(θ) > 0 for all θ. Samples: lo, mid, hi.
         sweep_worst, sweep_detail = 0.0, ""
@@ -1392,7 +1587,8 @@ def verify_assembly(asm: Assembly) -> dict:
             fit_ok = 0.1 <= best <= 0.8
             rows.append({"name": f"assembly · joint fit ({j.a}↔{j.b}, ⌀ clearance)",
                          "expected": "0.1–0.8 mm", "measured": round(best, 3), "within_tol": fit_ok,
-                         "category": "ok" if fit_ok else "fit"})
+                         "category": "ok" if fit_ok else "fit",
+                         **({} if fit_ok else {"parts": [j.a, j.b]})})
         # Joint ATTACHMENT — a revolute joint is only physically real if its two sides MEET
         # (pin in bore, hub on axle, faces in contact). The DOF/sweep rows are pure axis math
         # and happily pass a wheel hovering 60 mm from the chassis with nothing bridging the
@@ -1408,7 +1604,8 @@ def verify_assembly(asm: Assembly) -> dict:
             att_ok = gap <= 1.0
             rows.append({"name": f"assembly · joint attachment ({j.a}↔{j.b} gap)",
                          "expected": "≤ 1 mm", "measured": round(gap, 2), "within_tol": att_ok,
-                         "category": "ok" if att_ok else "kinematic"})
+                         "category": "ok" if att_ok else "kinematic",
+                         **({} if att_ok else {"parts": [j.a, j.b]})})
     # Joint blending is informational — surface the count so a render's "smoothed joints" is
     # auditable. It FAILS only if blending corrupted the solid (no seams to blend, e.g. a single
     # part or parts that merely abut, is fine — n_blended=0 with a still-valid solid passes).

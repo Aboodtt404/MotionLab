@@ -53,11 +53,13 @@ def _load():
 
 def multiview(ref_image, text: str = "high quality, detailed", num_views: int = 6, seed: int = 42,
               azimuth_deg: Optional[List[int]] = None, guidance_scale: float = 3.0,
-              num_inference_steps: int = 50) -> List["object"]:
+              num_inference_steps: int = 50, elevation_deg: Optional[List[int]] = None) -> List["object"]:
     """Reference image (path or PIL.Image) → list of `num_views` consistent views (PIL.Images).
 
     The reference is background-removed (BiRefNet) and centered; views are generated at `azimuth_deg`
-    (default the canonical 6-view orbit). `text` lightly guides appearance/quality."""
+    (default the canonical 6-view orbit) and `elevation_deg` (default 0 = level). `text` lightly guides
+    appearance/quality. NOTE: i2mv SDXL is trained mostly at low elevation — steep top/bottom views
+    (|elev|>~60) are out-of-distribution and may come out garbled."""
     import torch  # noqa: F401  (ensures CUDA context inside the gpu lock)
     from PIL import Image
     from scripts.inference_i2mv_sdxl import remove_bg, run_pipeline
@@ -69,5 +71,6 @@ def multiview(ref_image, text: str = "high quality, detailed", num_views: int = 
         pipe, num_views=num_views, text=text, image=img, height=768, width=768,
         num_inference_steps=num_inference_steps, guidance_scale=guidance_scale, seed=seed,
         remove_bg_fn=rmbg, azimuth_deg=azimuth_deg or DEFAULT_AZIMUTH[:num_views],
+        elevation_deg=elevation_deg,
     )
     return images

@@ -366,7 +366,13 @@ def build(spec: Spec) -> cq.Workplane:
         if sh.open_face == "none":
             r = r.shell(-sh.thickness)
         else:
-            r = r.faces({"top": ">Z", "bottom": "<Z"}[sh.open_face]).shell(-sh.thickness)
+            try:
+                r = r.faces({"top": ">Z", "bottom": "<Z"}[sh.open_face]).shell(-sh.thickness)
+            except Exception as e:  # noqa: BLE001 — OCCT raises an opaque Standard_ConstructionError
+                raise ValueError(
+                    f"shell(thickness={sh.thickness}) failed on this geometry — the walls do not fit "
+                    "(part too thin, or fillets/holes intersect the shell). Reduce thickness, or drop "
+                    "the shell feature: thin panels (doors, plates, lids) should NOT be shelled") from e
     for f in spec.features:
         if f.type == "pocket":
             # centerOption=CenterOfBoundBox ⇒ origin is ALWAYS the face center (absolute), so a
@@ -569,6 +575,11 @@ def _revolve_solid(spec: Spec) -> cq.Workplane:
     revolving about the plane normal is degenerate), then rotated +90° about X so the body stands
     on the Z axis like a cylinder (axial → +Z). `ruled` straight runs ⇒ analytic cylinders/cones."""
     pts = spec.profile or []
+    if len(pts) < 3:
+        # typed guidance instead of a deep cadquery IndexError — this string IS the repair feedback
+        raise ValueError(
+            "revolve requires `profile` [(radius, z), ...] with >=3 points (meridian, axis at r=0) - "
+            "or use shape 'cylinder' with envelope {diameter, height} for a plain round part")
     angle = spec.envelope.get("angle", 360.0)
     arcs = spec.profile_arcs or []
     if any(arcs):
@@ -591,6 +602,9 @@ def _sweep_solid(spec: Spec) -> cq.Workplane:
     round tube of envelope['diameter']. The path wire is assembled from 3D line edges (so non-planar
     paths work), and the profile sits on a plane perpendicular to the first segment (square to the path)."""
     pts = [cq.Vector(*p) for p in (spec.path or [])]
+    if len(pts) < 2:
+        raise ValueError("sweep requires `path` [[x,y,z], ...] with >=2 points, plus envelope "
+                         "{diameter} for a tube or {width, height} for a rectangular section")
     edges = [cq.Edge.makeLine(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
     path_wire = cq.Wire.assembleEdges(edges)
     t0 = (pts[1] - pts[0]).normalized()
@@ -621,6 +635,9 @@ def _profile_extrude_solid(spec: Spec) -> cq.Workplane:
     extrude would sweep to −Y only. Built then CENTERED on the origin like box/loft."""
     from .spec import profile_extent, profile_is_simple
     side = spec.side_profile or []
+    if len(side) < 3:
+        raise ValueError("profile_extrude requires `side_profile` [[x,z], ...] with >=3 points "
+                         "(the silhouette polygon), plus envelope {width}")
     if len(side) < 3 or not profile_is_simple(side, spec.side_arcs):
         raise ValueError("profile_extrude: side_profile must be a simple closed outline (≥3 pts)")
     sx0, sx1, sz0, sz1 = profile_extent(side, spec.side_arcs or [])

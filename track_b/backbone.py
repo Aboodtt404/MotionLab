@@ -71,8 +71,44 @@ def _export_glb(mesh, out_glb: str, texture_size: int, decimation: int) -> str:
     hung native call holds the GPU lock, blocking the whole service. Skipping it keeps the raw
     marching-cubes topology (perfectly usable; /lowpoly handles topology cleanup on demand) and makes
     generation reliable + faster. The decimation_target pass still runs."""
+    import gc
+    import torch
     import o_voxel
-    mesh.simplify(16777216)   # nvdiffrast index limit
+    # Hand torch's reserved-but-unused cache back to the driver BEFORE CuMesh runs: CuMesh
+    # (simplify + to_glb decimation) raw-cudaMalloc's OUTSIDE the PyTorch pool, so the hero tier
+    # can OOM here while tens of GB sit "free" inside torch's cache (measured 2026-07-09 with
+    # ~54 GB system-free; recurred 2026-07-19 with FLUX parked resident). expandable_segments
+    # does NOT cover raw allocations — releasing the cache is the actual fix.
+    # When the card is SHARED (serve + LTX resident), even that isn't enough: FLUX + MV-Adapter —
+    # and at the limit TRELLIS itself — are dead weight at extraction time (sampling is DONE, only
+    # `mesh` matters). Evict in stages under pressure, retrying the CuMesh call once after a full
+    # eviction: a slower next-job warmup always beats OOMing the user's finished generation.
+    def _evict(deep: bool) -> None:
+        global _pipe
+        from . import mvadapter_views, t2i
+        t2i._pipe = None
+        mvadapter_views._pipe = None
+        mvadapter_views._birefnet = None
+        mvadapter_views._tf = None
+        if deep:
+            _pipe = None                       # the TRELLIS pipeline — reloads in ~60-90s next job
+        gc.collect(); torch.cuda.empty_cache()
+
+    free_gb = torch.cuda.mem_get_info()[0] / 1e9
+    if free_gb < 20.0:
+        _evict(deep=free_gb < 12.0)
+        print(f"[export] pre-CuMesh eviction: free {free_gb:.1f} → "
+              f"{torch.cuda.mem_get_info()[0] / 1e9:.1f} GB", flush=True)
+    gc.collect(); torch.cuda.empty_cache()
+    try:
+        mesh.simplify(16777216)   # nvdiffrast index limit
+    except RuntimeError as e:
+        if "out of memory" not in str(e).lower():
+            raise
+        _evict(deep=True)
+        print(f"[export] CuMesh OOM — full eviction, retrying "
+              f"(free {torch.cuda.mem_get_info()[0] / 1e9:.1f} GB)", flush=True)
+        mesh.simplify(16777216)
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs, coords=mesh.coords,
         attr_layout=mesh.layout, voxel_size=mesh.voxel_size, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],

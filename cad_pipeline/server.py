@@ -64,8 +64,81 @@ def _inspection(report: dict) -> list:
             for r in report["rows"]]
 
 
+def _display_name(prompt: str) -> "str | None":
+    """A library-card name for the asset (2-4 words, Title Case) from the tuned serve — the prompt
+    itself makes an ugly card title. Best-effort: any failure (vLLM paused, timeout) returns None
+    and the caller falls back to prompt truncation client-side."""
+    if not prompt:
+        return None
+    try:
+        import urllib.request
+        body = {"model": os.environ.get("NAME_MODEL", "qwen3.6-27b"),
+                "messages": [
+                    {"role": "system", "content": "Name this 3D asset for a studio library. Output JSON "
+                     "{\"name\": \"...\"}: a clean 2-4 word Title Case noun phrase. No dimensions, "
+                     "counts, units, or punctuation. Example: 'a 220x120 chassis plate with 4 holes' -> "
+                     "{\"name\": \"Chassis Plate\"}"},
+                    {"role": "user", "content": prompt[:400]},
+                ],
+                "temperature": 0.2, "max_tokens": 24,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": {
+                    "type": "object", "properties": {"name": {"type": "string", "maxLength": 42}},
+                    "required": ["name"]}}}}
+        req = urllib.request.Request("http://localhost:8002/v1/chat/completions",
+                                     data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            name = json.loads(json.loads(r.read())["choices"][0]["message"]["content"])["name"].strip()
+        return name[:60] or None
+    except Exception:  # noqa: BLE001 — naming is decoration, never a failure
+        return None
+
+
+_SUGGEST_THEMES = [
+    "a sci-fi film prop with moving parts", "a workshop fixture or jig", "a piece of furniture",
+    "a robotics mount or gimbal", "a wheeled cart or rig", "a hinged door, lid or hatch on a frame",
+    "a mechanical bracket or clamp pair", "a small gantry or pivoting boom", "a machine part with holes and fillets",
+    "a shelled enclosure with internal standoffs",
+]
+
+
+def _suggest_brief(track: str) -> "str | None":
+    """One playful-but-buildable generation brief (the dashboard dice). Mesh track gets an organic/
+    hero-prop ask; CAD gets a parametric assembly/part ask. Best-effort like _display_name."""
+    import random as _rnd
+    try:
+        import urllib.request
+        theme = _rnd.choice(_SUGGEST_THEMES) if track != "mesh" else _rnd.choice([
+            "an alien artifact or relic", "a weathered sci-fi vehicle or droid", "an organic creature bust",
+            "a hero film prop", "a rock/terrain formation", "a hard-surface crate or container"])
+        style = _rnd.choice(["casual one-liner", "metric-precise engineering ask with real mm dimensions"])
+        body = {"model": os.environ.get("NAME_MODEL", "qwen3.6-27b"),
+                "messages": [
+                    {"role": "system", "content": "Write ONE generation brief for a 3D asset studio. "
+                     "Output JSON {\"brief\": \"...\"}. Keep it under 26 words, concrete and buildable "
+                     "(rigid parts; no fabric, no electronics internals)."},
+                    {"role": "user", "content": f"A {style} for: {theme}. Surprise me."},
+                ],
+                "temperature": 1.1, "max_tokens": 90,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "response_format": {"type": "json_schema", "json_schema": {"name": "s", "schema": {
+                    "type": "object", "properties": {"brief": {"type": "string", "maxLength": 200}},
+                    "required": ["brief"]}}}}
+        req = urllib.request.Request("http://localhost:8002/v1/chat/completions",
+                                     data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(json.loads(r.read())["choices"][0]["message"]["content"])["brief"].strip() or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _run_golden(spec: Spec) -> dict:
+    from . import progress
+    progress.publish(stage="building solid (deterministic)")
     solid = build(spec)
+    progress.publish(stage="verifying · re-measuring geometry")
     rep = verify(solid, spec).to_dict()
     return {"passed": rep["passed"], "attempts": 1,
             "history": [{"attempt": 1, "status": "ok", "category": "ok"}],
@@ -89,10 +162,13 @@ def _run_model(spec: Spec, max_attempts: int) -> dict:
     # CAD_RAG=1 restores it for the un-tuned base model.
     gen = VLLMGenerator(model=os.environ.get("CAD_MODEL", "phase23"),
                         rag=os.environ.get("CAD_RAG", "0") == "1")
+    from . import progress
     feedback = None
     history, best = [], None
     for attempt in range(1, max_attempts + 1):
+        progress.publish(stage=f"codegen · attempt {attempt}", attempt=attempt)
         code = gen.generate(spec, feedback)
+        progress.publish(stage=f"executing + verifying · attempt {attempt}")
         res = run_code(code, spec)
         ok = res["status"] == "ok"
         history.append({"attempt": attempt, "status": res["status"], "category": "ok" if ok and res["report"]["passed"] else res["status"]})
@@ -137,17 +213,23 @@ def _spec_of(body: dict) -> Spec:
 
 
 def _gen_job(body: dict) -> dict:
+    from . import progress
+    progress.publish(stage="parsing prompt → spec")
     spec = _spec_of(body)
+    progress.publish(stage="spec ready", spec=spec.model_dump(exclude_none=True))
     refine_hist = None
     if body.get("refine"):   # Stage C: render→VLM critique loop nudges the greeble params first
         from .critique import refine
         spec, refine_hist = refine(spec, rounds=int(body.get("rounds", 2)))
     out = (_run_model(spec, int(body.get("max_attempts", 3))) if body.get("use_model") else _run_golden(spec))
+    progress.publish(stage="exporting STL + STEP")
+    display_name = _display_name(str(body.get("prompt", "")))
     resp = {"passed": out["passed"], "attempts": out["attempts"], "history": out["history"], "code": out["code"],
             "spec": spec.model_dump(exclude_none=True),
             "inspection": _inspection(out["report"]) if out["report"] else [],
             "mesh_stl_b64": _stl_b64(out["solid"]) if out.get("solid") is not None else None,
-            "step_b64": _step_b64(out["solid"]) if out.get("solid") is not None else None}
+            "step_b64": _step_b64(out["solid"]) if out.get("solid") is not None else None,
+            "display_name": display_name}
     if refine_hist is not None:
         resp["refine_history"] = refine_hist
         if out.get("solid") is not None:
@@ -168,10 +250,12 @@ def _critique_job(body: dict) -> dict:
 
 
 def _assembly_job(route: str, body: dict) -> dict:
+    from . import progress
     from .assembly import Assembly, build_assembly, verify_assembly
     from .planner import edit
     attempts_used = None
     if route == "/plan":
+        progress.publish(stage="planning · drafting the assembly spec")
         # The retry LOOP, not a single shot: plan → verify → typed A1–A8 feedback → minimal patch →
         # re-verify (asm_loop). Budget stays small (Hephaestus: few compounding iterations, rich
         # per-iteration feedback) and it stops on pass. The BEST attempt (most passing rows) ships.
@@ -187,11 +271,14 @@ def _assembly_job(route: str, body: dict) -> dict:
         asm = Assembly(**best["assembly"])
         attempts_used = len(out.get("attempt_log", []))
     else:
+        progress.publish(stage="editing · applying the instruction")
         asm = edit(Assembly(**body["assembly"]), body["instruction"])
+    progress.publish(assembly=asm.model_dump(), stage="assembly spec locked")
     refine_hist = None
     if route == "/plan" and body.get("refine"):   # render→VLM critique loop improves the blockout
         from .critique import refine_assembly
         asm, refine_hist = refine_assembly(asm, asm.object, rounds=int(body.get("rounds", 2)))
+    progress.publish(stage="verifying assembly · kinematics + interference")
     rep = verify_assembly(asm)
     insp = [{"name": r["name"], "expected": r["expected"], "measured": r["measured"],
              "delta": None, "within_tol": r["within_tol"], "category": r["category"]} for r in rep["rows"]]
@@ -199,10 +286,13 @@ def _assembly_job(route: str, body: dict) -> dict:
         insp.append({"name": f"part · {c['name']}", "expected": "ok",
                      "measured": "ok" if c["passed"] else ", ".join(c["fails"]) or "fail",
                      "delta": None, "within_tol": c["passed"], "category": "component"})
+    progress.publish(stage=f"constructing · {len(asm.components)} parts")
     asm_solid = build_assembly(asm)
+    progress.publish(stage="exporting STL + STEP")
     out = {"passed": rep["passed"], "assembly": asm.model_dump(), "components": len(asm.components),
            "object": asm.object, "inspection": insp, "mesh_stl_b64": _stl_b64(asm_solid),
-           "step_b64": _step_b64(asm_solid)}
+           "step_b64": _step_b64(asm_solid),
+           "display_name": _display_name(str(body.get("prompt", ""))) if route == "/plan" else None}
     if attempts_used is not None:
         out["attempts"] = attempts_used
     if refine_hist is not None:
@@ -256,7 +346,25 @@ def _engine_job(body: dict) -> dict:
             "report": part.report, "reason": part.reason}
 
 
+def _job_sink(jid: str):
+    """Per-job progress sink: merge published fields into the job record (GET /job streams them).
+    `part` appends to a growing parts list (the construction theater); everything else overwrites."""
+    def sink(**fields):
+        with _jobs_lock:
+            job = _jobs.get(jid)
+            if job is None:
+                return
+            prog = job.setdefault("progress", {"parts": []})
+            part = fields.pop("part", None)
+            if part is not None:
+                prog["parts"].append(part)
+            prog.update(fields)
+    return sink
+
+
 def _run_job(jid: str, route: str, body: dict):
+    from . import progress
+    progress.set_sink(_job_sink(jid))
     try:
         if route == "/generate":
             result = _gen_job(body)
@@ -294,6 +402,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802 — enqueue a job, return its id (poll GET /job/<id>)
         route = self.path.rstrip("/")
+        if route == "/suggest":         # the dashboard dice — one playful buildable brief (~1-2s)
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(n) or b"{}")
+                return self._json(200, {"brief": _suggest_brief(str(body.get("track", "cad")))})
+            except Exception as e:  # noqa: BLE001
+                return self._json(200, {"brief": None, "error": str(e)[:100]})
+        if route == "/name":            # synchronous ~1s naming call (mesh lane borrows it too)
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(n) or b"{}")
+                return self._json(200, {"name": _display_name(str(body.get("prompt", "")))})
+            except Exception as e:  # noqa: BLE001
+                return self._json(200, {"name": None, "error": str(e)[:100]})
         if route not in ("/generate", "/plan", "/edit", "/critique", "/engine"):
             return self._json(404, {"error": "not found"})
         try:
@@ -308,16 +430,31 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         route = self.path.rstrip("/")
         if route.startswith("/job/"):
+            path, _, query = route[len("/job/"):].partition("?")
+            parts_after = 0
+            for kv in query.split("&"):
+                if kv.startswith("parts_after="):
+                    try:
+                        parts_after = max(0, int(kv.split("=", 1)[1]))
+                    except ValueError:
+                        pass
             with _jobs_lock:
-                job = _jobs.get(route[len("/job/"):])
+                job = _jobs.get(path)
                 snap = dict(job) if job else None
+                prog = dict(job.get("progress", {})) if job else {}
+                parts = list(prog.get("parts", []))
             if snap is None:
                 return self._json(404, {"error": "unknown job"})
             if snap["status"] == "done":
                 return self._json(200, {"status": "done", **snap["result"]})
             if snap["status"] == "error":
                 return self._json(200, {"status": "error", "error": snap["error"], "trace": snap.get("trace", "")})
-            return self._json(200, {"status": snap["status"], "elapsed": round(time.time() - snap["created"])})
+            # running → stream the generation theater: stage, live spec (streamed planner tokens or
+            # the parsed spec), attempt number, assembly JSON, and per-part STLs built so far.
+            # Client sends ?parts_after=N to fetch only new parts (they're heavy).
+            live = {k: v for k, v in prog.items() if k != "parts"}
+            return self._json(200, {"status": snap["status"], "elapsed": round(time.time() - snap["created"]),
+                                    "parts_total": len(parts), "parts": parts[parts_after:], **live})
         if route in ("/health", "/"):
             return self._json(200, {"ok": True, "jobs": len(_jobs)})
         return self._json(404, {"error": "not found"})

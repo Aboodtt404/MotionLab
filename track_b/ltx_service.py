@@ -62,22 +62,33 @@ def _get_pipeline(variant: str):
     from ltx_pipelines.ic_lora import ICLoraPipeline
     from ltx_pipelines.utils.quantization_factory import QuantizationKind
 
-    if variant not in LORAS:
-        raise ValueError(f"unknown variant {variant!r}; expected one of {sorted(LORAS)}")
+    if variant != "i2v" and variant not in LORAS:
+        raise ValueError(f"unknown variant {variant!r}; expected 'i2v' or one of {sorted(LORAS)}")
     if _pipe is not None:                       # evict the old variant first to free VRAM before reloading
         _pipe = None
         gc.collect(); torch.cuda.empty_cache()
-    print(f"[ltx] loading ICLoraPipeline (variant={variant}, fp8-cast)…", flush=True)
     t0 = time.time()
-    lora = LoraPathStrengthAndSDOps(LORAS[variant], 1.0, LTXV_LORA_COMFY_RENAMING_MAP)
     quant = QuantizationKind("fp8-cast").to_policy(checkpoint_path=CKPT)
-    pipe = ICLoraPipeline(
-        distilled_checkpoint_path=CKPT,
-        spatial_upsampler_path=UPSAMPLER,
-        gemma_root=GEMMA,
-        loras=(lora,),
-        quantization=quant,
-    )
+    if variant == "i2v":                        # plain distilled ti2vid — image+prompt → motion clip, no LoRA
+        from ltx_pipelines.distilled import DistilledPipeline
+        print("[ltx] loading DistilledPipeline (i2v, fp8-cast)…", flush=True)
+        pipe = DistilledPipeline(
+            distilled_checkpoint_path=CKPT,
+            spatial_upsampler_path=UPSAMPLER,
+            gemma_root=GEMMA,
+            loras=[],
+            quantization=quant,
+        )
+    else:
+        print(f"[ltx] loading ICLoraPipeline (variant={variant}, fp8-cast)…", flush=True)
+        lora = LoraPathStrengthAndSDOps(LORAS[variant], 1.0, LTXV_LORA_COMFY_RENAMING_MAP)
+        pipe = ICLoraPipeline(
+            distilled_checkpoint_path=CKPT,
+            spatial_upsampler_path=UPSAMPLER,
+            gemma_root=GEMMA,
+            loras=(lora,),
+            quantization=quant,
+        )
     _pipe = (variant, pipe)
     print(f"[ltx] pipeline ready in {time.time() - t0:.0f}s", flush=True)
     return pipe
@@ -131,6 +142,42 @@ def animate(turntable_path: str, first_frame_path: str, prompt: str, variant: st
     return _strip_audio(raw, out)
 
 
+def i2v(first_frame_path: str, prompt: str, height: int = 768, width: int = 768,
+        num_frames: int = 121, frame_rate: float = 24.0, seed: int = 42) -> str:
+    """Image+prompt -> motion mp4 (plain distilled ti2vid; the /animate_clip text path).
+
+    The prompt should describe OBJECT motion on a static camera — the caller
+    (track_b/animate_clip.py) feeds the result to Puppeteer's optimizer, which
+    assumes the object moves, not the viewpoint."""
+    import torch
+    from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+    from ltx_pipelines.utils.args import ImageConditioningInput
+    from ltx_pipelines.utils.media_io import encode_video
+
+    workdir = tempfile.mkdtemp(prefix="ltx_i2v_")
+    raw = os.path.join(workdir, "raw.mp4")
+    out = os.path.join(workdir, "motion.mp4")
+    full = (prompt.strip() + ". Static camera, fixed viewpoint; only the subject moves; "
+            "plain background.")
+    with _lock, gpu_lock():
+        try:
+            pipe = _get_pipeline("i2v")
+            tiling = TilingConfig.default()
+            with torch.inference_mode():
+                video, audio = pipe(
+                    prompt=full, seed=seed, height=height, width=width,
+                    num_frames=num_frames, frame_rate=frame_rate,
+                    images=[ImageConditioningInput(first_frame_path, 0, 1.0)],
+                    tiling_config=tiling,
+                )
+                encode_video(video=video, fps=frame_rate, audio=audio, output_path=raw,
+                             video_chunks_number=get_video_chunks_number(num_frames, tiling))
+        finally:
+            import gc
+            gc.collect(); torch.cuda.empty_cache()
+    return _strip_audio(raw, out)
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, payload: dict):
         body = json.dumps(payload).encode()
@@ -146,13 +193,36 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):  # noqa: N802
-        if self.path.rstrip("/") != "/animate":
+        route = self.path.rstrip("/")
+        if route not in ("/animate", "/i2v"):
             return self._json(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception as e:  # noqa: BLE001
             return self._json(400, {"error": f"bad request: {e}"})
+
+        if route == "/i2v":
+            workdir = tempfile.mkdtemp(prefix="ltx_i2v_in_")
+            try:
+                ff = os.path.join(workdir, "first.png")
+                open(ff, "wb").write(base64.b64decode(body["image_png_b64"]))
+                t0 = time.time()
+                mp4 = i2v(
+                    ff, prompt=body.get("prompt", ""),
+                    height=int(body.get("height", 768)),
+                    width=int(body.get("width", 768)),
+                    num_frames=int(body.get("num_frames", 121)),
+                    frame_rate=float(body.get("frame_rate", 24.0)),
+                    seed=int(body.get("seed", 42)),
+                )
+                data = base64.b64encode(open(mp4, "rb").read()).decode()
+                return self._json(200, {"mp4_b64": data, "seconds": round(time.time() - t0),
+                                        "frames": int(body.get("num_frames", 121))})
+            except Exception as e:  # noqa: BLE001
+                print(f"[i2v] FAILED: {type(e).__name__}: {e}", flush=True)   # keep a server-side record
+                return self._json(500, {"error": f"{type(e).__name__}: {e}",
+                                        "trace": traceback.format_exc()[-900:]})
 
         workdir = tempfile.mkdtemp(prefix="ltx_in_")
         try:

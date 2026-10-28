@@ -16,7 +16,10 @@ export function b64ToBytes(b64: string): Uint8Array {
 /** Parse a base64 GLB into its three.js scene graph (callback API wrapped as a promise). */
 export function parseGlbScene(b64: string): Promise<THREE.Object3D> {
   return new Promise((res, rej) =>
-    new GLTFLoader().parse(b64ToBytes(b64).buffer as ArrayBuffer, "", (g) => res(g.scene), rej));
+    new GLTFLoader().parse(b64ToBytes(b64).buffer as ArrayBuffer, "", (g) => {
+      g.scene.userData.animations = g.animations || [];   // keep clips — the viewport plays them
+      res(g.scene);
+    }, rej));
 }
 
 /** Render a base64 GLB to a small framed PNG data-URL — the Library thumbnail. Uses a throwaway
@@ -45,6 +48,57 @@ export async function renderThumbnail(glbB64: string, size = 256): Promise<strin
   renderer.dispose();
   (renderer as any).forceContextLoss && (renderer as any).forceContextLoss();
   return url;
+}
+
+/** Parse a base64 binary STL (the CAD pipeline's mesh_stl_b64) into a BufferGeometry.
+ * Handles ASCII STL too (OCCT emits binary, but be tolerant). Normals come from the file's
+ * per-facet normals — flat shading, which is what a machined CAD part should look like. */
+export function parseStlGeometry(b64: string): THREE.BufferGeometry {
+  const bytes = b64ToBytes(b64);
+  const isAscii = bytes.length > 5 && String.fromCharCode(...bytes.subarray(0, 5)).toLowerCase() === "solid"
+    && !looksBinaryStl(bytes);
+  return isAscii ? parseAsciiStl(new TextDecoder().decode(bytes)) : parseBinaryStl(bytes);
+}
+
+function looksBinaryStl(bytes: Uint8Array): boolean {
+  if (bytes.length < 84) return false;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const n = dv.getUint32(80, true);
+  return 84 + n * 50 === bytes.length;
+}
+
+function parseBinaryStl(bytes: Uint8Array): THREE.BufferGeometry {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const n = dv.getUint32(80, true);
+  const pos = new Float32Array(n * 9);
+  const nrm = new Float32Array(n * 9);
+  let o = 84;
+  for (let i = 0; i < n; i++) {
+    const nx = dv.getFloat32(o, true), ny = dv.getFloat32(o + 4, true), nz = dv.getFloat32(o + 8, true);
+    o += 12;
+    for (let v = 0; v < 3; v++) {
+      const j = i * 9 + v * 3;
+      pos[j] = dv.getFloat32(o, true); pos[j + 1] = dv.getFloat32(o + 4, true); pos[j + 2] = dv.getFloat32(o + 8, true);
+      nrm[j] = nx; nrm[j + 1] = ny; nrm[j + 2] = nz;
+      o += 12;
+    }
+    o += 2; // attribute byte count
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  g.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));
+  return g;
+}
+
+function parseAsciiStl(text: string): THREE.BufferGeometry {
+  const pos: number[] = [];
+  const re = /vertex\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) pos.push(+m[1], +m[2], +m[3]);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pos), 3));
+  g.computeVertexNormals();
+  return g;
 }
 
 /** base64 GLB → USDZ archive bytes (PBR survives), fully client-side. */

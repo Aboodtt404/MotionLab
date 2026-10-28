@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 from collections import Counter
@@ -56,9 +57,12 @@ def fam_table_shelf(rng) -> tuple:
             object="table top", shape="box", envelope={"length": tl, "width": tw, "height": tt}))
         legs = [Component(name=f"leg{i}", role="leg", part=Spec(
             object="leg", shape="box", envelope={"length": lw, "width": lw, "height": lh})) for i in range(4)]
+        # corners dx/dy are HALF-spacings (the cart's dxh convention): legs must land INSET inside
+        # the top's footprint. The old full-span values (tl-lw-10) solved the legs ~2× outside the
+        # top and only gated via repair_connectivity drag — training data poison (wrong dialect).
         asm = Assembly(object="four-leg table", components=[top, *legs], mates=[
             Mate(kind="corners", parts=[f"leg{i}" for i in range(4)], around="top",
-                 dx=tl - lw - 10, dy=tw - lw - 10),
+                 dx=(tl - lw) / 2 - 5, dy=(tw - lw) / 2 - 5),
             Mate(kind="stack", a="top", b="leg0", overlap=3),
         ], fuse=True)
         brief = (f"A small four-leg table: a {tl:.0f}×{tw:.0f}×{tt:.0f} mm rectangular top on four "
@@ -151,21 +155,123 @@ def fam_enclosure_pcb(rng) -> tuple:
     return "enclosure + parented standoffs + pcb", brief, asm
 
 
+def _rotor_noun(rng, n: int) -> str:
+    """Vocabulary variety — the OOD cliff was partly LEXICAL: the corpus only ever said 'drone
+    frame', so 'quadcopter' (a dashboard suggested prompt!) fell off-distribution. Rotate the
+    object noun through the words users actually type."""
+    if n == 4:
+        return rng.choice(["drone frame", "quadcopter frame", "quad frame",
+                           "4-rotor multirotor frame", "UAV frame"])
+    if n == 6:
+        return rng.choice(["drone frame", "hexacopter frame", "6-rotor multirotor frame"])
+    return "drone frame"
+
+
 def fam_drone(rng) -> tuple:
     n = rng.choice([4, 4, 6])
+    noun = _rotor_noun(rng, n)
     hd = round(rng.uniform(50, 80), 0); ht = round(rng.uniform(5, 9), 0)
     al = round(rng.uniform(60, 110), 0); aw = round(rng.uniform(10, 16), 0); at_ = round(rng.uniform(5, 8), 0)
     hub = Component(name="hub", role="hub", part=Spec(
         object="hub plate", shape="cylinder", envelope={"diameter": hd, "height": ht}))
     arms = [Component(name=f"arm{i}", role="arm", part=Spec(
         object="arm", shape="box", envelope={"length": al, "width": aw, "height": at_})) for i in range(n)]
-    asm = Assembly(object=f"{n}-arm drone frame", components=[hub, *arms], mates=[
+    asm = Assembly(object=f"{n}-arm {noun}", components=[hub, *arms], mates=[
         Mate(kind="radial", parts=[f"arm{i}" for i in range(n)], around="hub", count=n,
              radius=round(hd / 2 + al / 2 - rng.uniform(6, 12), 0)),
     ], fuse=True)
-    brief = (f"A {n}-arm drone frame: a round hub plate ⌀{hd:.0f}×{ht:.0f} mm with {n} rectangular "
+    brief = (f"A {n}-arm {noun}: a round hub plate ⌀{hd:.0f}×{ht:.0f} mm with {n} rectangular "
              f"arms ({al:.0f}×{aw:.0f}×{at_:.0f} mm) radiating evenly from its rim, fused into one frame.")
     return "drone frame (radial arms)", brief, asm
+
+
+def fam_quadcopter(rng) -> tuple:
+    # HERO family (rung 3): the quad-test OOD cliff, answered with the shapes the representation
+    # already supports but no family ever composed — a SHAPED profile_extrude center plate, tapered
+    # loft arms, bolt-circle motor pads PARENTED at the arm tips (frame hierarchy), a standoff ring,
+    # and a top plate stacked on the standoff group. Optionally a battery box flush underneath.
+    n = rng.choice([4, 4, 4, 6])
+    noun = _rotor_noun(rng, n)
+    hub_r = round(rng.uniform(38, 60), 0); pt_ = round(rng.uniform(3.5, 6), 1)
+    al = round(rng.uniform(70, 130), 0); aw = round(rng.uniform(12, 18), 0); ah = round(rng.uniform(6, 10), 0)
+    awt = round(aw * rng.uniform(0.5, 0.7), 0); aht = round(ah * rng.uniform(0.6, 0.85), 0)
+    pd = round(rng.uniform(22, 30), 0); pth = round(rng.uniform(3, 5), 1)     # motor pad ⌀ / thickness
+    bc = round(pd * rng.uniform(0.55, 0.7), 0)                                # bolt-circle PCD
+    hd_ = rng.choice([2.5, 3.0]); shaft = round(rng.uniform(5, 8), 0)         # bolt + shaft holes
+    sod = round(rng.uniform(5, 8), 0); soh = round(rng.uniform(22, 40), 0)    # standoffs ⌀×h
+    sink = round(rng.uniform(8, 14), 0)                                       # arm root buried in the plate rim
+    # standoff ring must stay radially CLEAR of the arm roots (arms start at hub_r − sink; both
+    # radial rings share phase 0, so a too-wide ring parks standoff k ON arm k — measured 45 mm³)
+    sor = round(min(0.48 * hub_r, hub_r - sink - sod / 2 - 3), 0)
+    tp_r = round(hub_r * rng.uniform(0.85, 1.0), 0); tpt = round(rng.uniform(3, 5), 1)
+
+    if rng.random() < 0.7:      # shaped plate: a 2n-gon PHASE-ALIGNED to the arms, so every arm
+        #                         meets a full-radius vertex dead-on (an 8-gon under 6 arms left
+        #                         4 arms hanging where the outline dips — 5 islands, measured)
+        pts = []
+        for k in range(2 * n):
+            r = hub_r if k % 2 == 0 else round(hub_r * 0.82, 1)
+            a = math.pi * k / n
+            pts.append([round(r * math.cos(a), 1), round(r * math.sin(a), 1)])
+        plate_spec = Spec(object="center plate", shape="profile_extrude",
+                          side_profile=[[-hub_r, 0], [hub_r, 0], [hub_r, pt_], [-hub_r, pt_]],
+                          plan_profile=pts)
+        plate_txt = (f"a shaped {'octagonal' if n == 4 else 'twelve-sided'} center plate "
+                     f"({2 * hub_r:.0f} mm across, {pt_:g} mm thick)")
+        plate_top = pt_ / 2          # profile_extrude solids are CENTERED on the origin
+    else:
+        plate_spec = Spec(object="center plate", shape="cylinder",
+                          envelope={"diameter": 2 * hub_r, "height": pt_})
+        plate_txt = f"a round center plate ⌀{2 * hub_r:.0f}×{pt_:g} mm"
+        plate_top = pt_              # cylinders are BASE-origin — top face at full thickness
+
+    arms = [Component(name=f"arm{i}", role="arm", part=Spec(
+        object="arm", shape="loft", envelope={"length": al, "width": aw, "height": ah,
+                                              "width_top": awt, "height_top": aht})) for i in range(n)]
+    # motor pads ride the arm tips in the ARM's local frame (tip at +length/2; sections centered
+    # in YZ): the pattern rotation carries each pad to its arm's angle — frame hierarchy, no
+    # world coordinates. CYLINDERS ARE BASE-ORIGIN (the pcb-standoff convention): the local z is
+    # the pad's UNDERSIDE — put it 1 mm below the tip half-height, which the ruled taper only
+    # grows inboard, so the pad is sunk (welded) at any x along the tip.
+    pads = [Component(name=f"motor_pad{i}", role="hub", parent=f"arm{i}",
+                      at=(al / 2 - pd / 2, 0.0, aht / 2 - 1.0), part=Spec(
+        object="motor pad", shape="cylinder", envelope={"diameter": pd, "height": pth},
+        features=[{"type": "through_hole", "diameter": shaft},
+                  {"type": "hole_pattern", "pattern": "bolt_circle", "count": 4,
+                   "diameter": hd_, "pitch_diameter": bc}])) for i in range(n)]
+    standoffs = [Component(name=f"standoff{i}", role="support", part=Spec(
+        object="standoff", shape="cylinder", envelope={"diameter": sod, "height": soh}))
+        for i in range(4)]
+    top = Component(name="top_plate", role="top", part=Spec(
+        object="top plate", shape="cylinder", envelope={"diameter": 2 * tp_r, "height": tpt}))
+
+    # role 'hub', NOT 'base': a multirotor frame is a FREE frame (the drone-family precedent) —
+    # 'base'/'leg' roles make the support row demand floor contact it shouldn't have.
+    comps = [Component(name="bottom_plate", role="hub", part=plate_spec), *arms, *pads, *standoffs, top]
+    mates = [
+        Mate(kind="radial", parts=[f"arm{i}" for i in range(n)], around="bottom_plate", count=n,
+             radius=round(hub_r + al / 2 - sink, 0)),
+        # radial z sets the component `at` = a cylinder's BASE: 1 mm below the plate's top face
+        # (plate_top is variant-aware — the two plate shapes have different z origins)
+        Mate(kind="radial", parts=[f"standoff{i}" for i in range(4)], around="bottom_plate",
+             count=4, radius=sor, z=round(plate_top - 1.0, 1)),
+        Mate(kind="stack", a="top_plate", b="standoff0", overlap=1),
+    ]
+    bat_txt = ""
+    if rng.random() < 0.35:
+        bl = round(hub_r * 1.2, 0); bw = round(hub_r * 0.7, 0); bh = round(rng.uniform(12, 20), 0)
+        comps.append(Component(name="battery_box", role="body", part=Spec(
+            object="battery box", shape="box", envelope={"length": bl, "width": bw, "height": bh})))
+        mates.append(Mate(kind="flush", a="battery_box", b="bottom_plate", side="-z", overlap=1))
+        bat_txt = f", and a {bl:.0f}×{bw:.0f}×{bh:.0f} mm battery box slung flush under the plate"
+    asm = Assembly(object=f"{n}-arm {noun}", components=comps, mates=mates, fuse=True)
+    brief = (f"A {n}-arm {noun}: {plate_txt} with {n} tapered arms "
+             f"({al:.0f} mm long, {aw:.0f}×{ah:.0f} mm at the root narrowing to {awt:.0f}×{aht:.0f} mm) "
+             f"radiating from its rim, each tip carrying a ⌀{pd:.0f}×{pth:g} mm motor pad drilled "
+             f"⌀{shaft:.0f} mm for the shaft with 4×⌀{hd_:g} mm on a {bc:.0f} mm bolt circle; four "
+             f"⌀{sod:.0f}×{soh:.0f} mm standoffs on a {sor:.0f} mm ring carry a ⌀{2 * tp_r:.0f}×{tpt:g} mm "
+             f"top plate{bat_txt}. One fused frame.")
+    return "quadcopter (hero: shaped plate + pads + standoffs)", brief, asm
 
 
 def fam_cart(rng) -> tuple:
@@ -202,8 +308,49 @@ def fam_cart(rng) -> tuple:
     return "cart (axles + corner wheels + revolutes)", brief, asm
 
 
+def fam_rack(rng) -> tuple:
+    # the MID-HEIGHT dialect family (rung 2): shelves fixed PARTWAY UP corner posts via
+    # stack+fraction — the z the eval said was inexpressible (a rack's middle shelf sits between
+    # the group ends, not on top). Posts are role 'leg' (grounded, spread, statics-checked);
+    # every shelf spans the post rectangle so it welds through all four posts (sanctioned).
+    tiers = rng.choice([2, 2, 2, 3])
+    sl = round(rng.uniform(150, 240), 0); sw = round(rng.uniform(90, 160), 0); st = round(rng.uniform(8, 14), 0)
+    pw = round(rng.uniform(12, 20), 0); ph = round(rng.uniform(130, 230), 0)
+    dx = round((sl - pw) / 2 - rng.uniform(4, 10), 1)      # posts INSET inside the shelf footprint
+    dy = round((sw - pw) / 2 - rng.uniform(4, 10), 1)      # (corners dx/dy are HALF-spacings)
+    fr_mid = round(rng.uniform(0.38, 0.62), 2)
+
+    def shelf(nm):
+        return Component(name=nm, role="top", part=Spec(
+            object="shelf", shape="box", envelope={"length": sl, "width": sw, "height": st}))
+
+    posts = [Component(name=f"post{i}", role="leg", part=Spec(
+        object="post", shape="box", envelope={"length": pw, "width": pw, "height": ph})) for i in range(4)]
+    comps = [*posts, shelf("top_shelf"), shelf("mid_shelf")]
+    mates = [
+        Mate(kind="corners", parts=[f"post{i}" for i in range(4)], around="top_shelf", dx=dx, dy=dy),
+        Mate(kind="stack", a="top_shelf", b="post0", overlap=3),
+        Mate(kind="stack", a="mid_shelf", b="post0", fraction=fr_mid),
+    ]
+    mid_txt = ("about halfway up the posts" if 0.45 <= fr_mid <= 0.55
+               else f"{round(fr_mid * 100):g}% of the way up the posts")
+    low_txt = ""
+    if tiers == 3:
+        fr_low = round(rng.uniform(0.10, 0.24), 2)
+        comps.append(shelf("low_shelf"))
+        mates.append(Mate(kind="stack", a="low_shelf", b="post0", fraction=fr_low))
+        low_txt = f", plus a low shelf at {round(fr_low * 100):g}% of the post height"
+    asm = Assembly(object=f"{'three' if tiers == 3 else 'two'}-tier rack",
+                   components=comps, mates=mates, fuse=True)
+    brief = (f"A {'three' if tiers == 3 else 'two'}-tier storage rack: four {pw:.0f} mm square posts "
+             f"{ph:.0f} mm tall at the corners of a {sl:.0f}×{sw:.0f} mm footprint, a "
+             f"{sl:.0f}×{sw:.0f}×{st:.0f} mm top shelf resting on the post tops, and a middle shelf "
+             f"fixed {mid_txt}{low_txt}, all fused into one frame.")
+    return "rack (posts + mid-height shelves)", brief, asm
+
+
 FAMILIES = [fam_stool, fam_table_shelf, fam_bolt_stack, fam_shaft_bearings,
-            fam_hinge, fam_enclosure_pcb, fam_drone, fam_cart]
+            fam_hinge, fam_enclosure_pcb, fam_drone, fam_cart, fam_rack, fam_quadcopter]
 
 
 def _gate(asm: Assembly):

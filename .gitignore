@@ -67,3 +67,9 @@ skills/
 task.md
 corpus_out/
 cad_pipeline/tools/node_modules/
+docs/frontend-design-brief.md
+frontend-backup-*/
+*.zip
+studio_data/
+bug_reports/
+ufficio-sans-font-family.zip

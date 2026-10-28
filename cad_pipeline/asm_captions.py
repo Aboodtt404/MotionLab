@@ -101,13 +101,43 @@ def _mate_phrases(asm: Assembly, level: int, rng: random.Random) -> List[str]:
                 p += f" ({2 * m.dx:g}×{2 * (m.dy or 0):g} mm spacing)"
             out.append(p)
         elif m.kind == "stack":
-            out.append(_pick(rng, f"the {_hn(m.a)} resting on the {_hn(m.b)}", f"the {_hn(m.a)} stacked on the {_hn(m.b)}"))
+            if m.fraction is not None:
+                # mid-height dialect: the part is fixed PARTWAY UP its support, not on top
+                if level == 1:
+                    out.append(_pick(rng, f"the {_hn(m.a)} fixed partway up the {_hn(m.b)}",
+                                     f"the {_hn(m.a)} mounted part-way up the {_hn(m.b)}"))
+                elif level == 2:
+                    word = ("near the bottom of" if m.fraction < 0.34
+                            else "about halfway up" if m.fraction < 0.67 else "near the top of")
+                    out.append(f"the {_hn(m.a)} {word} the {_hn(m.b)}")
+                else:
+                    out.append(f"the {_hn(m.a)} at {round(m.fraction * 100):g}% of the {_hn(m.b)} height")
+            else:
+                out.append(_pick(rng, f"the {_hn(m.a)} resting on the {_hn(m.b)}", f"the {_hn(m.a)} stacked on the {_hn(m.b)}"))
         elif m.kind == "ground":
             out.append(f"the {_hn(m.a)} sitting on the floor")
         elif m.kind == "coaxial":
             out.append(f"the {_hn(m.a)} coaxial with the {_hn(m.b)}")
         elif m.kind == "flush":
             out.append(f"the {_hn(m.a)} flush against the {_hn(m.b)}")
+        elif m.kind == "port":
+            # The brief MUST name the face, or port selection is unlearnable from the caption
+            # (the whole point of FIX 2 is that placement becomes a discrete CHOICE). Faces are
+            # bbox-frame but deterministic, so caption -> port is a learnable mapping.
+            face = {"top": "on top of", "bottom": "underneath",
+                    "front": "on the front face of", "back": "on the back face of",
+                    "left": "on the left face of", "right": "on the right face of"}.get(m.b_port, "on")
+            p = f"the {_hn(m.a)} mounted {face} the {_hn(m.b)}"
+            if m.fraction is not None and m.b_port not in ("top", "bottom"):
+                if level == 2:
+                    word = ("low on" if m.fraction < 0.34 else "midway up"
+                            if m.fraction < 0.67 else "high on")
+                    p += f", {word} it"
+                elif level == 3:
+                    p += f", at {round(m.fraction * 100):g}% of its height"
+            if level == 3 and m.b_port in ("top", "bottom") and m.offset and any(m.offset):
+                p += f", offset ({m.offset[0]:g}, {m.offset[1]:g}) mm"
+            out.append(p)
         elif m.kind == "mirror":
             out.append(f"the {_hn(m.a)} mirrored across from the {_hn(m.b)}")
     return out
@@ -153,7 +183,9 @@ def asm_describe(asm: Assembly, rng: random.Random) -> Dict[str, str]:
                 ph = f"{_ORD.get(cnt, str(cnt))} {ph.split(' ', 1)[1] if ph.startswith('a ') else ph}"
                 ph = re.sub(r"\ba\b ", "", ph) if False else ph
                 # naive plural: "two ... wheel" reads fine as "two ... wheels"
-                if not ph.endswith("s"):
+                if ph.endswith("f") and not ph.endswith("ff"):   # shelf → shelves (not "shelfs")
+                    ph = ph[:-1] + "ves"
+                elif not ph.endswith("s"):
                     ph += "s"
             bits.append(ph)
         return ", ".join(bits)
@@ -162,7 +194,8 @@ def asm_describe(asm: Assembly, rng: random.Random) -> Dict[str, str]:
     j1 = _joint_phrase(asm.joints, 1)
     l1 = f"A {obj_l1}: {parts_at(1)}"
     if mates1:
-        l1 += f" — {mates1[0]}" if len(mates1) == 1 else f" — {'; '.join(mates1[:2])}"
+        # up to 3 phrases so a DEFINING third relationship (a rack's mid-height shelf) isn't dropped
+        l1 += f" — {mates1[0]}" if len(mates1) == 1 else f" — {'; '.join(mates1[:3])}"
     if j1:
         l1 += f", with {j1}"
     l1 += "."
@@ -173,7 +206,7 @@ def asm_describe(asm: Assembly, rng: random.Random) -> Dict[str, str]:
     j2 = _joint_phrase(asm.joints, 2)
     l2 = f"A {obj}: {parts_at(2)}"
     if mates2:
-        l2 += f" — {'; '.join(mates2[:2])}"
+        l2 += f" — {'; '.join(mates2[:3])}"
     if j2:
         l2 += f"; {j2}"
     l2 += "."
@@ -212,6 +245,8 @@ def gate_caption(level: str, text: str, asm: Assembly) -> bool:
             v = getattr(m, k, None)
             if isinstance(v, (int, float)):
                 pool.extend([float(v), 2 * float(v)])
+        if getattr(m, "fraction", None) is not None:   # mid-height share, spoken as a percentage
+            pool.extend([float(m.fraction), float(round(m.fraction * 100))])
     for j in asm.joints:
         pool.extend([float(j.limits[0]), float(j.limits[1])])
     pool.extend(float(x) for x in range(0, 10))          # counts/ordinals
